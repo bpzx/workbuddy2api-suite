@@ -372,3 +372,47 @@ func newTestUpstream(t *testing.T, h http.HandlerFunc) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(h)
 }
+
+// TestBareHeaderAbbreviated 裸键名（无冒号）兜底缩写——2026-09-13 实验 F4：
+// assistant 消息反引号引用裸键名即触发 11128，剥离层 sanitizeHdrRe 要求冒号、
+// 对裸串无效。键值形态被整段删除后，残留裸键名做最小缩写（header→hdr），
+// 破坏逐字匹配、语义不变、保留可读性。
+func TestBareHeaderAbbreviated(t *testing.T) {
+	for _, in := range []string{
+		"引用 `x-anthropic-billing-header` 这个键",
+		"lower: x-anthropic-billing-header",
+		"mixed: X-Anthropic-Billing-Header",
+	} {
+		out := sanitizeText(in)
+		if strings.Contains(strings.ToLower(out), "x-anthropic-billing-header") {
+			t.Fatalf("裸键名未被兜底: in=%q out=%q", in, out)
+		}
+		if !strings.Contains(strings.ToLower(out), "x-anthropic-billing-hdr") {
+			t.Fatalf("裸键名未缩写为 hdr 形态: in=%q out=%q", in, out)
+		}
+	}
+	// 键值形态仍走整段删除（不留 hdr 残骸）
+	out := sanitizeText("prefix x-anthropic-billing-header: cc_version=1.0; cc_entrypoint=cli; suffix")
+	if strings.Contains(strings.ToLower(out), "x-anthropic-billing") {
+		t.Fatalf("键值形态应整段删除: out=%q", out)
+	}
+}
+
+// TestReasoningContentSanitized reasoning_content（思维链回填字段）与 content
+// 同等净化——实测该字段同样携带指纹。
+func TestReasoningContentSanitized(t *testing.T) {
+	msgs := []any{
+		map[string]any{
+			"role":              "assistant",
+			"content":           nil,
+			"reasoning_content": "上文出现过 `x-anthropic-billing-header` 键名",
+		},
+	}
+	if !sanitizeMessages(msgs) {
+		t.Fatal("reasoning_content 中的指纹未被净化")
+	}
+	rc := msgs[0].(map[string]any)["reasoning_content"].(string)
+	if strings.Contains(rc, "x-anthropic-billing-header") {
+		t.Fatalf("reasoning_content 指纹残留: %q", rc)
+	}
+}

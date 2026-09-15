@@ -26,6 +26,21 @@ export interface Account {
   disabled_reason?: string | null;
   in_flight?: number | null;
   cooling?: boolean | null;
+  /** 冷却剩余秒数（上游权威值：可能是上游明说的重置时刻，也可能是有界退避）；null = 未在冷却 */
+  cool_remaining_sec?: number | null;
+  /**
+   * 被限流的模型清单（上游限额台账）。多模型限流时各模型的恢复时刻**不同**，
+   * 账号级冷却时间不足以表达，故逐条列出。
+   * 字段名照上游 /status 的 JSON：model / until / reset_at / reason。
+   */
+  rate_limited_models?: {
+    model: string;
+    /** 该模型的冷却截止（已被 soft_rate_max 截断） */
+    until?: string;
+    /** 上游明说的重置时刻（未截断）；无时间文案时缺省 */
+    reset_at?: string;
+    reason?: string;
+  }[];
   success_count?: number | null;
   err_total?: number | null;
   breaker_fails?: number | null;
@@ -97,6 +112,10 @@ export interface CatalogModel {
   max_output_tokens: number;
   /** 支持的推理档位，如 ['low','high','max']；空数组 = 非推理模型或未提供 */
   efforts: string[];
+  /** 默认推理档位；空串 = 上游未声明（由上游自行回退到硬编码默认） */
+  default_effort: string;
+  /** 是否支持图片输入（多模态） */
+  supports_images: boolean;
   /** 系列归属（按 id 前缀推导，仅用于分组浏览） */
   series: string;
 }

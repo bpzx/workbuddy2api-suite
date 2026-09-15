@@ -419,6 +419,57 @@ def update_upstream(rep: Reporter) -> None:
     else:
         rep.log('上游未在预期时间内就绪，请查看容器日志', 'warn')
 
+    # 7) 清版本检测缓存
+    #
+    # 缓存里存的是「更新前」查到的远端最新提交；不清的话，界面会把**已经装好的
+    # 这个版本**当成新版本继续提示「上游有更新」，一直到缓存 6 小时过期为止
+    # （用户报过这个问题：明明更新到最新了，面板还是一直说有更新）。
+    # 管理端更新那条路径早就清了，上游这条一直漏着。
+    _clear_version_cache(rep)
+
+
+def _clear_version_cache(rep: Reporter) -> None:
+    """清掉版本检测缓存，使界面立即重新判断「有没有更新」。"""
+    try:
+        (DATA_DIR / 'version-check.json').unlink(missing_ok=True)
+        rep.log('已清除版本检测缓存')
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# 安全关键文件：它们承载验签逻辑与信任锚，改了必须人工审查
+_TRUST_ANCHOR_FILES = ('update.py', 'release-signing-key.pub')
+
+
+def _explain_deploy_risk(rep: Reporter, modified: list[str], added: list[str],
+                         here: Path) -> None:
+    """把 deploy/ 差异翻译成「要不要紧张、下一步做什么」。
+
+    为什么要单独一段说明：早先只说「已跳过同步」，管理员看到一排文件名
+    无法判断严重性——实测有用户专门来问「这要不要紧」。差异本身分三类，
+    处理方式完全不同：
+
+      1. 只新增了工具脚本（如 check-upstream.sh）→ **无需任何操作**
+      2. 修改了非信任锚文件（如 systemd 单元）→ 看一眼即可，想要新功能就覆盖
+      3. 修改了信任锚（update.py / 公钥）→ **必须人工比对**，确认是官方改动
+         而非被替换，再覆盖；这是整条供应链防护的最后一关
+    """
+    anchors = [f for f in modified if Path(f).name in _TRUST_ANCHOR_FILES]
+    others = [f for f in modified if Path(f).name not in _TRUST_ANCHOR_FILES]
+
+    if anchors:
+        rep.log('   ⚠️ 其中包含**验签相关文件**：' + '、'.join(anchors), 'warn')
+        rep.log('      这类文件决定「更新包是否可信」，改动必须人工确认后才覆盖，'
+                '否则供应链防护可能被绕过。', 'warn')
+    elif others:
+        rep.log('   这些是普通脚本/配置（不含验签逻辑），看过差异后按需覆盖即可。')
+    elif added:
+        rep.log('   仅新增文件、未改动现有内容 —— 不影响本次更新，可以不处理。')
+
+    if modified:
+        rep.log(f'   比对方法：diff {here.parent}/<文件名> <新包目录>/deploy/<文件名>')
+    rep.log(f'   覆盖位置：{here.parent}（本次未改动任何文件）')
+
 
 def _read_upstream_ref() -> str:
     """要固定的上游版本（提交号/标签）。环境变量优先，其次本地文件；空 = 跟随分支。"""
@@ -615,25 +666,38 @@ def update_manager(rep: Reporter) -> None:
         #
         # 因此：包内带了 deploy/ 就在日志里提示差异，由管理员**手动**决定是否
         # 覆盖（例如 systemd 单元确实需要更新时）。正常发版不会改这里。
+        #
+        # 提示要**分清轻重**：早先无论什么差异都只说「已跳过同步」，于是
+        # 「新增了一个无害的检查脚本」与「验签逻辑被改」看起来一模一样，
+        # 管理员无从判断该紧张还是该忽略（实测：有用户为此专门来问）。
+        # 现在逐文件标注新增/修改，并把安全关键文件单独点出来。
         new_deploy = new_root / 'deploy'
         if new_deploy.is_dir():
             here = Path(__file__).resolve()
-            changed = []
+            added: list[str] = []
+            modified: list[str] = []
             for src in sorted(new_deploy.rglob('*')):
                 if not src.is_file():
                     continue
                 rel = src.relative_to(new_deploy)
                 dst = INSTALL_DIR / 'deploy' / rel
                 try:
-                    if not dst.is_file() or dst.read_bytes() != src.read_bytes():
-                        changed.append(str(rel))
+                    if not dst.is_file():
+                        added.append(str(rel))
+                    elif dst.read_bytes() != src.read_bytes():
+                        modified.append(str(rel))
                 except OSError:
-                    changed.append(str(rel))
-            if changed:
-                rep.log('⚠️ 新包内的 deploy/ 与本地不同，**已跳过同步**（保护验签逻辑）：'
-                        + '、'.join(changed[:8])
-                        + ('…' if len(changed) > 8 else ''), 'warn')
-                rep.log(f'   如需更新，请手动比对后覆盖：{here.parent}（本次未改动）', 'warn')
+                    modified.append(str(rel))
+            if added or modified:
+                rep.log('⚠️ 新包内的 deploy/ 与本地不同，**已跳过同步**'
+                        '（deploy/ 含验签逻辑，是信任锚，不能随包替换）', 'warn')
+                if modified:
+                    rep.log('   修改（需人工确认）：' + '、'.join(modified[:8])
+                            + ('…' if len(modified) > 8 else ''), 'warn')
+                if added:
+                    rep.log('   新增（本地没有，多半无害）：' + '、'.join(added[:8])
+                            + ('…' if len(added) > 8 else ''), 'warn')
+                _explain_deploy_risk(rep, modified, added, here)
             else:
                 rep.log('deploy/ 与包内一致，无需同步')
 
@@ -663,11 +727,7 @@ def update_manager(rep: Reporter) -> None:
     # 清掉版本检测缓存：缓存里存的是「更新前」查到的 latest，留着会让界面
     # 拿旧 latest 跟新版本比较，出现「v1.0.5 → v1.0.4」这类把降级当更新的提示，
     # 也会让刚发布的新版本最长 6 小时才被发现。
-    try:
-        (DATA_DIR / 'version-check.json').unlink(missing_ok=True)
-        rep.log('已清除版本检测缓存')
-    except Exception:  # noqa: BLE001
-        pass
+    _clear_version_cache(rep)
 
     # 先把终态落盘，再重启：systemd 默认 KillMode=control-group，restart 会连同
     # 本进程一起终止（start_new_session 只脱离终端会话，并未脱离 service 的 cgroup），

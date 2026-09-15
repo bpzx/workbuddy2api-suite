@@ -267,14 +267,16 @@ func IsModelRateLimit(body string) bool {
 	return re.MatchString(body)
 }
 
-// ParseSoftRateReset 从 429 body 解析「将在 … 重置」时间（上游 UTC+8 文案）。
+// ParseRateReset 从任何限流响应 body 里统一解析「将在 … 重置」时间（上游 UTC+8 文案）。
 // 成功返回解析出的**墙钟时刻**（按 UTC+8 解释），失败返回零值 + false。
-// 内部先判 IsModelRateLimit：非模型级限流（非 6004）即使带"重置"字样也不返回——该重置
-// 无冷却语义（如 11140 的通用限流提示），解析出来反而会错误收窄冷却。
-func ParseSoftRateReset(body string) (time.Time, bool) {
-	if !IsModelRateLimit(body) {
-		return time.Time{}, false
-	}
+//
+// 与旧 ParseSoftRateReset 的关键差异：不再被 IsModelRateLimit（6004）门禁。只要是
+// 带「将在 … 重置」的限流文案——6004 模型级、11140 "The model provider is
+// rate-limiting requests." 等任意形态——都提取同一上游权威重置墙钟。是否走模型级
+// 豁免、时日对齐到 until 还是 modelCooldowns，由冷却决策侧（pool）按
+// IsModelRateLimit 判定，本函数只负责「把上游明说的恢复时刻抽出来」。没有时间文案
+// 的限流也照常由调用方退回有界退避（绝不臆造时间）。
+func ParseRateReset(body string) (time.Time, bool) {
 	re := regexp.MustCompile(softRateResetRe)
 	m := re.FindStringSubmatch(body)
 	if len(m) < 2 {
@@ -287,6 +289,12 @@ func ParseSoftRateReset(body string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return t, true
+}
+
+// ParseSoftRateReset 旧函数名的兼容别名：等价于 ParseRateReset（统一入口）。
+// 保留仅为避免旧调用点/外部引用断裂；新增代码应直接使用 ParseRateReset。
+func ParseSoftRateReset(body string) (time.Time, bool) {
+	return ParseRateReset(body)
 }
 
 // Classify 按 HTTP 状态码 + body 判定错误类别。
@@ -519,8 +527,14 @@ func (c *Client) chatBase(a *auth.Auth) string {
 // conversationID 为网关解析出的会话标识（用于 prompt_cache_key 注入的会话段；
 // body 里自带 conversation_id 时以 body 为准）。uid8 来自账号 UID，是跨账号硬隔离段。
 func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []byte {
-	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints,
-		c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm))
+	efforts, defs := c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm)
+	if realmKey(realm) == "global" {
+		// global 域降级源 = 远端探测桶（权威）∪ 产品静态兜底表（全局 21 名内档位如
+		// deepseek-v4.1-flash ['high']）。当前探测桶为空时也按静态表降级，不全程透传
+		// （issue #84：往 WorkBuddy 上游发 low/max 非法，须降级到 high）。
+		efforts, defs = globalEffortMap(efforts, defs)
+	}
+	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints, efforts, defs)
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
 	body = InjectPromptCacheKey(body, uid, conversationID)
@@ -566,6 +580,36 @@ func realmKey(realm string) string {
 	return realm
 }
 
+// storeEfforts 按 realm 写入 effort 能力缓存桶（efforts + defaultEfforts），并发安全。
+// 供 CN FetchModels 与 global 探测共用：拉取到的模型档位落桶后，出站请求体 normalizeReasoningEffort
+// 才能按域降级。efforts 与 defs 均空时删除该 realm 桶（等价「该域无可降级档位」）。
+// 调用方负责在「无新数据」时跳过写（CN 侧空桶不清既有桶，见 FetchModels 尾部）。
+func (c *Client) storeEfforts(realm string, efforts map[string][]string, defs map[string]string) {
+	c.effortsMu.Lock()
+	defer c.effortsMu.Unlock()
+	if c.efforts == nil {
+		c.efforts = make(map[string]map[string][]string)
+	}
+	if c.defaultEfforts == nil {
+		c.defaultEfforts = make(map[string]map[string]string)
+	}
+	k := realmKey(realm)
+	if len(efforts) == 0 && len(defs) == 0 {
+		delete(c.efforts, k)
+		delete(c.defaultEfforts, k)
+		return
+	}
+	c.efforts[k] = efforts
+	c.defaultEfforts[k] = defs
+}
+
+// GlobalEffortSnapshot 导出 global 域 effort 能力缓存（探测下发 ∪ 静态兜底合并后的桶），
+// 供 /v1/models 输出 reasoning_supported_efforts / reasoning_default_effort。
+// 返回副本；桶未填充（无 global 账号或从未探测）→ nil（调用方回落静态兜底表）。
+func (c *Client) GlobalEffortSnapshot() (efforts map[string][]string, defaults map[string]string) {
+	return c.effortsSnapshot("global"), c.defaultEffortsSnapshot("global")
+}
+
 func (c *Client) billingBase(a *auth.Auth) string {
 	if c.globalOn(a) {
 		return c.globalBillingBase()
@@ -602,13 +646,18 @@ func (c *Client) checkinMeterPaths(a *auth.Auth) []string {
 }
 
 // doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带 body 片段的 *Error。
+// body 读失败（连接中断/空闲掐流/截断）返回普通错误（非 *Error）——半截 body 不进
+// Classify，不参与账号惩罚（传输层故障不该喂熔断误罚号）。
 func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
 	if resp.StatusCode >= 400 {
 		kind := Classify(resp.StatusCode, string(raw))
 		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
@@ -748,13 +797,15 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	var cancel context.CancelFunc
 	// global 首次路径 404/405 时换 fallback 路径重试；ensureConsoleSystem 在 prepareBody 后统一套用
 	// 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128）。
 	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
 	}
+	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
+	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 + 尾部
+	// 不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
 	for attempt, path := range c.chatPaths(a) {
 		url := c.chatBase(a) + path
 		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(prepared))
@@ -773,9 +824,15 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			return nil, 0, nil, err
 		}
 		if resp.StatusCode >= 400 {
-			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 			resp.Body.Close()
 			cancel()
+			// body 读失败（掐流/截断）→ 传输层错误：半截 raw 不交回调用方进 Classify，
+			// 否则 handler 侧 applyErrorPolicy 会按误判分类罚号。
+			if rerr != nil {
+				log.Printf("ERR: [upstream] chat_stream uid=%s: read body: %v", logfmt.UID8(a.UID), rerr)
+				return nil, 0, nil, fmt.Errorf("read body: %w", rerr)
+			}
 			kind := Classify(resp.StatusCode, string(raw))
 			log.Printf("WARN: [upstream] chat_stream uid=%s: upstream %d %s body=%s",
 				logfmt.UID8(a.UID), resp.StatusCode, kind, truncate(string(raw), 200))
@@ -790,8 +847,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		// 取消传播由 http.Transport 在 body Close / 父 ctx 取消时处理，连接正常清理。
 		return monitorBody(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
 	}
-	cancel()
-	return nil, 0, nil, nil
+	panic("unreachable: chatPaths is never empty") // for range 空集时编译器仍要求兜底 return；chatPaths 恒非空（构造保证），永不触达
 }
 
 // chatPaths 返回按 realm 的 chat 路径候选序列：
@@ -811,7 +867,7 @@ type ModelInfo struct {
 	MaxTokens      int64    // = maxOutputTokens
 	Efforts        []string // reasoning.supportedEfforts（空=未知/固定档）
 	DefaultEffort  string   // reasoning.defaultEffort（空=未声明，thinking.go 回退硬编码）
-	SupportsImages bool    // 顶层 supportsImages（多模态能力，透出到 /v1/models）
+	SupportsImages bool     // 顶层 supportsImages（多模态能力，透出到 /v1/models）
 }
 
 // 模型目录端点路径常量（按 realm 切）：
@@ -872,7 +928,11 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		// 读失败 → 传输层错误（handler 侧该路径不 NoteError，见发现 6 的正确行为）。
+		return nil, fmt.Errorf("read body: %w", err)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("models api status %d: %s", resp.StatusCode, truncate(string(raw), 120))
 	}
@@ -950,9 +1010,9 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			ID:             m.ID,
 			Name:           m.Name,
 			ContextWindow:  m.MaxInputTokens,
-			MaxTokens:       m.MaxOutputTokens,
-			Efforts:         m.Efforts,
-			DefaultEffort:   m.DefaultEffort,
+			MaxTokens:      m.MaxOutputTokens,
+			Efforts:        m.Efforts,
+			DefaultEffort:  m.DefaultEffort,
 			SupportsImages: m.SupportsImages,
 		})
 	}
@@ -960,6 +1020,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		return nil, fmt.Errorf("models api returned empty list")
 	}
 	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入 efforts 桶）。
+	// 空桶时跳过写：避免「某探测无档位数据」清掉既有桶（例：cn 桶已有档位，再次探测返回全无等级 → 不应清空）。
 	cache := make(map[string][]string, len(out))
 	defCache := make(map[string]string, len(out))
 	for _, mi := range out {
@@ -974,16 +1035,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		return out, nil
 	}
 	// 按探测账号的 realm 写入对应桶：CN 探测只进 cn 桶，global 同模型名不被污染（C-2）。
-	c.effortsMu.Lock()
-	if c.efforts == nil {
-		c.efforts = make(map[string]map[string][]string)
-	}
-	if c.defaultEfforts == nil {
-		c.defaultEfforts = make(map[string]map[string]string)
-	}
-	c.efforts[realmKey(a.Realm())] = cache
-	c.defaultEfforts[realmKey(a.Realm())] = defCache
-	c.effortsMu.Unlock()
+	c.storeEfforts(a.Realm(), cache, defCache)
 	return out, nil
 }
 

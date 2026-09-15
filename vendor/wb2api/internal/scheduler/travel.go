@@ -3,6 +3,7 @@
 package scheduler
 
 import (
+	"context"
 	"log"
 	"time"
 
@@ -31,6 +32,23 @@ var activityAccountDelay = 800 * time.Millisecond
 // 秒发易触发风控，故 1.5s 一条。测试可置 0。
 var activityReportGap = 1500 * time.Millisecond
 
+// sleepCtx 可取消的等待：ctx 取消立即返回 false（优雅停机不必等 sleep 醒来），
+// 等满返回 true。d<=0 立即放行（测试把延迟置 0 时不白等）。
+// 替换 time.Sleep：账号间/账号内限速值不变，只换等待方式。
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
 // cstZone 上游每日重置按自然日 00:00 CST（Asia/Shanghai）。中国无夏令时，固定 +8 即可，
 // 不依赖容器 tzdata。
 var cstZone = time.FixedZone("CST", 8*60*60)
@@ -40,10 +58,17 @@ func travelDay(t time.Time) string {
 	return t.In(cstZone).Format("2006-01-02")
 }
 
-// RunTravelNow 立即对池内所有可用账号执行一趟旅行巡检。
-// 禁用账号跳过；401/查询失败只跳过该账号本轮（不强刷 token，交 22:00 keepalive）；
-// 账号间限速 travelAccountDelay。
+// RunTravelNow 立即对池内所有可用账号执行一趟旅行巡检（无 ctx 的外部入口：
+// cmd/手动触发、测试）。内部走 runTravel，取背景 ctx（不可取消，语义与
+// 引入前 time.Sleep 版一致）。
 func (s *Scheduler) RunTravelNow() {
+	s.runTravel(context.Background())
+}
+
+// runTravel 旅行巡检遍历，随 ctx 取消立即退出。
+// 禁用账号跳过；401/查询失败只跳过该账号本轮（不强刷 token，交 22:00 keepalive）；
+// 账号间限速 travelAccountDelay（sleepCtx：取消时立即放弃后续账号）。
+func (s *Scheduler) runTravel(ctx context.Context) {
 	first := true
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
@@ -57,7 +82,9 @@ func (s *Scheduler) RunTravelNow() {
 			continue // D4 门控：global 无猫猫旅行体系，不发起任何上游调用
 		}
 		if !first {
-			time.Sleep(travelAccountDelay)
+			if !sleepCtx(ctx, travelAccountDelay) {
+				return // 优雅停机：不等限速睡满，剩余账号下轮再巡
+			}
 		}
 		first = false
 		s.travelOne(a)

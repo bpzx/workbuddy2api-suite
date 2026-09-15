@@ -90,6 +90,10 @@ def _decorate(items: list[dict]) -> list[dict]:
             'max_output_tokens': int(m.get('max_output_tokens') or 0),
             'efforts': list(m.get('efforts') or []),
             'series': series_of(str(m.get('id') or '')),
+            # 上游解析出并用于 thinking 决策的默认推理档位；空 = 未声明
+            'default_effort': str(m.get('default_effort') or ''),
+            # 多模态能力（官方 /v1/models 也透出 supports_images）
+            'supports_images': bool(m.get('supports_images')),
         }
         for m in items
         if m.get('id')

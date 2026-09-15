@@ -210,23 +210,40 @@ func (s *Scheduler) Run(ctx context.Context) {
 			return
 		case <-timer.C:
 			// 到点任务在排程时确定（不依赖唤醒时刻的小时数），迟到唤醒也不会漏跑。
-			for _, k := range kinds {
-				s.dispatch(k)
-			}
+			// 唤醒时全部并行派发：每类一个 goroutine，慢任务族（如活跃上报
+			// 54 号 × 5 条 ≈ 7-8 分钟睡眠）不再阻塞同槽其他任务族；返回前
+			// 等全部任务收尾（下一轮 nextWake 照旧从"现在"起算，多轮重叠
+			// 的风险与串行版相同——nextWake 只挑现在之后的时点）。
+			s.runBatch(ctx, kinds)
 		}
 	}
 }
 
+// runBatch 并行派发一批任务（同一唤醒时刻的多类任务），等全部完成返回。
+// 供 Run 主循环与测试使用；ctx 取消时由各任务内部的 sleepCtx 快速收尾。
+func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
+	var wg sync.WaitGroup
+	for _, k := range kinds {
+		wg.Add(1)
+		go func(k taskKind) {
+			defer wg.Done()
+			s.dispatch(ctx, k)
+		}(k)
+	}
+	wg.Wait()
+}
+
 // dispatch 按任务类型分发到对应执行函数。脚本类（school/cat）失败只记 WARN、
 // 不影响其余任务继续执行（与现有各任务"单账号失败不阻断遍历"同口径）。
-func (s *Scheduler) dispatch(k taskKind) {
+// ctx 传导给带账号间限速的遍历（取消时立即放弃剩余账号），纯脚本类任务不感知。
+func (s *Scheduler) dispatch(ctx context.Context, k taskKind) {
 	switch k {
 	case taskCheckin:
 		s.RunCheckinNow()
 	case taskTravel:
-		s.RunTravelNow()
+		s.runTravel(ctx)
 	case taskActivity:
-		s.RunActivityNow()
+		s.runActivity(ctx)
 	case taskKeepalive:
 		s.RunKeepaliveNow()
 	case taskSchool:
@@ -375,7 +392,15 @@ func joinDetail(existing, add string) string {
 // ② 无猫账号立即重试领养（travelAdoptForce）——对话量刚补满的新状态，不算重试，
 // 豁免 adoptTriedToday 当日防抖（旅行排程 09 点已领养过且 skip，10 点上报补满后
 // 不能依赖下一轮旅行领养，就地闭环）。
+// RunActivityNow 立即对池内所有可用账号执行对话活跃上报（无 ctx 的外部入口：
+// cmd/activity 一次性触发、测试）。内部走 runActivity，取背景 ctx（不可取消，
+// 语义与引入前 time.Sleep 版一致）。
 func (s *Scheduler) RunActivityNow() {
+	s.runActivity(context.Background())
+}
+
+// runActivity 活跃上报遍历，随 ctx 取消立即退出。
+func (s *Scheduler) runActivity(ctx context.Context) {
 	count := s.cfg.ActivityReportCount
 	first := true
 	for _, st := range s.cfg.Pool.List() {
@@ -390,7 +415,9 @@ func (s *Scheduler) RunActivityNow() {
 		// 点亮连登）；realmBase 路由/头由 upstream.billingJSON/BillingHeaders 按 realm 切。
 		// 单账号失败只记 WARN 不影响遍历（下方 report err → break 该号 → continue 下号）。
 		if !first {
-			time.Sleep(activityAccountDelay)
+			if !sleepCtx(ctx, activityAccountDelay) {
+				return // 优雅停机：不等限速睡满，剩余账号下轮再报
+			}
 		}
 		first = false
 		// N 条共用同一 conversationId（同会话），requestId 各自独立（每条一个）。
@@ -405,7 +432,10 @@ func (s *Scheduler) RunActivityNow() {
 			log.Printf("activity %s: report %d/%d ok", logfmt.UID8(a.UID), i, count)
 			ok++
 			if i < count {
-				time.Sleep(activityReportGap) // 账号内 5 条之间间隔，避免秒发风控
+				// 账号内 5 条之间间隔，避免秒发风控；取消时立即放弃本号剩余条数。
+				if !sleepCtx(ctx, activityReportGap) {
+					return
+				}
 			}
 		}
 		if ok < count {

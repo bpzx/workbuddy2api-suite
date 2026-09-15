@@ -24,6 +24,12 @@ async def login(request: Request) -> JSONResponse:
         body = await request.json()
     except Exception:  # noqa: BLE001
         raise HTTPException(status_code=400, detail='请求格式错误') from None
+    # body 必须是 JSON 对象：`null` / `[]` / `"str"` / `123` 都是**合法 JSON**，
+    # 上面的 try 不会拦住它们，随后 body.get(...) 会抛 AttributeError → 500。
+    # 500 不泄露内容，但属于未处理异常：每次触发都在服务端留下错误日志
+    # （可被用来刷日志），且暴露了输入校验不完整。这里显式拒绝。
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail='请求格式错误') from None
     username = str(body.get('username', '')).strip()[:64]
     password = str(body.get('password', ''))
 

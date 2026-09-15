@@ -58,6 +58,15 @@ jobs:
           grep -q "_internal_direct_mounts" \
             /tmp/patched/manager/server/config.py \
             || { echo "::error::补丁 1 未生效（config.py 缺少 mounts 逻辑）"; exit 1; }
+          grep -q "docker compose pull" \
+            /tmp/patched/manager/web/components/common/settings/UpdatePanel.tsx \
+            || { echo "::error::补丁 3 未生效（更新面板仍显示裸机文案）"; exit 1; }
+          # 旧的误导文案必须消失，否则用户会以为点按钮就能更新
+          if grep -q "点下方按钮即可更新" \
+            /tmp/patched/manager/web/components/common/settings/UpdatePanel.tsx; then
+            echo "::error::更新面板仍残留裸机误导文案"
+            exit 1
+          fi
           echo "补丁校验通过"
 
       - name: Set up Go

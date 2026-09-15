@@ -39,7 +39,8 @@ WORKDIR /src/web
 COPY --from=vpatch /src/vendor/manager/web/package.json /src/vendor/manager/web/package-lock.json ./
 RUN npm ci
 # 再拷源码构建。build:export = NEXT_OUTPUT_EXPORT=1 next build → out/
-# 用打过补丁的源码（manager/web 不含补丁，但保持来源一致，避免两处取源）
+# ⚠️ 必须取自 vpatch：manager/web 的「更新」面板文案带集成补丁（补丁 3），
+# 从构建上下文拷会丢掉补丁，界面上就会继续显示裸机部署的误导文案。
 COPY --from=vpatch /src/vendor/manager/web/ ./
 RUN npm run build:export \
  && test -f out/index.html

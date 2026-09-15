@@ -322,6 +322,9 @@ async def fetch_models(auth: dict) -> tuple[bool, list | str]:
     口径与上游 FetchModels 保持一致：
       - 只取 agents 里名为 `cli` 的模型 id 列表（那才是对 CLI 暴露的）
       - `disabled` 的条目不收录
+      - **过滤非对话模型**（上游 2026-09-14 新增）：见 `_non_chat_model`。
+        不过滤的话，模型中心会列出嵌入/补全/图片生成这类模型，用户选中后
+        聊天直接报 `code=11102`（上游明确说「选了报错」）。
     路径按版本分派：国际版 `/v2/enterprises/personal/models` 优先、
     `/console/...` 回落；国内版直接 `/console/...`。
     返回 (ok, models 或错误信息)。不含任何凭据。
@@ -370,22 +373,59 @@ async def fetch_models(auth: dict) -> tuple[bool, list | str]:
             continue
         reasoning = m.get('reasoning') if isinstance(m.get('reasoning'), dict) else {}
         efforts = reasoning.get('supportedEfforts')
-        info[str(m['id'])] = {
-            'id': str(m['id']),
+        mid = str(m['id'])
+        tags = m.get('tags') if isinstance(m.get('tags'), list) else []
+        info[mid] = {
+            'id': mid,
             'name': str(m.get('name') or '').strip(),
             'context_length': _as_int(m.get('maxInputTokens')),
             'max_output_tokens': _as_int(m.get('maxOutputTokens')),
             'disabled': bool(m.get('disabled')),
             'efforts': [str(x) for x in efforts if x] if isinstance(efforts, list) else [],
+            # 推理默认档位（上游 2026-09-14 起解析并用于 thinking 决策）。
+            # 空 = 上游未声明，此时上游会回退到自己的硬编码默认。
+            'default_effort': str(reasoning.get('defaultEffort') or '').strip(),
+            # 多模态能力：官方 /v1/models 也透出该字段（supports_images）
+            'supports_images': bool(m.get('supportsImages')),
+            '_non_chat': _non_chat_model(mid, _as_int(m.get('maxOutputTokens')), tags),
         }
 
     # cli 列表为空时退回全部未禁用模型：上游此时直接报错，但管理端只是展示，
     # 给个可用列表比整页空白更有用（来源会在 UI 上如实标注）。
     ids = cli_ids or list(info.keys())
-    out = [info[i] for i in ids if i in info and not info[i]['disabled']]
+    out: list[dict] = []
+    for i in ids:
+        item = info.get(i)
+        if not item or item['disabled']:
+            continue
+        # 内部标记一律去掉（无论是否命中过滤）——否则它会随 API 响应漏到前端
+        if item.pop('_non_chat', False):
+            continue
+        out.append(item)
     if not out:
         return False, '模型接口未返回任何可用模型'
     return True, out
+
+
+def _non_chat_model(mid: str, max_output_tokens: int, tags: list) -> bool:
+    """是否非对话模型（应从可选列表里剔除）。
+
+    镜像上游 nonChatModel（2026-09-14 新增，来源 harness buddy.ts:547-555）。
+    三类：
+      * id 前缀 `nes-` / `completion-` / `codewise-`：嵌入 / 补全 / 代码专用，
+        选了会报 `code=11102`；
+      * `maxOutputTokens <= 256`：输出上限过小，属 tiny 非对话模型；
+      * tags 含 `text-to-image`：图片生成，不是本网关用途。
+
+    为什么要跟：模型中心是给用户**挑模型**的地方，列出选不了的东西
+    等于制造一次必然失败的尝试。
+    """
+    low = (mid or '').strip().lower()
+    if low.startswith(('nes-', 'completion-', 'codewise-')):
+        return True
+    if 0 < max_output_tokens <= 256:
+        return True
+    return any(str(t) == 'text-to-image' for t in tags)
 
 
 def _as_int(v: object) -> int:

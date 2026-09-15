@@ -202,12 +202,22 @@ docker compose pull && docker compose up -d   # 更新到最新镜像
 ### 更新镜像
 
 镜像构建在 GitHub Actions 上完成并推送到 ghcr.io。
-**容器内不提供「一键更新」**（没有 git、systemd，镜像层只读），
-面板上点更新会明确提示改用下面的命令：
+
+**容器内不提供「一键更新」**（没有 git、systemd，镜像层只读）。
+面板上「更新」按钮**不会改动任何代码**——点击后它只会在日志里打印下面的
+命令，供你复制到宿主机执行：
 
 ```bash
 docker compose pull && docker compose up -d
 ```
+
+> 面板会提示 "管理端 vX → vY" 这类新版本信息，那个检测本身有效
+> （它查 GitHub 上的版本号），只是**更新动作必须在宿主机做**。
+> 界面上相关文案已改为容器部署的真实说明。
+>
+> 同样地，「固定上游版本」输入框在容器里不可用（没有上游 git 仓库，
+> 无法检出指定版本）。要固定或回退上游版本，用
+> `./scripts/sync-upstreams.sh --ref <commit>` 后重新构建镜像。
 
 更新前建议先看新镜像捆绑的上游版本：
 
@@ -264,7 +274,7 @@ git pull
 | 容器入口以 root 启动 | 仅为 chown 数据目录后立刻 gosu 降权到 uid 10001；服务进程本身非 root。这是宿主目录挂载的必然代价（命名卷无此问题） |
 | 代理能力靠构建期补丁注入 | 上游的 httpx 内网绕过、Go transport 代理支持均以补丁实现（`docker/patches/apply.py`）。上游若重构对应代码，**构建会失败**并指出要改哪里——这是刻意设计，避免静默失效 |
 | 网关不认 `ALL_PROXY` | Go 标准库只读 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`；代理只配在 `ALL_PROXY` 时网关不走代理 |
-| Windows 上 Go 测试有 2 个失败 | `rate_limited_models` 用例依赖亚毫秒时钟精度，Windows 时钟粒度约 0.5ms 导致；Linux / CI 通过 |
+| Python 测试在 Windows 有 2 个失败 | `test_first_token` 的临时目录清理在 Windows 上抛 `NotADirectoryError`（上游 `tearDown` 只捕获 `PermissionError`）；Linux / CI 通过 |
 
 ---
 

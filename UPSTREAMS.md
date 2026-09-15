@@ -12,14 +12,14 @@
 
 | 上游 | 仓库 | 分支 | Commit | 提交时间 | 快照位置 |
 |---|---|---|---|---|---|
-| wb2api | [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) | `master` | [`b5077d5`](https://github.com/Sliverkiss/workbuddy2api/commit/b5077d513a9e4f4fd0d032d4ae369c850c41da23) | 2026-09-15 00:52 | `vendor/wb2api` |
-| manager | [ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) | `main` | [`e3e7bb9`](https://github.com/ithtelab/workbuddy-manager/commit/e3e7bb93b28ac9b4c01e1eb4165eb24b06834426) | 2026-09-14 23:54 | `vendor/manager` |
+| wb2api | [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) | `master` | [`39f3c3f`](https://github.com/Sliverkiss/workbuddy2api/commit/39f3c3fbd485c9a5f15b05daf81c3c67141632d4) | 2026-09-15 14:17 | `vendor/wb2api` |
+| manager | [ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) | `main` | [`3ed6c48`](https://github.com/ithtelab/workbuddy-manager/commit/3ed6c4894fceca017a1d7e3631c94c0e4453dc22) | 2026-09-15 13:47 | `vendor/manager` |
 
-- wb2api：`refactor(upstream): thinking.go 用模型 defaultEffort 替代硬编码`
-  （本次含 13 个提交：状态机收敛、`prompt_cache_key` 费用优化 ~17×、
-  流式 tool_calls 修复、非对话模型过滤）
-- manager：`review(upstream): a50c923b 流式 tool_calls name 收敛 —— 确认无需适配`
-  （面板显示版本 v1.0.28）
+- wb2api：`fix(scheduler): 去串行化 + sleep 换 select-ctx 可取消`
+  （本次含 20+ 提交：熔断/模型冷却持久化、429 冷却对齐上游重置时间、
+  tool_call 配对清理与截断检测、推理档位透出、跨平台路径修复）
+- manager：`improve(update): deploy/ 差异提示说清「要不要紧」`
+  （面板显示版本 **v1.0.31**）
 
 > 记录的是**分支 + commit**，不是 Release tag：上游的 CHANGELOG 常滞后于
 > 代码（manager 打完 v1.0.25 后仍有未发版提交），按 tag 记录会失真。
@@ -76,21 +76,25 @@ internal/prompt/prompt.go:17:12: pattern defaultprompt.md: no matching files fou
 
 ## 构建期补丁登记
 
-上游代码保持原样入库，但容器化集成需要两处上游没有的行为，因此在**构建期**
+上游代码保持原样入库，但容器化集成需要三处上游没有的行为，因此在**构建期**
 打补丁（`docker/patches/apply.py`，Dockerfile 的 `vpatch` 阶段）。
 
 | # | 目标 | 上游位置 | 补丁内容 | 为什么需要 |
 |---|---|---|---|---|
 | 1 | manager | `server/config.py` · `http_client()` | 给内部服务（`WB2API_BASE`、`dockerproxy`）挂直连 transport（`mounts`） | httpx 的 `proxy=` 作用于所有请求；配了 SOCKS 后连内网上游 `wb2api:7863` 也会走代理，管理端连不上自己的上游。`no_proxy` 环境变量在显式 `proxy=` 下**不生效**（已实测） |
 | 2 | wb2api | `internal/upstream/client.go` · `New()` | 给 `http.Transport` 设 `Proxy: http.ProxyFromEnvironment` | 上游未设该字段，Go 零值 = **恒不使用代理**且不读环境变量，网关出站无法走代理 |
+| 3 | manager 前端 | `web/components/common/settings/UpdatePanel.tsx` | 「更新」面板文案改为容器部署的真实操作 | 上游文案描述的是**裸机部署**（git + systemd + Release 包）。本项目在构建期已把 `deploy/update.py` 换成替身（不执行实际更新），文案若不改，用户会以为点按钮就能更新——实际什么都发生不了 |
+
+补丁 3 覆盖的文案：顶部提示行、"一键更新"面板标题与说明、三个按钮的 hint、
+确认弹窗措辞、"固定上游版本"整块（容器内无 git，该功能不可用）。
 
 ### 补丁是 fail-fast 的
 
 补丁脚本先断言「锚点文本存在且只出现一次」，不满足就**让构建失败**，
 并打印要改哪里。这比静默跳过更安全——后者会让镜像"能构建、能启动"，
-但代理行为悄悄失效，极难排查。
+但补丁意图悄悄失效，极难排查。
 
-因此上游若重构了这两处，**构建会红**，这是预期行为。按提示更新锚点文本即可。
+因此上游若重构了这几处，**构建会红**，这是预期行为。按提示更新锚点文本即可。
 
 ### 同步上游时的注意事项
 

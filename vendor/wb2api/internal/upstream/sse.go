@@ -137,7 +137,15 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		for _, idx := range toolOrder {
 			calls = append(calls, toolCalls[idx])
 		}
-		message["tool_calls"] = calls
+		// P1b：finish_reason==length 且 tool_call 的 arguments 是残缺 JSON（解析失败）
+		// 时不把脏参数交给客户端——残留分片会被客户端解析成非法 JSON 卡死会话。
+		// 完整参数原样保留（正例零改动）；空参数（无参工具）不是截断，同样保留。
+		if finishReason == "length" {
+			calls = dropTruncatedToolCalls(calls)
+		}
+		if len(calls) > 0 {
+			message["tool_calls"] = calls
+		}
 	}
 	resp := map[string]any{
 		"id":      id,

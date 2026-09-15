@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"log"
 	"os"
@@ -108,6 +109,8 @@ func TestNextWakeSchoolCatDisabled(t *testing.T) {
 // TestRunSchoolNowBuildsCommand RunSchoolNow 构造
 // python3 scripts/school_open_day_2026.py ALL --run --yes，工作目录设为仓库根。
 func TestRunSchoolNowBuildsCommand(t *testing.T) {
+	// 防环境泄漏：WB2A_PYTHON 若在测试机已设置会改写 pythonCmd()，使默认值断言失败。
+	t.Setenv("WB2A_PYTHON", "")
 	f := installFakeExec(t)
 	s := New(Config{})
 	s.RunSchoolNow()
@@ -129,6 +132,7 @@ func TestRunSchoolNowBuildsCommand(t *testing.T) {
 // TestRunCatNowBuildsCommand RunCatNow 构造
 // python3 scripts/task_runner.py ALL --yes --only black_cat，工作目录为仓库根。
 func TestRunCatNowBuildsCommand(t *testing.T) {
+	t.Setenv("WB2A_PYTHON", "")
 	f := installFakeExec(t)
 	s := New(Config{})
 	s.RunCatNow()
@@ -144,6 +148,7 @@ func TestRunCatNowBuildsCommand(t *testing.T) {
 // TestDispatchSchoolCatAndFailureWarnsOnly dispatch 把 school/cat 分发给对应脚本；
 // 脚本失败只记 WARN（不 panic/不向上抛），且不影响后续任务继续分发。
 func TestDispatchSchoolCatAndFailureWarnsOnly(t *testing.T) {
+	t.Setenv("WB2A_PYTHON", "")
 	f := installFakeExec(t)
 	f.err = errors.New("boom boom")
 	s := New(Config{})
@@ -156,11 +161,11 @@ func TestDispatchSchoolCatAndFailureWarnsOnly(t *testing.T) {
 		log.SetFlags(log.LstdFlags)
 	})
 
-	s.dispatch(taskSchool)
+	s.dispatch(context.Background(), taskSchool)
 	if f.runN != 1 || f.lastArgs[0] != "scripts/school_open_day_2026.py" {
 		t.Errorf("dispatch(school) 未执行: runN=%d last=%v", f.runN, f.lastArgs)
 	}
-	s.dispatch(taskCat)
+	s.dispatch(context.Background(), taskCat)
 	if f.runN != 2 || f.lastArgs[0] != "scripts/task_runner.py" {
 		t.Errorf("dispatch(cat) 未执行: runN=%d last=%v", f.runN, f.lastArgs)
 	}
@@ -170,5 +175,29 @@ func TestDispatchSchoolCatAndFailureWarnsOnly(t *testing.T) {
 	}
 	if !strings.Contains(out, "scripts/task_runner.py") {
 		t.Errorf("cat 失败未按 WARN 记录:\n%s", out)
+	}
+}
+
+// TestPythonCmd WB2A_PYTHON 覆盖解释器名：缺省/空白回落 "python3"（保持
+// 容器与既有测试的行为不变），显式设置时取其值（Windows 等仅有 python 的环境）。
+func TestPythonCmd(t *testing.T) {
+	t.Setenv("WB2A_PYTHON", "")
+	if got := pythonCmd(); got != "python3" {
+		t.Errorf("default pythonCmd()=%q want python3", got)
+	}
+
+	t.Setenv("WB2A_PYTHON", "   ")
+	if got := pythonCmd(); got != "python3" {
+		t.Errorf("blank pythonCmd()=%q want python3", got)
+	}
+
+	t.Setenv("WB2A_PYTHON", "python")
+	if got := pythonCmd(); got != "python" {
+		t.Errorf("override pythonCmd()=%q want python", got)
+	}
+
+	t.Setenv("WB2A_PYTHON", "  /usr/bin/python3.10  ")
+	if got := pythonCmd(); got != "/usr/bin/python3.10" {
+		t.Errorf("trim pythonCmd()=%q want /usr/bin/python3.10", got)
 	}
 }

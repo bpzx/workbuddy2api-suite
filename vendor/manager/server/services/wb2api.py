@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ipaddress
 import json
 import re
 import time
@@ -168,6 +169,16 @@ def merge_pool_status(accounts: list[dict], status: dict) -> list[dict]:
         credits = p.get('credits')
         a['credits'] = int(credits) if isinstance(credits, (int, float)) else None
         a['cooling'] = bool(p.get('cooling'))
+        # 冷却剩余秒数：上游状态机给的是权威值（可能是它解析出的「上游重置时刻」，
+        # 也可能是无时间文案时的有界退避）。展示出来，用户就知道还要等多久，
+        # 而不是只看到一个「冷却中」干等。
+        _remain = p.get('cool_remaining_sec')
+        a['cool_remaining_sec'] = int(_remain) if isinstance(_remain, (int, float)) and _remain > 0 else None
+        # 被限流的模型清单（上游 issue #36 的限额台账）：多模型限流时，
+        # 账号级 until 不等于各模型各自的恢复时刻，需分别展示。
+        # 只透传列表形态（前端直接 .map()）；异常类型归空列表，避免整页崩掉。
+        _rl = p.get('rate_limited_models')
+        a['rate_limited_models'] = _rl if isinstance(_rl, list) else []
         a['disabled'] = bool(p.get('disabled'))
         # 禁用原因：上游对 11140（request illegal，需重新 OAuth 登录）会**硬禁用**
         # 账号（到期也不自愈），对 14017（试用未激活）只软冷却。展示原因才能
@@ -590,6 +601,9 @@ def _upstash_rest_base(url: str) -> str | None:
 
     支持：https://xxx.upstash.io / xxx.upstash.io / rediss://default:tok@xxx.upstash.io:6379
     与 workbuddy2api 的 normalizeURL 保持一致的思路。
+
+    **只做字符串归一化，不做安全判定**：调用方（test_upstash）必须再过一道
+    `_reject_internal_host`，否则这里返回的任意主机会被服务端真的请求出去。
     """
     raw = (url or '').strip()
     if not raw:
@@ -609,11 +623,61 @@ def _upstash_rest_base(url: str) -> str | None:
     return f'https://{host}' if host else None
 
 
+# 明确禁止的主机名（云平台元数据服务：SSRF 的头号目标）
+_BLOCKED_HOSTNAMES = (
+    'metadata.google.internal',
+    'metadata.tencentyun.com',
+    'metadata',
+    'instance-data',
+)
+
+
+def _reject_internal_host(host: str) -> str | None:
+    """判断主机是否指向内网/本机/元数据服务；是则返回拒绝原因，否则 None。
+
+    为什么必须拦：这是个**服务端代发起请求**的接口（SSRF）。它拿用户给的地址
+    去 POST，再把响应片段回显给调用方。若不拦，管理员账号（或被提权到此的
+    攻击者）就能用它探测内网、甚至读取云元数据端点（`169.254.169.254` /
+    `metadata.tencentyun.com` —— 后者常能拿到实例临时凭证）。
+
+    管理员权限不等于「可以随便发请求」：这类探测是典型的**提权后利用**步骤，
+    纵深防御应当在这里就断掉。
+
+    注意允许自定义 Redis 服务商（如自建 Upstash 兼容服务）：所以不是白名单
+    域名，而是**排除内网与元数据**——公网主机名/IP 一律放行。
+    """
+    h = (host or '').strip().strip('[]').lower()
+    if not h:
+        return '地址为空'
+    if h in _BLOCKED_HOSTNAMES or h.endswith('.internal') or h.endswith('.local'):
+        return f'{host} 是不允许探测的内部地址'
+    # 明文 IP：拦掉回环 / 私有 / 链路本地（含云元数据 169.254.169.254）/ 保留段
+    try:
+        addr = ipaddress.ip_address(h)
+    except ValueError:
+        # 不是 IP 字面量（域名）→ 放行。域名解析到内网的情况由部署方的网络策略兜底，
+        # 这里不做 DNS 解析：解析后校验会引入 TOCTOU（解析与请求之间结果可能变），
+        # 而且会让每次测试多一次 DNS 查询。
+        return None
+    if (addr.is_loopback or addr.is_private or addr.is_link_local
+            or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
+        return f'{host} 是不允许探测的内部地址'
+    return None
+
+
 async def test_upstash(url: str, token: str | None = None) -> tuple[bool, str]:
-    """用 Upstash REST 接口探测连通性（PING）。token 留空时取配置文件中的值。"""
+    """用 Upstash REST 接口探测连通性（PING）。token 留空时取配置文件中的值。
+
+    安全：地址经 `_reject_internal_host` 过滤——这是服务端代发起请求的接口，
+    不能让它打到内网或云元数据端点（SSRF）。
+    """
     base = _upstash_rest_base(url)
     if not base:
         return False, '请先填写 Upstash 地址'
+    host = base.split('://', 1)[-1].split('/', 1)[0]
+    blocked = _reject_internal_host(host)
+    if blocked:
+        return False, blocked
 
     if not token:
         try:

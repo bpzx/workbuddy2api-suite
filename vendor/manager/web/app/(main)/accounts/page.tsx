@@ -232,12 +232,29 @@ export default function AccountsPage() {
       );
     }
     if (a.is_expired) return <Badge variant="destructive" className="rounded-full">● 已过期</Badge>;
-    if (a.cooling)
+    if (a.cooling) {
+      // 带上「还要等多久」：只写「冷却中」的话用户不知道是几秒还是几小时，
+      // 只能反复刷新碰运气。剩余时间是上游状态机给的权威值。
+      const secs = a.cool_remaining_sec;
+      const left = typeof secs === 'number' && secs > 0 ? fmtRemain(secs) : '';
+      const models = (a.rate_limited_models ?? []).map((m) => m.model);
+      const tip = [
+        left ? `预计 ${left}后恢复` : '',
+        models.length ? `被限流的模型：${models.join('、')}` : '',
+      ]
+        .filter(Boolean)
+        .join('\n');
       return (
-        <Badge variant="secondary" className="rounded-full text-amber-600 dark:text-amber-400">
-          ● 冷却中
+        <Badge
+          variant="secondary"
+          className="rounded-full text-amber-600 dark:text-amber-400"
+          title={tip || undefined}
+        >
+          ● 冷却中{left ? ` · ${left}` : ''}
+          {models.length > 1 && <span className="ml-1 opacity-70">（{models.length} 个模型）</span>}
         </Badge>
       );
+    }
     return (
       <Badge variant="secondary" className="rounded-full text-emerald-600 dark:text-emerald-400">
         ● 在线

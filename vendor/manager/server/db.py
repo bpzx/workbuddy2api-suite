@@ -5,6 +5,7 @@ import json
 import sqlite3
 import threading
 import time
+from pathlib import Path
 from typing import Any, Iterable
 
 from . import config
@@ -163,6 +164,30 @@ CREATE INDEX IF NOT EXISTS idx_task_logs_ts ON task_logs(ts);
 """
 
 
+def _restrict_db_permissions() -> None:
+    """把数据库文件（含 WAL/SHM 伴生文件）收紧到仅属主可读写。
+
+    为什么：库里存着 **API 密钥的哈希与前缀、全部请求日志（含来源 IP 与 UA）、
+    审计日志**。默认创建的 SQLite 文件是 0644——同主机的其他用户，或任何能读到
+    该目录的进程，都能直接读走：密钥前缀可用于针对性爆破，日志则暴露调用方与
+    内部拓扑。
+
+    WAL 模式下还有 `-wal` / `-shm` 两个伴生文件，同样含尚未落盘的数据，
+    必须一并收紧（只 chmod 主库文件是不够的）。
+
+    Windows 上 chmod 语义有限，失败静默忽略——不影响功能。
+    """
+    import os
+    import stat as _stat
+    for suffix in ('', '-wal', '-shm'):
+        p = Path(str(config.DB_PATH) + suffix)
+        try:
+            if p.exists():
+                os.chmod(p, _stat.S_IRUSR | _stat.S_IWUSR)
+        except OSError:
+            pass
+
+
 def connect() -> sqlite3.Connection:
     global _conn
     if _conn is None:
@@ -174,6 +199,8 @@ def connect() -> sqlite3.Connection:
         _conn.executescript(SCHEMA)
         _migrate(_conn)
         _conn.commit()
+        # 建表之后再收紧权限：库文件此刻才确定存在，WAL 伴生文件也在初始化后出现
+        _restrict_db_permissions()
     return _conn
 
 

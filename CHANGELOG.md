@@ -41,6 +41,21 @@
   > 该校验在开发中当场抓到了真实问题（中文文件名被 git 转义导致的假阳性），
   > 已改用 NUL 分隔比较（`-z`）修正。
 
+### 修复
+
+- **面板「更新」按钮的误导性文案**（用户实测反馈）。上游文案描述的是
+  **裸机部署**："点下方按钮即可更新，账号与配置会自动保留"、"从 GitHub
+  拉取最新代码并自动重建/重启"、按钮 hint "重建容器 / 替换代码与前端"。
+  但本项目在构建期已把 `deploy/update.py` 换成替身脚本（不执行实际更新），
+  文案却不一致 —— 用户按提示点按钮，**什么都不发生**。
+
+  这是本项目的设计缺陷：替换了更新器的**行为**，却没改**界面文案**。
+
+  修法（补丁 3）：顶部提示行、面板标题与说明、三个按钮 hint、确认弹窗措辞
+  全部改为容器部署的真实说明；「固定上游版本」整块标注为容器内不可用
+  （无上游 git 仓库），并给出 `sync-upstreams.sh --ref` 的替代做法。
+  CI 增加断言：补丁必须落地，且旧的误导文案必须消失。
+
 ### 新增
 
 - **出口代理支持**（`.env` 的 `WB_HTTP_PROXY`），两个服务分别处理：
@@ -87,24 +102,33 @@
 
 | 上游 | 分支 | Commit | 提交时间 |
 |---|---|---|---|
-| Sliverkiss/workbuddy2api | `master` | `b5077d5` | 2026-09-15 00:52 |
-| ithtelab/workbuddy-manager | `main` | `e3e7bb9` | 2026-09-14 23:54 |
+| Sliverkiss/workbuddy2api | `master` | `39f3c3f` | 2026-09-15 14:17 |
+| ithtelab/workbuddy-manager | `main` | `3ed6c48` | 2026-09-15 13:47 |
 
-- wb2api：`refactor(upstream): thinking.go 用模型 defaultEffort 替代硬编码`
-  （含 13 个提交：状态机收敛为单一权威状态机、`prompt_cache_key` 按账号隔离
-  缓存键费用降 ~17×、流式 tool_calls name 收敛、`defaultEffort`/`supportsImages`
-  解析与过滤非对话模型）
-- manager：`review(upstream): a50c923b 流式 tool_calls name 收敛 —— 确认无需适配`
-  （面板显示版本 v1.0.28）
+- wb2api：`fix(scheduler): 去串行化 + sleep 换 select-ctx 可取消`
+  （含 20+ 提交：熔断与模型冷却持久化、429 冷却对齐上游重置时间、
+  tool_call 配对清理与截断检测、推理档位透出、跨平台路径修复、
+  `prompt_cache_key` 费用优化）
+- manager：`improve(update): deploy/ 差异提示说清「要不要紧」`
+  （面板显示版本 **v1.0.31**）
 
-### 集成层核对（本次同步后）
+### 集成层核对（同步后）
 
-- **补丁锚点仍有效**：wb2api 的 `internal/upstream/client.go` 本次改动很大
-  （+291 行），但 `http.Transport` 构造处未变，补丁 2 正常应用；
-  manager 的 `http_client()` 也未变。三处补丁全部应用成功。
-- **配置模板无需改**：上游 `config.example.json` 本次零差异。
-- **env 变量集合未变**：compose 无需调整。
+- **三处补丁全部正常应用**（共 10 个替换点）。wb2api 的 `client.go` 本次
+  改动很大，但 `http.Transport` 构造处未变；manager 的 `http_client()` 与
+  `UpdatePanel.tsx` 均未变。
+- **SSRF 守卫不冲突**：manager 本次新增 SSRF 防护（`_reject_internal_host`），
+  但它只作用于用户可传 URL 的接口（Upstash 连通性测试），
+  **不在 manager 调自己上游的路径上**，与补丁 1 的内网直连不冲突。
+- **替身脚本契约未变**：新版 `deploy/update.py` 的 `--target` 与状态文件
+  约定与替身一致。
+- **配置模板无需改**：上游 `config.example.json` 零差异。
+- **env 变量集合未变**（21 个）：compose 无需调整。
 - **Dockerfile COPY 清单未变**：无需跟改。
+
+> **Go 测试已全绿**：先前那 2 个在 Windows 上必现失败（`rate_limited_models`
+  依赖亚毫秒时钟精度）的用例，被上游本次改动顺带修掉了。现在
+  `go test ./...` 在 Windows 上也是 16/16 包全过。
 
 ### 新增
 

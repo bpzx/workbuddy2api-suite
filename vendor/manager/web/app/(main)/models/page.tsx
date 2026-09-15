@@ -98,8 +98,8 @@ export default function ModelsPage() {
 
   const [q, setQ] = useState('');
   const [series, setSeries] = useState('all');
-  /** 能力筛选：全部 / 支持推理 / 大上下文 */
-  const [cap, setCap] = useState<'all' | 'reasoning' | 'large'>('all');
+  /** 能力筛选：全部 / 支持推理 / 大上下文 / 多模态 */
+  const [cap, setCap] = useState<'all' | 'reasoning' | 'large' | 'vision'>('all');
 
   // realm 变化时重新拉取：两个版本的模型清单不同，且后端已按版本分开缓存
   const load = useCallback(async (force = false) => {
@@ -133,6 +133,7 @@ export default function ModelsPage() {
       if (series !== 'all' && m.series !== series) return false;
       if (cap === 'reasoning' && m.efforts.length === 0) return false;
       if (cap === 'large' && (m.context_length || 0) < 131072) return false;
+      if (cap === 'vision' && !m.supports_images) return false;
       if (!kw) return true;
       return (
         m.id.toLowerCase().includes(kw) ||
@@ -258,6 +259,7 @@ export default function ModelsPage() {
                 ['all', '全部'],
                 ['reasoning', '支持推理'],
                 ['large', '大上下文'],
+                ['vision', '多模态'],
               ] as const
             ).map(([k, label]) => (
               <Button
@@ -327,19 +329,36 @@ export default function ModelsPage() {
                       </TableCell>
                       <TableCell>
                         {m.efforts.length ? (
-                          <div className="flex flex-wrap gap-1">
+                          <div className="flex flex-wrap items-center gap-1">
                             {m.efforts.map((e) => (
                               <Badge key={e} variant="secondary" className="rounded-md font-mono text-[10px]">
                                 {e}
                               </Badge>
                             ))}
+                            {/* 默认档位单独标出来：上游 thinking 决策用它，
+                                用户据此知道不指定档位时会走哪一档 */}
+                            {m.default_effort && (
+                              <span
+                                className="text-[10px] text-muted-foreground"
+                                title={`未指定档位时默认使用 ${m.default_effort}`}
+                              >
+                                默认 {m.default_effort}
+                              </span>
+                            )}
                           </div>
                         ) : (
                           <span className="text-[11px] text-muted-foreground/60">—</span>
                         )}
                       </TableCell>
                       <TableCell className="pr-4">
-                        <SeriesBadge series={m.series} />
+                        <div className="flex items-center justify-end gap-1.5">
+                          {m.supports_images && (
+                            <Badge variant="secondary" className="rounded-md text-[10px]" title="支持图片输入">
+                              多模态
+                            </Badge>
+                          )}
+                          <SeriesBadge series={m.series} />
+                        </div>
                       </TableCell>
                     </TableRow>
                   ))}

@@ -109,6 +109,38 @@ class ProbeRequestShapeTest(unittest.TestCase):
         ok, msg = self._probe()
         self.assertTrue(ok, msg)
 
+    def test_probe_content_has_no_known_fingerprints(self) -> None:
+        """探测内容不得含上游内容审核的指纹词。
+
+        上游 2026-09-14 又修了脱敏的三处盲区（裸键名 / reasoning_content /
+        大小写），说明这份指纹词表是**活的**——它按逐字精确匹配拦截，命中即
+        返回 `11-128 Illegal API invocation from an unapproved channel`。
+
+        我们这条探测是**自己造的内容**（不是客户端透传），所以只要别写出
+        指纹词就永远安全。这条测试守住这一点：将来有人把探测内容改得像
+        Claude Code / Codex 的自述（那些正是被拦的模板句），会在这里失败。
+
+        词表来源：上游 internal/upstream/sanitize.go 的 sanitizeFeatures。
+        """
+        self._probe()
+        body = _Client.sent['json']
+        blob = json.dumps(body, ensure_ascii=False).lower()
+        offenders = [w for w in self.FINGERPRINT_WORDS if w.lower() in blob]
+        self.assertEqual(
+            offenders, [],
+            f'探测内容含上游内容审核指纹词：{offenders} —— 会被判 11-128 拦截',
+        )
+
+    # 上游 sanitizeFeatures 的词表（保持小写比较）
+    FINGERPRINT_WORDS = (
+        'x-anthropic-billing-header',
+        'You are Claude Code',
+        'Main branch (',
+        'You are a coding agent running in the Codex CLI',
+        'github.com/anthropics/',
+        '11-128',
+    )
+
 
 class ErrorCodeHintTest(unittest.TestCase):
     """错误码翻译：数字与「数字-数字」字符串都要能查到提示。"""

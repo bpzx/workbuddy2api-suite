@@ -59,8 +59,8 @@ type RateLimitedModel struct {
 	// Until 冷却到期时刻 = 该模型的独立冷却截止（modelCooldowns[m].Until，截断后），
 	// 多模型限流时不再等于 Status.Until（账号级）。
 	Until time.Time `json:"until,omitempty"`
-	// ResetAt 上游「将在 … 重置」的原始墙钟（未经 soft_rate_max 截断，跟 softRateReset）；
-	// 截断后 Until==ResetAt，省略 ResetAt 让台账自然减少一列。
+	// ResetAt 上游「将在 … 重置」的原始墙钟（未经 soft_rate_max 截断）；未截断时
+	// Until==ResetAt（两者同值）。截断/未截断都透出，台账始终可见上游权威时点。
 	ResetAt time.Time `json:"reset_at,omitempty"`
 	// Reason 触发原因（透出运维可读文案，同 Status.Reason）。
 	Reason string `json:"reason,omitempty"`
@@ -72,7 +72,9 @@ type entry struct {
 	// creditsExpiring 即将过期（签到时按 expiringSoon 窗口判定）的可用积分子集，
 	// 是 credits 的一部分（credits = creditsExpiring + 长期积分）。选号权重对其
 	// 额外加成：优先消耗快过期积分，避免官方活动赠送的奖励积分到期作废
-	// （issue:积分过期）。运行态，签到刷新，不单独持久化（credits 仍持总量）。
+	// （issue:积分过期）。持久化（stateAccount.CreditsExpiring）：重启后到下次
+	// 签到之间第四因子（weightOf ×8）不应失忆——签到 09:00/21:00 定期刷新，
+	// 窗口外重启会丢快过期积分偏好，可能让奖励积分到期作废。
 	creditsExpiring int64
 	successCount    int64     // 累计成功
 	errTotal        int64     // 累计错误（供成功率权重 successRate = successCount/(successCount+errTotal)，不清零）
@@ -89,7 +91,11 @@ type entry struct {
 	// lastUsed 全等 → LRU Before 全 false → 恒选 candsAll[0] → 集中单号）。
 	// usedSeq 提供严格全序，与时间精度无关。运行态，不持久化。
 	usedSeq uint64
-	// breakerUntil / fails / retryCount 为熔断器运行态（不持久化）。
+	// breakerUntil / fails / retryCount 为熔断器运行态。
+	// breakerUntil + retryCount 持久化（stateAccount.BreakerUntil/RetryCount）：
+	// breakerUntil 持久化以避免熔断期重启失忆（账号立即回到可选池再撞 5xx 雷区），
+	// retryCount 持久化以保留"越熔越长"的退避累积（重启归零会失去累积保护）。
+	// fails 不持久化——短期计数，重启从 0 累计可接受（达 breakerThreshold=3 才熔断）。
 	// fails 是唯一的"连续失败"计数器：任何错误喂入，达到 breakerThreshold 触发熔断（指数退避），
 	// 跨入口累计，成功/熔断/统一复活时清零（保留 retryCount 驱动退避指数）。
 	breakerUntil time.Time // 熔断截止（指数退避）
@@ -104,7 +110,9 @@ type entry struct {
 	// 与 until（全账号级）正交：6004 只写本表、不写 until，因此多个模型同时 6004 时
 	// 各自独立计时，互不覆盖（A 触发后 B 再触发，A 的冷却截止不被 B 覆盖——这是
 	// 单 until 字段做不到的）。only 6004 触发时记录；空 map = 无模型级限流（不豁免）。
-	// 运行态语义（不持久化）：重启清零，退化为仅账号级 until 冷却的现状。
+	// 持久化语义（stateAccount.ModelCooldowns）：重启后恢复，恢复时惰性过滤已过期
+	// 条目。PR #96 把 6004 改成精确对齐上游重置墙钟后，单模型冷却可长达数小时，
+	// 跨重启是常态；不持久化会导致 healthyForModel 重启失忆、重新踩 6004 雷区。
 	modelCooldowns map[string]modelCooldown
 	// sessionDeadFails 连续 12153（ErrSessionDead）计数。12153 在真实环境会被临时性触发
 	// （网络抖动/上游闪断/refresh 竞态），一次失败就永久禁用太粗暴——连续达到阈值才判死。
@@ -258,9 +266,36 @@ type stateAccount struct {
 	// 退避从基数重新开始（向后兼容）。
 	SoftStreak int `json:"soft_streak,omitempty"`
 
+	// BreakerUntil 熔断截止（指数退避）。仅未过期才持久化（落盘/恢复均惰性过滤），
+	// 避免熔断期重启失忆：breakerUntil 在未来时重启后仍阻断选号。过期/零值不写。
+	// 用 *time.Time（而非 time.Time）：Go 的 omitempty 对非指针 time.Time 的零值
+	// 不生效（会序列化成 0001-01-01T00:00:00Z）；指针 nil 才能真正被 omitempty 省略，
+	// 与落盘"过期不写"的口径一致。
+	BreakerUntil *time.Time `json:"breaker_until,omitempty"`
+	// RetryCount 已熔断次数（指数退避的指数）。持久化以保留"越熔越长"的退避累积——
+	// 重启归零会让反复熔断只从最小退避开始。仅在 BreakerUntil 未过期时才有意义，
+	// 恢复时若 BreakerUntil 已过期则 retryCount 归零（不保留无用退避指数）。
+	RetryCount int `json:"retry_count,omitempty"`
+	// CreditsExpiring 快过期积分子集（credits 的子集）。持久化以保留第四因子
+	// （weightOf ×8）的快过期积分偏好——重启后到下次签到之间不应失忆。
+	CreditsExpiring int64 `json:"credits_expiring,omitempty"`
+
 	// ModelCost 实测扣费账本（model → 观测）。仅内存态，重启后重新学习：
 	// 成本会随上游活动（限免期/夜间免费/折扣）变化，持久化旧值反而是脏数据。
 	ModelCost map[string]stateModelCost `json:"-"`
+	// ModelCooldowns 6004 模型级独立冷却表（model → 冷却记录）。持久化：
+	// PR #96 把 6004 改成精确对齐上游重置墙钟后，单模型冷却可长达数小时，
+	// 跨重启是常态；不持久化导致每次重启 healthyForModel 失忆、重新踩一遍
+	// 6004 雷区（选号撞限流号耗尽 MaxRotate → 429）。恢复时惰性过滤已过期条目。
+	ModelCooldowns map[string]stateModelCooldown `json:"model_cooldowns,omitempty"`
+}
+
+// stateModelCooldown 单个 (账号, 模型) 的 6004 独立冷却持久化记录，与运行态
+// modelCooldown 同构（Until/ResetAt/Reason 字段名与语义对齐），落盘/恢复往返无损。
+type stateModelCooldown struct {
+	Until   time.Time `json:"until,omitempty"`
+	ResetAt time.Time `json:"reset_at,omitempty"`
+	Reason  string    `json:"reason,omitempty"`
 }
 
 // stateModelCost 单个 (账号, 模型) 的实测成本观测。

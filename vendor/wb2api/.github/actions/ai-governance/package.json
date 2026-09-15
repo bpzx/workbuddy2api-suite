@@ -25,8 +25,8 @@
   "author": "workbuddy2api contributors (基于 JohnsonRan/nomore-spam)",
   "license": "MIT",
   "dependencies": {
-    "@actions/core": "^1.10.1",
-    "@actions/github": "^6.0.0",
+    "@actions/core": "^2.0.3",
+    "@actions/github": "^9.1.1",
     "openai": "^4.104.0"
   },
   "devDependencies": {

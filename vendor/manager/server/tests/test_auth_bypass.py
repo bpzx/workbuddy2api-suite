@@ -470,3 +470,65 @@ class KeysAuditRegressionTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class MalformedLoginBodyTest(unittest.TestCase):
+    """登录接口对「合法 JSON 但非对象」的 body 必须返回 400，而不是 500。
+
+    实测（真实部署 https://wk.sbai.shop/）：`null` 与 `[]` 会让 `body.get()`
+    抛 AttributeError → 500。虽然 500 的响应体只有 "Internal Server Error"、
+    不泄露堆栈，但这属于未处理异常：
+
+      * 每次触发都在服务端留下一条错误日志 —— 可被用来刷日志、淹没真实告警；
+      * 暴露输入校验不完整（`null`/`[]`/`"str"`/数字都是**合法 JSON**，
+        原有 try 只拦解析失败，拦不住它们）。
+
+    注意区别：解析失败的（如 `{`）本来就返回 400，这里补的是「能解析但类型不对」。
+    """
+
+    def setUp(self) -> None:
+        self._dir = Path(tempfile.mkdtemp())
+        self._orig = (config.DB_PATH, config.USERS_FILE, config.STATIC_DIR)
+        config.DB_PATH = self._dir / 'malformed.db'
+        config.USERS_FILE = self._dir / 'users.json'
+        config.STATIC_DIR = self._dir / 'no-static'
+
+        def _restore() -> None:
+            config.DB_PATH, config.USERS_FILE, config.STATIC_DIR = self._orig
+
+        self.addCleanup(_restore)
+        security.save_users({
+            'users': [{'username': 'admin', 'role': 'admin',
+                       'pwd_hash': security.make_hash('pw'), 'sv': 1}],
+            'secret': 'test-secret',
+        })
+        security._fail.clear()
+        security._user_fail.clear()
+        self.addCleanup(security._fail.clear)
+        self.addCleanup(security._user_fail.clear)
+        from server.main import app
+        self.c = TestClient(app)
+
+    def test_non_object_json_returns_400_not_500(self) -> None:
+        for body in ('null', '[]', '"str"', '123', 'true'):
+            r = self.c.post('/api/login', content=body,
+                            headers={'Content-Type': 'application/json'})
+            self.assertEqual(
+                r.status_code, 400,
+                f'body={body!r} 应返回 400（实际 {r.status_code}）—— '
+                '500 说明崩在未处理的异常上',
+            )
+
+    def test_unparseable_json_still_400(self) -> None:
+        r = self.c.post('/api/login', content='{',
+                        headers={'Content-Type': 'application/json'})
+        self.assertEqual(r.status_code, 400)
+
+    def test_valid_object_still_reaches_auth(self) -> None:
+        """修复不能把正常登录一起挡掉。"""
+        r = self.c.post('/api/login', json={'username': 'admin', 'password': 'wrong'})
+        self.assertEqual(r.status_code, 401, '正常对象 body 应走到鉴权逻辑（这里密码错→401）')
+
+    def test_correct_password_still_logs_in(self) -> None:
+        r = self.c.post('/api/login', json={'username': 'admin', 'password': 'pw'})
+        self.assertEqual(r.status_code, 200, r.text)

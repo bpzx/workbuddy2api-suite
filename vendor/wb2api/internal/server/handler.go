@@ -237,7 +237,15 @@ func (h *Handler) modelList() []map[string]any {
 				entry["context_length"] = 131072 // 兜底
 			}
 			if mi.SupportsImages {
-				entry["supports_images"] = true // P1：多模态能力透出
+				entry["supports_images"] = true // 多模态能力透出
+			}
+			// P0：effort 能力透出——远端 supportedEfforts 权威，缺失落到 CN 静态兜底表
+			// （issue #84 客户端可发现档位，不再盲传）。无档位→省略字段（非空数组）。
+			if efforts, def := upstream.EffortListing("cn", mi.ID, mi.Efforts, mi.DefaultEffort); efforts != nil {
+				entry["reasoning_supported_efforts"] = efforts
+				if def != "" {
+					entry["reasoning_default_effort"] = def
+				}
 			}
 			out = append(out, entry)
 		}
@@ -249,6 +257,13 @@ func (h *Handler) modelList() []map[string]any {
 			}
 			if id, ok := m["id"].(string); ok {
 				e["id"] = "cn:" + id
+				// P0：静态兜底分支同样按 CN 静态档位表透出 effort 能力（远端不可用时的可发现性）。
+				if efforts, def := upstream.EffortListing("cn", id, nil, ""); efforts != nil {
+					e["reasoning_supported_efforts"] = efforts
+					if def != "" {
+						e["reasoning_default_effort"] = def
+					}
+				}
 			}
 			out = append(out, e)
 		}
@@ -257,14 +272,25 @@ func (h *Handler) modelList() []map[string]any {
 	// 名单 = 探测结果 ∪ §7.2 静态（fetchGlobalModels 内合并去重）；无 global 账号时
 	// 直接静态名单且零上游调用。
 	if h.cfg.GlobalEnabled {
-		for _, id := range h.fetchGlobalModels() {
-			out = append(out, map[string]any{
+		// global 域 effort 能力三级查找：探测下发桶（权威）→ 静态兜底表 → 省略。
+		// 先 fetchGlobalModels（内部探测并落 effort 桶），再按 id 取快照。
+		globalIDs := h.fetchGlobalModels()
+		globalEfforts, globalDefaults := h.cfg.Upstream.GlobalEffortSnapshot()
+		for _, id := range globalIDs {
+			entry := map[string]any{
 				"id":             "global:" + id,
 				"object":         "model",
 				"created":        1753600000,
 				"owned_by":       "workbuddy",
 				"context_length": 131072,
-			})
+			}
+			if efforts, def := upstream.EffortListing("global", id, globalEfforts[id], globalDefaults[id]); efforts != nil {
+				entry["reasoning_supported_efforts"] = efforts
+				if def != "" {
+					entry["reasoning_default_effort"] = def
+				}
+			}
+			out = append(out, entry)
 		}
 	}
 	return out
@@ -670,9 +696,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 //
 // 七条路径，各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
-//   - ErrSoftRate → 默认 Cooldown(CoolSoft, soft_rate) 连续触发指数退避（封顶 soft_rate_max）；
-//     若上游 body 为模型级 6004 且带重置时间 → CooldownSoftForModel（until=重置墙钟，
-//     封顶 soft_rate_max，记录触发模型供切模型豁免）。
+//   - ErrSoftRate → 优先对齐上游重置墙钟（带「将在 … 重置」时 6004 走模型级豁免、
+//     非 6004 走账号级，均不指数堆加）；无重置时间才走有界退避（soft_rate 基数起、
+//     softStreak 翻倍、封顶 soft_rate_max，冷却中兜底探测不翻倍）。
 //   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s)：短冷却防雪崩，不随 soft_rate 退避。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
 //   - ErrContentBlocked → 不罚账号（无冷却/熔断/NoteError）；passthrough 首遇触发
@@ -694,18 +720,24 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 不需要异步核查（冗余）。立即换号。
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
 	case upstream.ErrSoftRate:
-		// 模型级 6004 且带「将在 … 重置」时间（issue #31）：冷却到上游明说的重置墙钟
-		// （封顶 soft_rate_max），记录触发模型 → 该账号对**其他模型**请求可豁免冷却。
-		// 解析失败（无时间文案 / 非 6004）→ 退回既有 600s 基数 + 指数退避现况。
-		if upstream.IsModelRateLimit(body) {
-			if resetAt, ok := upstream.ParseSoftRateReset(body); ok {
+		// 统一对齐上游重置时间（重构核心）：只要 body 带「将在 … 重置」，无论业务
+		// code 是 6004 还是 11140 rate-limiting 等形态，都精确冷却到该墙钟、绝不
+		// softStreak 指数堆加。
+		//   - 模型级（6004）→ CooldownSoftForModel：写 modelCooldowns[model]，切模型
+		//     豁免（既有 issue #31 语义）。
+		//   - 账号级（非 6004）→ CooldownSoftRate：写账号级 until，不产生模型豁免
+		//     （普通账号级限流不该因切模型绕过）。
+		if resetAt, ok := upstream.ParseRateReset(body); ok {
+			if upstream.IsModelRateLimit(body) {
 				h.cfg.Pool.CooldownSoftForModel(uid, h.cfg.SoftCooldown, resetAt, model, "6004 model rate limit")
 				return
 			}
+			h.cfg.Pool.CooldownSoftRate(uid, h.cfg.SoftCooldown, resetAt, "429 rate limit")
+			return
 		}
-		// 其余 soft_rate：软冷却基数来自 soft_rate（默认 600s）；同一账号连续触发时
-		// pool 内部按 softStreak 指数退避并封顶 soft_rate_max。
-		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "429 rate limit")
+		// 无重置时间 → 账号级有界退避（soft_rate 基数起、softStreak 翻倍、封顶
+		// soft_rate_max）；已在冷却中的兜底探测不翻倍（见 CooldownSoftRate）。
+		h.cfg.Pool.CooldownSoftRate(uid, h.cfg.SoftCooldown, time.Time{}, "429 rate limit")
 	case upstream.ErrSessionDead:
 		h.cfg.Pool.Disable(uid, "12153 session dead")
 	case upstream.ErrNotFound:

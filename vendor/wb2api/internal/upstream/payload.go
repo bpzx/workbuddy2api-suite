@@ -41,6 +41,14 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	}
 	normalizeToolChoice(obj)
 	normalizeRoles(obj)
+	// 孤儿 tool_call↔tool 配对清理（见 tool_pairing.go）：所有模型一律执行（独立于
+	// deepseek-only 的 sanitize 开关）。这是「让请求通过」的安全网——不完整配对的
+	// tool_calls/tool 结果会让上游对之后每条消息都返 400，必须先行剔除。
+	if msgs, ok := obj["messages"].([]any); ok {
+		if cleaned, ch := cleanupOrphanToolCalls(msgs); ch {
+			obj["messages"] = cleaned
+		}
+	}
 	// DeepSeek 思维链开关（见 thinking.go）：注入 thinking.type=enabled + 缺档补默认档。
 	// 先于 normalizeReasoningEffort 执行：补入的默认档也要走既有降级管线，
 	// 模型不支持默认档时自动落到 ≤ 默认档的最高支持档（不出站不合规档位）。
