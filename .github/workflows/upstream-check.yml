@@ -1,0 +1,121 @@
+# 上游漂移检测。
+#
+# vendored 快照不会自动跟随上游（这是刻意的：本项目要的是"确定的某个上游版本"，
+# 而不是"跟随变动"）。但漂移不能没人知道——上游常常带的是风控指纹对齐、
+# 错误码表更新这类与账号安全直接相关的东西，值得及时跟进。
+#
+# 本工作流每天比对 upstreams.json 锁定的 commit 与上游仓库最新 commit，
+# 发现漂移就开 issue（同一天重复检测只更新，不刷屏）。
+# 不喜欢这个机制的话，直接删掉本文件即可，不影响构建。
+name: Upstream Drift Check
+
+on:
+  schedule:
+    # 每天北京时间 09:00 = UTC 01:00
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare pinned vs upstream HEAD
+        id: drift
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          def gh(url):
+              req = urllib.request.Request(url, headers={
+                  'Accept': 'application/vnd.github+json',
+                  'User-Agent': 'workbuddy2api-suite-drift-check',
+                  # 未认证走 GITHUB_TOKEN 以免撞 60 次/小时限流
+                  'Authorization': f"Bearer {os.environ['GH_TOKEN']}",
+              })
+              with urllib.request.urlopen(req, timeout=20) as resp:
+                  return json.loads(resp.read().decode())
+
+          with open('upstreams.json', encoding='utf-8') as fh:
+              upstreams = json.load(fh)['upstreams']
+
+          lines = []
+          drifted = False
+          for name, info in upstreams.items():
+              slug, branch = info['repo'], info['branch']
+              pinned = info['commit']
+              try:
+                  commits = gh(f"https://api.github.com/repos/{slug}/commits?sha={branch}&per_page=1")
+                  head = commits[0]['sha']
+                  date = commits[0]['commit']['committer']['date']
+                  subject = commits[0]['commit']['message'].split('\n')[0]
+              except Exception as exc:  # noqa: BLE001
+                  lines.append(f"| {name} | `{slug}` | 查询失败：{exc} |  |  |")
+                  continue
+
+              if head == pinned:
+                  lines.append(f"| {name} | `{slug}` | 已是最新 | `{pinned[:7]}` | — |")
+              else:
+                  drifted = True
+                  lines.append(
+                      f"| {name} | `{slug}` | **有新提交** | `{pinned[:7]}` → `{head[:7]}` | {date} |"
+                  )
+                  lines.append(f"|  |  | 最新提交 | {subject} |  |")
+
+          body = "\n".join(lines)
+          out = os.environ['GITHUB_OUTPUT']
+          with open(out, 'a', encoding='utf-8') as fh:
+              fh.write(f"drifted={'1' if drifted else '0'}\n")
+              print(f"drifted={'1' if drifted else '0'}")
+              # 多行值用 heredoc 语法传给后续步骤
+              fh.write("body<<EOF\n")
+              fh.write('| 上游 | 仓库 | 状态 | Commit | 时间 |\n|---|---|---|---|---|\n')
+              fh.write(body + "\n")
+              fh.write("EOF\n")
+          PY
+
+      - name: Open or update issue
+        if: steps.drift.outputs.drifted == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="上游有更新可同步"
+          BODY="$(cat <<EOF
+          vendored 快照落后于上游。同步方式：
+
+          \`\`\`bash
+          git pull
+          ./scripts/sync-upstreams.sh --dry-run   # 先看差异
+          ./scripts/sync-upstreams.sh             # 确认后同步
+          \`\`\`
+
+          ${{ steps.drift.outputs.body }}
+
+          同步后请：
+          1. 跑三关测试（Go / Python / 前端构建）——脚本会打印确切命令
+          2. 按 [UPSTREAMS.md](UPSTREAMS.md) 的检查清单核对集成层是否需要跟改
+          3. 更新 UPSTREAMS.md 的表格与 CHANGELOG.md
+
+          > 本 issue 由 \`.github/workflows/upstream-check.yml\` 自动维护，
+          > 同步完成后关闭即可（下次有新漂移会重新开）。
+          EOF
+          )"
+
+          # 已存在同名开放 issue 就更新内容，否则新建——避免每天刷一个新 issue
+          EXISTING="$(gh issue list --state open --search "$TITLE in:title" \
+            --json number --jq '.[0].number' 2>/dev/null || true)"
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+            gh issue edit "$EXISTING" --body "$BODY"
+            echo "已更新既有 issue #$EXISTING"
+          else
+            gh issue create --title "$TITLE" --body "$BODY"
+          fi

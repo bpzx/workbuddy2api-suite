@@ -1,0 +1,72 @@
+# ============================================================
+# workbuddy2api-suite .gitignore
+#
+# 设计原则（踩过坑，务必遵守）—— **所有模式一律锚定**：
+#
+# 本项目内嵌了 vendor/wb2api 与 vendor/manager 两份**上游快照**，快照必须与
+# upsreams.json 记录的 commit 逐字节一致。而 Git 的 bare 模式（如 `config.json`
+# `out/` `*.md`）是**递归**的，会匹配进 vendor/ 深层，把上游的必需文件悄悄排除。
+#
+# 真实事故：`vendor/wb2api/.gitignore`（上游自带）里的 `*.md` 排除了
+# `internal/prompt/defaultprompt.md`——那是 go:embed 的编译期必需文件。
+# 本地 `go build` 不报错（文件在磁盘上），CI 从 git 全新 clone 后文件不存在，
+# 直接编译失败。同类还有 `config.json` 误伤 ai-governance/config.json。
+#
+# 因此：
+#   1. vendor/ 下的上游 .gitignore 已全部移除（见 scripts/sync-upstreams.sh），
+#      保护规则由本文件用**锚定路径**显式表达；
+#   2. 本文件不使用裸模式；确实需要递归的只有缓存类（__pycache__、node_modules）。
+# ============================================================
+
+# ── 根目录运行时数据（锚定，绝不递归）──────────────────────
+/auths/
+/data/
+/config.json
+/state.json
+/users.json
+/.version
+
+# ── 本地配置与更新器状态 ──────────────────────────────────
+/.env
+/.env.local
+/update-status.json
+/update.log
+/update.lock
+/upstream-ref.txt
+
+# ── 同步脚本的裸仓库缓存 ──────────────────────────────────
+/.upstream-cache/
+
+# ── 本地覆盖用的 compose ──────────────────────────────────
+/docker-compose.override.yml
+
+# ── vendor 快照：运行时产物（本地跑测试/构建会生成）────────
+# 这些会破坏「快照 == 上游 commit」，必须锚定到具体路径逐个列出
+vendor/manager/.version
+vendor/manager/web/next-env.d.ts
+vendor/manager/web/out/
+vendor/manager/web/.next/
+vendor/manager/web/node_modules/
+vendor/wb2api/auths/
+vendor/wb2api/data/
+vendor/wb2api/config.json
+
+# wb2api 本地编译产物（上游 .gitignore 的 /login /credit 等规则，
+# 这里补成带 vendor 前缀的绝对路径）
+/vendor/wb2api/wb2api
+/vendor/wb2api/login
+/vendor/wb2api/credit
+/vendor/wb2api/signin_bin
+/vendor/wb2api/trial_bin
+/vendor/wb2api/activity_bin
+
+# ── 缓存类：确实需要递归（任何层级都该忽略）───────────────
+__pycache__/
+*.py[cod]
+node_modules/
+.venv/
+venv/
+.DS_Store
+.idea/
+.vscode/
+*.tsbuildinfo

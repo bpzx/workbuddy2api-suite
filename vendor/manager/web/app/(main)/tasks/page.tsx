@@ -1,0 +1,664 @@
+'use client';
+
+import {useCallback, useEffect, useState} from 'react';
+import {
+  CalendarCheck,
+  Globe,
+  Cat,
+  ChevronLeft,
+  ChevronRight,
+  Filter,
+  History,
+  RefreshCw,
+  Trash2,
+  TriangleAlert,
+} from 'lucide-react';
+import {useHeartbeat} from '@/lib/use-heartbeat';
+import {notify} from '@/lib/toast';
+import {accountApi, errText} from '@/lib/api';
+import type {CheckinLog, TaskLog, TaskLogResponse} from '@/lib/types';
+import {fmtDateTime, fmtNumber} from '@/lib/format';
+import {PageHeader} from '@/components/common/layout/PageHeader';
+import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
+import {useAuth} from '@/lib/auth-context';
+import {useRealm} from '@/lib/realm-context';
+import {Button} from '@/components/ui/button';
+import {Badge} from '@/components/ui/badge';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+
+/** 来源说明（本端触发的签到 + 上游自动签到） */
+const SOURCE_LABELS: Record<string, string> = {
+  manual: '手动',
+  'manual-batch': '批量',
+  add: '添加账号',
+  auto: '上游自动',
+};
+
+/** 结果文案：优先中文，英文原文作为悬浮提示保留 */
+function resultText(l: TaskLog): string {
+  return l.message_cn || l.message;
+}
+
+/**
+ * 单次拉取条数上限。
+ *
+ * 列表改为「固定高度 + 内部滚动」（与右侧「上游原始日志」一致），不再分页：
+ * 滚动比翻页直观，也不会出现「一页没填满、下面留一大片空白」。
+ * 上限用于控制 DOM 规模——记录只增不减，全量渲染会让页面越来越重；
+ * 需要更早的记录时用时间范围筛选收窄。
+ */
+const CHECKIN_LIMIT = 200;
+const TASK_LIMIT = 200;
+/** 手机端用更小的上限：卡片行高约是表格行的两倍，滚动也更费屏幕 */
+const TASK_LIMIT_MOBILE = 80;
+
+/** 时间范围选项（与请求日志页保持一致的说法） */
+const RANGES = [
+  {value: '1', label: '近 24 小时'},
+  {value: '7', label: '近 7 天'},
+  {value: '30', label: '近 30 天'},
+  {value: '90', label: '近 90 天'},
+];
+
+/** 任务日志的结果等级配色 */
+const LEVEL_TONE: Record<string, string> = {
+  credit: 'text-emerald-600 dark:text-emerald-400',
+  ok: 'text-muted-foreground',
+  info: 'text-muted-foreground',
+  warn: 'text-amber-600 dark:text-amber-400',
+  error: 'text-red-600 dark:text-red-400',
+};
+
+/** 列表底部条：总数 + 命中上限时的说明 */
+function ListFooter({
+  total,
+  shown,
+  truncated,
+}: {
+  total: number;
+  shown: number;
+  truncated: boolean;
+}) {
+  return (
+    <div className="flex shrink-0 flex-wrap items-center gap-x-2 border-t border-border/40 px-4 py-2 text-[11px] text-muted-foreground">
+      <span className="tabular-nums">共 {fmtNumber(total)} 条</span>
+      {truncated && (
+        <span className="text-amber-600 dark:text-amber-400">
+          · 仅显示最近 {fmtNumber(shown)} 条，更早的请缩小时间范围
+        </span>
+      )}
+    </div>
+  );
+}
+
+export default function TasksPage() {
+  const {isAdmin} = useAuth();
+  const {realm, label: realmName} = useRealm();
+
+  // 两块列表都分页：历史只增不减，若一次全渲染，页面会随记录数无限变长
+  // （实测 500 条任务日志 = 19 屏、9000 个 DOM 节点）。
+  const [checkinLogs, setCheckinLogs] = useState<CheckinLog[]>([]);
+  const [checkinTotal, setCheckinTotal] = useState(0);
+  /** 其中本端触发的条数（清空按钮据此显示） */
+  const [checkinLocalTotal, setCheckinLocalTotal] = useState(0);
+  /** 其中上游自动签到的条数（清空按钮的说明据此措辞） */
+  const [checkinAutoTotal, setCheckinAutoTotal] = useState(0);
+  const [checkinDays, setCheckinDays] = useState('7');
+
+  const [taskLogs, setTaskLogs] = useState<TaskLog[]>([]);
+  const [taskStats, setTaskStats] = useState<TaskLogResponse['stats'] | null>(null);
+  const [kindLabels, setKindLabels] = useState<Record<string, string>>({});
+  const [taskFilter, setTaskFilter] = useState<string>('all');
+  const [taskDays, setTaskDays] = useState('7');
+  /** 当前筛选下的总条数（不是全局统计）——分页必须用它算页数 */
+  const [taskTotal, setTaskTotal] = useState(0);
+
+  const [upstreamLines, setUpstreamLines] = useState<string[]>([]);
+  const [collectBusy, setCollectBusy] = useState(false);
+  /**
+   * 移动端把三块整合成一张卡片 + 分段切换。
+   * 三块竖着堆叠时，各有表头与分页，页面又长又碎；
+   * 桌面端横向空间够，仍三块并列。
+   */
+  const [mobileTab, setMobileTab] = useState<'checkin' | 'tasks' | 'raw'>('checkin');
+  /** 手机端用更小的拉取上限（卡片行高约是表格行的两倍） */
+  const [narrow, setNarrow] = useState(false);
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 767px)');
+    const sync = () => setNarrow(mq.matches);
+    sync();
+    mq.addEventListener('change', sync);
+    return () => mq.removeEventListener('change', sync);
+  }, []);
+  const taskLimit = narrow ? TASK_LIMIT_MOBILE : TASK_LIMIT;
+
+  const load = useCallback(async () => {
+    const [logRes, ulRes, taskRes] = await Promise.allSettled([
+      accountApi.checkinLogs(CHECKIN_LIMIT, 0, undefined, Number(checkinDays), realm),
+      accountApi.upstreamLogs(300),
+      accountApi.taskLogs(
+        taskLimit,
+        0,
+        taskFilter === 'all' ? undefined : taskFilter,
+        undefined,
+        Number(taskDays),
+        realm,
+      ),
+    ]);
+    if (logRes.status === 'fulfilled') {
+      setCheckinLogs(logRes.value.items);
+      setCheckinTotal(logRes.value.total);
+      setCheckinLocalTotal(logRes.value.local_total ?? logRes.value.total);
+      setCheckinAutoTotal(logRes.value.auto_total ?? 0);
+    }
+    if (ulRes.status === 'fulfilled') setUpstreamLines(ulRes.value.lines);
+    if (taskRes.status === 'fulfilled') {
+      setTaskLogs(taskRes.value.logs);
+      setTaskTotal(taskRes.value.total);
+      setTaskStats(taskRes.value.stats);
+      setKindLabels(taskRes.value.kinds);
+    }
+    if (logRes.status === 'rejected' && taskRes.status === 'rejected') {
+      notify.err(errText(logRes.reason ?? taskRes.reason));
+    }
+  }, [checkinDays, taskFilter, taskDays, taskLimit, realm]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  // 上游任务按点执行，停留期间心跳刷新，避免一直看旧记录
+  useHeartbeat(load, 30000);
+
+  /** 立即采集一次上游任务日志 */
+  const collectTasks = useCallback(async () => {
+    setCollectBusy(true);
+    try {
+      const r = await accountApi.collectTaskLogs();
+      await load();
+      if (r.added > 0) notify.ok('已采集新记录', `新增 ${r.added} 条任务日志`);
+      else notify.info('暂无新记录', '上游还没有产生新的自动任务日志');
+    } catch (e) {
+      notify.err(errText(e));
+    } finally {
+      setCollectBusy(false);
+    }
+  }, [load]);
+
+  function accountLabel(l: TaskLog) {
+    const uid = l.uid || '';
+    if (!uid) return '—';
+    // 昵称由后端解析：上游 2026-09-12 起只打 uid 前 8 位，前端拿不到完整 uid
+    return l.nickname || uid;
+  }
+
+  // 筛选与分页都在服务端完成，这里直接用返回的当前页
+  const filteredTasks = taskLogs;
+  // 命中上限说明还有更早的记录，界面上要讲清楚（避免以为是全部）
+  const checkinTruncated = checkinTotal > checkinLogs.length;
+  const taskTruncated = taskTotal > taskLogs.length;
+
+  /**
+   * 概览数字必须跟着筛选走。
+   *
+   * taskStats 是**未筛选**的区间汇总，而列表是按 kind 筛选的：筛选后若还用
+   * 未筛选的数字，会出现「共 62 条」配一个空列表的矛盾显示（用户反馈的
+   * 「余额查询 / 令牌保活 / 自动签到 点进去一片空白」就是这个）。
+   * by_kind 里同时有 count 与 credits，正好给出该筛选下的准确值。
+   */
+  const activeKind = taskFilter !== 'all' ? taskStats?.by_kind?.[taskFilter] : undefined;
+  const shownCount = taskFilter === 'all' ? (taskStats?.total ?? 0) : (activeKind?.count ?? 0);
+  const shownCredits =
+    taskFilter === 'all' ? (taskStats?.total_credits ?? 0) : (activeKind?.credits ?? 0);
+  /** 区间内是否有任何记录——决定筛选栏是否渲染（不能按筛选结果判断，否则会消失） */
+  const hasAnyTask = (taskStats?.total ?? 0) > 0;
+
+  return (
+    <div className="flex flex-col gap-4 md:gap-6">
+      <PageHeader
+        title="任务记录"
+        description={`${realmName}的签到结果、上游自动任务与积分收益（每 30 秒自动刷新）`}
+      />
+
+      {/* 移动端：三块整合成一张卡片，用分段切换，避免又长又碎 */}
+      <div className="flex gap-1 rounded-full bg-muted p-1 md:hidden">
+        {([
+          ['checkin', '签到记录'],
+          ['tasks', '自动任务'],
+          ['raw', '原始日志'],
+        ] as const).map(([id, label]) => (
+          <button
+            key={id}
+            type="button"
+            onClick={() => setMobileTab(id)}
+            className={
+              'flex-1 rounded-full px-3 py-1.5 text-xs transition-colors ' +
+              (mobileTab === id
+                ? 'bg-background font-medium text-foreground shadow-sm'
+                : 'text-muted-foreground')
+            }
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {/* 签到记录 + 上游原始日志 */}
+      {/* 两块等高：右栏内容区 flex-1 撑满，避免卡片下方留大片空白 */}
+      <section className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <div
+          className={
+            'flex h-[calc(100dvh-200px)] min-h-[320px] flex-col overflow-hidden rounded-[20px] bg-muted ' +
+            (mobileTab === 'checkin' ? '' : 'hidden ') +
+            'md:h-[470px] md:flex'
+          }
+        >
+          <div className="flex shrink-0 flex-wrap items-center justify-between gap-x-2 gap-y-1.5 px-4 py-3">
+            <div className="flex min-w-0 items-center gap-2 text-sm font-medium">
+              <CalendarCheck className="h-4 w-4 shrink-0" />
+              <span className="shrink-0">签到记录</span>
+              <span className="hidden truncate text-[11px] font-normal text-muted-foreground sm:inline">
+                （本端触发 + 上游自动签到）
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <Select value={checkinDays} onValueChange={setCheckinDays}>
+                <SelectTrigger className="h-7 w-[116px] rounded-full text-[11px]"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {RANGES.map((r) => (
+                    <SelectItem key={r.value} value={r.value} className="text-xs">{r.label}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            {/*
+              清空只删本端记录（上游自动签到的留痕由「自动任务」侧管理），
+              所以：
+              - 按钮只在确实有本端记录时出现，否则点了没反应像是坏了
+              - 文案写明范围，避免用户以为能把自动签到也清掉
+            */}
+            {isAdmin && checkinLocalTotal > 0 && (
+              <ConfirmDialog
+                title="清空签到记录？"
+                description={
+                  checkinAutoTotal > 0
+                    ? `将删除本端触发的 ${fmtNumber(checkinLocalTotal)} 条签到历史（手动 / 批量 / 添加账号）。` +
+                      `上游自动签到的 ${fmtNumber(checkinAutoTotal)} 条留痕不在此处删除，可在「自动任务」中清理。`
+                    : '仅删除本端的签到历史记录，不影响账号与上游数据。'
+                }
+                confirmText="清空"
+                destructive
+                onConfirm={async () => {
+                  await accountApi.clearCheckinLogs();
+                  notify.ok('已清空');
+                  await load();
+                }}
+                trigger={
+                  <Button variant="ghost" size="sm" className="h-7 rounded-full text-red-500">
+                    <Trash2 className="h-3.5 w-3.5" />
+                    清空
+                  </Button>
+                }
+              />
+            )}
+            </div>
+          </div>
+
+          {/* 固定高度 + 内部滚动：与右侧「上游原始日志」一致，页面高度不随记录增长 */}
+          <div className="scroll-slim min-h-0 flex-1 overflow-auto">
+          {checkinLogs.length ? (
+            <>
+              {/* 手机端：卡片 */}
+              <div className="space-y-1 px-3.5 pb-4 md:hidden">
+                {checkinLogs.map((l) => (
+                  <div key={l.id} className="rounded-xl bg-background/60 px-3 py-1.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="truncate text-xs font-medium">{l.nickname || l.uid || '—'}</span>
+                      <span
+                        className={
+                          'shrink-0 text-[11px] font-medium ' +
+                          (l.success
+                            ? 'text-emerald-600 dark:text-emerald-400'
+                            : 'text-red-600 dark:text-red-400')
+                        }
+                        title={l.message}
+                      >
+                        {l.message || (l.success ? '成功' : '失败')}
+                      </span>
+                    </div>
+                    <div className="mt-0.5 flex items-center justify-between gap-2 text-[10px] text-muted-foreground">
+                      <span className="truncate tabular-nums">{fmtDateTime(l.ts)}</span>
+                      <span className="shrink-0">{SOURCE_LABELS[l.source] || l.source}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="hidden md:block">
+                <Table className="[&_td]:py-1 [&_th]:h-8">
+                  <TableHeader>
+                    <TableRow className="border-b border-border/60 hover:bg-transparent">
+                      <TableHead className="pl-4 text-[11px] text-muted-foreground">时间</TableHead>
+                      <TableHead className="text-[11px] text-muted-foreground">账号</TableHead>
+                      <TableHead className="text-[11px] text-muted-foreground">来源</TableHead>
+                      <TableHead className="pr-4 text-[11px] text-muted-foreground">结果</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {checkinLogs.map((l) => (
+                      <TableRow key={l.id} className="border-b border-border/40">
+                        <TableCell className="pl-4 text-xs tabular-nums text-muted-foreground">
+                          {fmtDateTime(l.ts)}
+                        </TableCell>
+                        <TableCell className="max-w-[120px] truncate text-xs">{l.nickname || l.uid || '—'}</TableCell>
+                        <TableCell className="text-xs text-muted-foreground">
+                          {SOURCE_LABELS[l.source] || l.source}
+                        </TableCell>
+                        <TableCell className="pr-4">
+                          <span
+                            className={
+                              'text-[11px] font-medium ' +
+                              (l.success
+                                ? 'text-emerald-600 dark:text-emerald-400'
+                                : 'text-red-600 dark:text-red-400')
+                            }
+                            title={l.message}
+                          >
+                            {l.message || (l.success ? '成功' : '失败')}
+                          </span>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+            </>
+          ) : (
+            <div className="px-4 py-10 text-center text-xs text-muted-foreground">
+              暂无签到记录。在「账号管理」点「全部签到」或单个账号的 🎁 会在此留痕。
+            </div>
+          )}
+          </div>
+
+          <ListFooter total={checkinTotal} shown={checkinLogs.length} truncated={checkinTruncated} />
+        </div>
+
+        <div
+          className={
+            'flex h-[calc(100dvh-200px)] min-h-[320px] flex-col overflow-hidden rounded-[20px] bg-muted ' +
+            (mobileTab === 'raw' ? '' : 'hidden ') +
+            'md:h-[470px] md:flex'
+          }
+        >
+          <div className="flex shrink-0 items-center justify-between px-4 py-3">
+            <div className="flex items-center gap-2 text-sm font-medium">
+              <History className="h-4 w-4" />
+              上游原始日志
+              <span className="hidden text-[11px] font-normal text-muted-foreground sm:inline">
+                （签到 / 保活 / 旅行 / 活跃）
+              </span>
+            </div>
+            <span className="text-[11px] text-muted-foreground">来自容器日志</span>
+          </div>
+          {upstreamLines.length ? (
+            <div className="scroll-slim min-h-0 flex-1 overflow-auto px-4 pb-3">
+              <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-5 text-muted-foreground">
+                {upstreamLines.slice(-200).join('\n')}
+              </pre>
+            </div>
+          ) : (
+            <div className="flex min-h-0 flex-1 items-center justify-center px-4 py-6">
+              <div className="text-center text-xs leading-5 text-muted-foreground">
+                <TriangleAlert className="mx-auto mb-2 h-4 w-4 text-amber-500" />
+                上游只在<b>失败</b>与<b>旅行 / 活跃</b>时打日志：签到成功、
+                保活正常都是静默的，所以这里没有记录不代表没执行。
+                结构化、可长期保留（容器重建也不丢）的记录见下方「自动任务与积分记录」。
+              </div>
+            </div>
+          )}
+        </div>
+      </section>
+
+      {/* 自动任务与积分记录：上游把结果打在容器日志里且重建即丢，
+          这里展示后台采集器落库后的长期留痕，便于核对积分收益 */}
+      {/* 固定高度：内层 flex-1 才受约束（没有高度时它只会跟着内容一起变长） */}
+      <section
+        className={
+          'flex h-[calc(100dvh-200px)] min-h-[320px] flex-col overflow-hidden rounded-[20px] bg-muted ' +
+          (mobileTab === 'tasks' ? '' : 'hidden ') +
+          'md:h-[560px] md:flex'
+        }
+      >
+        <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 px-4 py-3">
+          <div className="flex items-center gap-2 text-sm font-medium">
+            <Cat className="h-4 w-4" />
+            自动任务与积分记录
+            <span className="hidden text-[11px] font-normal text-muted-foreground sm:inline">
+              猫猫旅行 / 活跃上报 / 自动签到 / 保活 / 开学季 / 夜猫
+            </span>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Select value={taskDays} onValueChange={setTaskDays}>
+              <SelectTrigger className="h-7 w-[116px] rounded-full text-[11px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {RANGES.map((r) => (
+                  <SelectItem key={r.value} value={r.value} className="text-xs">
+                    {r.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {shownCount > 0 && (
+              <Badge variant="secondary" className="hidden shrink-0 rounded-full tabular-nums sm:inline-flex">
+                共 {fmtNumber(shownCount)} 条
+                {shownCredits > 0 && (
+                  <span className="ml-1 text-emerald-600 dark:text-emerald-400">
+                    +{fmtNumber(shownCredits)} 积分
+                  </span>
+                )}
+              </Badge>
+            )}
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 rounded-full text-[11px]"
+              disabled={collectBusy}
+              onClick={collectTasks}
+            >
+              <RefreshCw className={collectBusy ? 'animate-spin' : ''} />
+              立即采集
+            </Button>
+            {isAdmin && taskTotal > 0 && (
+              <ConfirmDialog
+                title="清空任务记录？"
+                description="仅删除管理端采集留存的记录，不影响账号与上游运行。"
+                confirmText="清空"
+                destructive
+                onConfirm={async () => {
+                  await accountApi.clearTaskLogs();
+                  notify.ok('已清空');
+                  await load();
+                }}
+                trigger={
+                  <Button variant="ghost" size="sm" className="h-7 rounded-full text-red-500">
+                    <Trash2 className="h-3.5 w-3.5" />
+                    清空
+                  </Button>
+                }
+              />
+            )}
+          </div>
+        </div>
+
+        {/* 筛选栏的渲染条件是「区间内有任何记录」而不是「当前筛选有记录」：
+            否则点到一个没有记录的类型后，筛选栏会连同列表一起消失，
+            用户再也切不回「全部」——这是被反馈的「点进去一片空白」的另一半原因。 */}
+        {hasAnyTask && (
+          <div className="flex shrink-0 flex-wrap items-center gap-1.5 px-4 pb-3">
+            <Filter className="h-3 w-3 text-muted-foreground" />
+            {[
+              {id: 'all', label: '全部'},
+              ...Object.entries(kindLabels).map(([id, label]) => ({id, label})),
+            ].map((t) => {
+              const active = taskFilter === t.id;
+              // 每个类型都显示**自己**的条数（含 0）：这样点「余额查询」前就能
+              // 看出它是空的，不会以为点进去该有内容。这正是原先让人踩空的地方。
+              const n =
+                t.id === 'all'
+                  ? taskStats?.total
+                  : taskStats?.by_kind?.[t.id]?.count;
+              const isEmpty = t.id !== 'all' && !n;
+              return (
+                <button
+                  key={t.id}
+                  type="button"
+                  onClick={() => setTaskFilter(t.id)}
+                  title={isEmpty ? `${t.label}：当前范围内没有记录` : undefined}
+                  className={
+                    'rounded-full px-2.5 py-1 text-[11px] transition-colors ' +
+                    (active
+                      ? 'bg-foreground text-background'
+                      : isEmpty
+                        ? 'bg-background/40 text-muted-foreground/50 hover:text-muted-foreground'
+                        : 'bg-background/60 text-muted-foreground hover:text-foreground')
+                  }
+                >
+                  {t.label}
+                  {n !== undefined && <span className="ml-1 tabular-nums">{n}</span>}
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        {/*
+          空态分两种，不能混为一谈：
+          - hasAnyTask：区间内有数据，只是当前筛选为空 → 提示换个类型
+          - 否则：这个区间真的没记录 → 引导去采集
+          若只看 taskLogs.length，筛选到空时会落到「全局无记录」的文案上，
+          明明别的类型有记录却告诉用户「暂无记录」，既误导又像数据丢了。
+        */}
+        {taskLogs.length ? (
+          <div className="scroll-slim min-h-0 flex-1 overflow-auto pb-4">
+            {/* 手机端：卡片式；桌面：表格 */}
+            <div className="space-y-1.5 px-3.5 md:hidden">
+              {filteredTasks.map((l) => (
+                <div key={l.id} className="rounded-xl bg-background/60 px-3 py-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-medium">{kindLabels[l.kind] || l.kind}</span>
+                    <span className="text-xs font-semibold tabular-nums">
+                      {l.credits > 0 ? (
+                        <span className="text-emerald-600 dark:text-emerald-400">+{l.credits}</span>
+                      ) : (
+                        <span className="text-muted-foreground">—</span>
+                      )}
+                    </span>
+                  </div>
+                  <div
+                    className={'mt-1 break-words text-[11px] leading-4 ' + (LEVEL_TONE[l.level] || 'text-muted-foreground')}
+                    title={l.message}
+                  >
+                    {resultText(l)}
+                  </div>
+                  <div className="mt-1 flex items-center justify-between gap-2 text-[10px] text-muted-foreground">
+                    <span className="truncate" title={l.uid}>
+                      {accountLabel(l)}
+                    </span>
+                    <span className="shrink-0 tabular-nums">{fmtDateTime(l.ts)}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="hidden md:block">
+              <Table>
+                <TableHeader>
+                  <TableRow className="border-b border-border/60 hover:bg-transparent">
+                    <TableHead className="pl-4 text-[11px] text-muted-foreground">时间</TableHead>
+                    <TableHead className="text-[11px] text-muted-foreground">类型</TableHead>
+                    <TableHead className="text-[11px] text-muted-foreground">账号</TableHead>
+                    <TableHead className="text-[11px] text-muted-foreground">结果</TableHead>
+                    <TableHead className="pr-4 text-right text-[11px] text-muted-foreground">积分</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {filteredTasks.map((l) => (
+                    <TableRow key={l.id} className="border-b border-border/40">
+                      <TableCell className="pl-4 text-xs tabular-nums text-muted-foreground">
+                        {fmtDateTime(l.ts)}
+                      </TableCell>
+                      <TableCell className="text-xs">{kindLabels[l.kind] || l.kind}</TableCell>
+                      <TableCell className="max-w-[180px] truncate text-xs" title={l.uid}>
+                        {accountLabel(l)}
+                      </TableCell>
+                      <TableCell
+                        className={`max-w-[520px] truncate text-xs ${LEVEL_TONE[l.level] || ''}`}
+                        title={l.message}
+                      >
+                        {resultText(l)}
+                      </TableCell>
+                      <TableCell className="pr-4 text-right text-xs font-medium tabular-nums">
+                        {l.credits > 0 ? (
+                          <span className="text-emerald-600 dark:text-emerald-400">+{l.credits}</span>
+                        ) : (
+                          <span className="text-muted-foreground">—</span>
+                        )}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          </div>
+        ) : hasAnyTask ? (
+          <div className="px-4 py-10 text-center text-xs leading-5 text-muted-foreground">
+            <Filter className="mx-auto mb-2 h-4 w-4" />
+            「{kindLabels[taskFilter] || taskFilter}」在当前时间范围内没有记录。
+            <br />
+            点上方的「全部」可看其它类型，也可以放宽时间范围再试。
+          </div>
+        ) : realm === 'global' ? (
+          /* 国际版没有任务体系：这不是「还没采集到」，而是上游根本不跑这些任务。
+             写字说明白，否则用户会以为是采集器坏了。 */
+          <div className="px-4 py-10 text-center text-xs leading-5 text-muted-foreground">
+            <Globe className="mx-auto mb-2 h-4 w-4 text-sky-500/70" />
+            国际版（workbuddy.ai）<b>没有签到 / 猫猫旅行 / 开学季 / 夜猫任务</b>——
+            上游对这类账号直接跳过、不发起请求（避免风控）；积分只来自一次性 trial。
+            <br />
+            <b>保活与活跃上报照常执行</b>，有记录时会显示在这里。
+            要看签到与旅行请切回「国内版」。
+          </div>
+        ) : (
+          <div className="px-4 py-10 text-center text-xs leading-5 text-muted-foreground">
+            <Cat className="mx-auto mb-2 h-4 w-4" />
+            暂无自动任务记录。上游的签到 / 猫猫旅行 / 活跃上报 / 保活结果会打在容器日志里，
+            后台每 45 秒采集一次并长期保留（容器重建也不会丢）。
+            <br />
+            想立刻看到结果，点右上角「立即采集」。
+          </div>
+        )}
+
+        <ListFooter
+          total={taskFilter === 'all' ? (taskStats?.total ?? taskTotal) : (activeKind?.count ?? taskTotal)}
+          shown={taskLogs.length}
+          truncated={taskTruncated}
+        />
+      </section>
+    </div>
+  );
+}

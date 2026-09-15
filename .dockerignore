@@ -1,0 +1,64 @@
+# 构建上下文裁剪。
+#
+# 原则：只排除「体积大」或「会影响构建正确性」的东西，不为省几百 KB 去排除
+# 裸文件名（如 README.md / LICENSE），因为 Docker 的 .dockerignore 匹配规则对
+# 裸模式的层级语义容易踩坑，一旦误伤 vendor/manager/LICENSE 之类的构建输入，
+# 表现是构建期报"文件不存在"，排查起来不值当。
+
+# ── 必须排除：影响构建正确性 ─────────────────────────────
+# ⚠️ 运行时数据目录必须排除。compose 默认把数据放在宿主机 ./data
+# （WB_DATA_PATH），里面有账号凭证（含明文 refresh token）、含 api_key 与
+# 设备 token 的 config.json、管理端密钥库。它们绝不能进构建上下文 ——
+# 构建上下文会被整体发给 Docker daemon，即便 Dockerfile 从不 COPY 它。
+# 这是改用宿主目录后新增的风险点（旧版用命名卷，数据不在项目目录里）。
+data/
+/data/
+
+# ⚠️ 根目录 .env 同样含机密：WB_ADMIN_PASSWORD、代理凭据、容器内地址。
+# 它不是构建输入（compose 在运行时读取它，与镜像构建无关）。
+/.env
+/.env.local
+
+# ⚠️ node_modules 必须排除。Dockerfile 的 web 阶段先 `npm ci` 装依赖，
+# 再 `COPY vendor/manager/web/ ./` 覆盖源码。若宿主的 node_modules 进了上下文，
+# 这一步会用宿主（可能是别的平台/Node 版本）装出来的依赖盖掉容器里刚装好的，
+# 产物在其他架构上会直接跑不起来，且报错很难指向这里。
+vendor/manager/web/node_modules
+vendor/manager/web/.next
+vendor/manager/web/out
+vendor/manager/web/.env
+vendor/manager/web/.env.local
+
+# wb2api 的本地编译产物与运行时数据（与上游 .dockerignore 口径一致）。
+# config.json 尤其重要：真实配置含 api_key，绝不能进镜像。
+vendor/wb2api/auths
+vendor/wb2api/data
+vendor/wb2api/config.json
+vendor/wb2api/wb2api
+vendor/wb2api/login
+vendor/wb2api/credit
+vendor/wb2api/signin_bin
+vendor/wb2api/trial_bin
+vendor/wb2api/activity_bin
+
+# ── 必须排除：体积 ────────────────────────────────────────
+.git
+# 同步脚本的裸仓库镜像（可能几十 MB，且是本机缓存）
+.upstream-cache
+# 嵌套的 .git 目录（vendor 快照里已排除，这里是双保险）
+**/.git
+
+# ── 缓存与杂物 ────────────────────────────────────────────
+**/__pycache__
+**/*.py[cod]
+**/.venv
+**/venv
+**/.DS_Store
+**/.idea
+**/.vscode
+
+# 本地跑测试/构建会在 vendor 快照里落下的产物（会破坏"快照 == 上游 commit"）。
+# 正常情况下它们不该存在（.gitignore 也挡着），这里是双保险：
+# 万一有人本地跑过测试就直接构建，至少不会把脏文件打进镜像。
+vendor/manager/.version
+vendor/manager/web/next-env.d.ts

@@ -1,0 +1,236 @@
+# 打 tag 时自动构建前端、打包产物并创建 GitHub Release。
+#
+# 用法：推送形如 v1.0.0 的 tag 即可
+#   git tag v1.0.0 && git push origin v1.0.0
+#
+# 产物为可直接部署的压缩包（含 server/ 与已构建的 web/out/）。
+#
+# ── 关于签名（重要）──────────────────────────────────────────
+# 本工作流**不持有签名私钥**，也不代替维护者签名：
+#   * 私钥绝不进 CI —— 恶意 PR 合并后能改 workflow 里的任意步骤，
+#     把密钥放在这里等于直接交给攻击者。
+#   * 签名在维护者本机完成（见步骤末尾的 step summary 与
+#     docs/release-signing.md），.sig 作为 Release 资产上传。
+#   * 用户侧 deploy/update.py 强制验签，未签名的 Release 会被拒绝安装；
+#     本 workflow 在检测到已签名后也**不再覆盖 tar.gz**，避免使签名失效。
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # 允许手动触发（用于补发某个已有 tag 的产物）
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要构建的 tag（如 v1.0.0）'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 解析版本号
+        id: vars
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=${TAG#v}" >> $GITHUB_OUTPUT
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.vars.outputs.tag }}
+          fetch-depth: 0
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 构建前端静态导出
+        working-directory: web
+        run: |
+          npm ci
+          npm run build:export
+
+      - name: 校验构建产物
+        run: |
+          test -f web/out/index.html || { echo "构建失败：缺少 web/out/index.html"; exit 1; }
+          echo "构建产物大小：$(du -sh web/out | cut -f1)"
+
+      - name: 后端语法与导入自检
+        run: |
+          python3 -m compileall -q server
+          echo "后端语法检查通过"
+
+      - name: 后端单元测试
+        run: |
+          python3 -m pip install --quiet -r server/requirements.txt
+          python3 -m unittest discover -s server/tests -t . -v
+
+      - name: 组装发布目录
+        id: pack
+        run: |
+          TAG="${{ steps.vars.outputs.tag }}"
+          STAGE="workbuddy-manager-${TAG}"
+          rm -rf "$STAGE" && mkdir -p "$STAGE"
+          cp -r server "$STAGE/"
+          mkdir -p "$STAGE/web" && cp -r web/out "$STAGE/web/"
+          cp -r deploy "$STAGE/"
+          # 文档一并打包（安全审查报告、设计说明等），便于离线查阅
+          cp -r docs "$STAGE/" 2>/dev/null || true
+          cp .env.example README.md CHANGELOG.md LICENSE "$STAGE/"
+          # 再放一份到 server/：一键更新必然整体替换 server/，而旧版更新器
+          # 不替换根目录文件。放进 server/ 后，任何部署（含从旧版升上来的）
+          # 都拿得到更新日志，避免界面报「未找到更新日志文件」。
+          cp CHANGELOG.md "$STAGE/server/CHANGELOG.md"
+          # 写入版本标记：管理端「系统更新」页与安装流程据此显示当前版本
+          echo "${TAG}" > "$STAGE/.version"
+          # 不含运行时数据与凭据
+          find "$STAGE" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+          echo "stage=$STAGE" >> $GITHUB_OUTPUT
+          tar czf "${STAGE}.tar.gz" "$STAGE"
+          zip -qr "${STAGE}.zip" "$STAGE"
+          ls -lh "${STAGE}.tar.gz" "${STAGE}.zip"
+          echo "打包完成"
+
+      - name: 生成发布说明
+        run: |
+          TAG="${{ steps.vars.outputs.tag }}"
+          # 优先取 CHANGELOG 中该版本的段落；取不到则退回提交摘要
+          python3 - "$TAG" > RELEASE_NOTES.md <<'PY'
+          import re, sys, subprocess
+          tag = sys.argv[1]
+          version = tag.lstrip('v')
+          try:
+              text = open('CHANGELOG.md', encoding='utf-8').read()
+          except FileNotFoundError:
+              text = ''
+          # 匹配 "## [1.0.0] - 2026-09-11" 到下一个 "## [" 之间
+          pattern = re.compile(
+              r'^##+\s*\[' + re.escape(version) + r'\].*?$(.*?)(?=^##+\s*\[|\Z)',
+              re.S | re.M,
+          )
+          m = pattern.search(text)
+          if m and m.group(1).strip():
+              # 去掉段落末尾的分隔线（CHANGELOG 里版本之间以 --- 分隔）
+              body = re.sub(r'\n*-{3,}\s*$', '', m.group(1).strip()).strip()
+              print(body)
+          else:
+              print('## 变更\n')
+              log = subprocess.run(
+                  ['git', 'log', '--pretty=format:- %s', '-n', '40', tag],
+                  capture_output=True, text=True,
+              ).stdout.strip()
+              print(log or '详见提交历史。')
+          PY
+          echo "--- 发布说明预览 ---"
+          head -20 RELEASE_NOTES.md
+
+      - name: 检查是否已有签名资产
+        id: sigcheck
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.vars.outputs.tag }}"
+          STAGE="${{ steps.pack.outputs.stage }}"
+          if gh release view "$TAG" >/dev/null 2>&1 && \
+             gh release view "$TAG" --json assets -q '.assets[].name' | grep -qx "${STAGE}.tar.gz.sig"; then
+            echo "has_sig=1" >> $GITHUB_OUTPUT
+            echo "Release 已带签名资产 .tar.gz.sig"
+          else
+            echo "has_sig=0" >> $GITHUB_OUTPUT
+            echo "尚未签名（正常：签名由维护者在本机完成，见下方说明）"
+          fi
+
+      - name: 创建 Release 并上传产物
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.vars.outputs.tag }}"
+          STAGE="${{ steps.pack.outputs.stage }}"
+          if [ "${{ steps.sigcheck.outputs.has_sig }}" = "1" ]; then
+            # 一旦有签名就绝不再覆盖 tar.gz：重新打包会产生不同的字节流，
+            # 使已上传的 .sig 失效，而用户侧的更新器会因此拒绝安装。
+            echo "Release $TAG 已带 .tar.gz.sig 签名，**不覆盖既有产物**（覆盖会使签名失效）"
+            echo "确需重新发布：先删除 Release（含 .sig），再重跑本流程并重新签名"
+          elif gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在（未签名），改为上传/覆盖产物"
+            gh release upload "$TAG" "${STAGE}.tar.gz" "${STAGE}.zip" --clobber
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --notes-file RELEASE_NOTES.md \
+              "${STAGE}.tar.gz" "${STAGE}.zip"
+          fi
+          echo ""
+          echo "== 发版必做：本机签名并上传 =="
+          echo "  正常流程：先让 CI 建好 Release，再由你在本机对下载下来的产物签名上传。"
+          echo "  命令见下方 step summary 与 docs/release-signing.md。"
+
+      - name: 校验签名（已上传 .sig 时）
+        if: steps.sigcheck.outputs.has_sig == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.vars.outputs.tag }}"
+          STAGE="${{ steps.pack.outputs.stage }}"
+          gh release download "$TAG" --pattern "${STAGE}.tar.gz" --pattern "${STAGE}.tar.gz.sig" --dir . --clobber
+          if [ ! -f deploy/release-signing-key.pub ]; then
+            echo "::warning::仓库缺少 deploy/release-signing-key.pub，无法比对公钥"
+            exit 0
+          fi
+          if grep -q 'AAAA_REPLACE_ME' deploy/release-signing-key.pub; then
+            echo "::warning::deploy/release-signing-key.pub 仍是占位值，无法比对公钥"
+            exit 0
+          fi
+          printf 'release %s\n' "$(cat deploy/release-signing-key.pub)" > /tmp/allowed_signers
+          ssh-keygen -Y verify -f /tmp/allowed_signers -I release -n file \
+            -s "${STAGE}.tar.gz.sig" < "${STAGE}.tar.gz"
+          echo "✓ 签名与仓库内公钥匹配"
+
+      - name: 部署说明
+        run: |
+          cat <<'EOF' >> $GITHUB_STEP_SUMMARY
+          ## 发布完成
+
+          资产：
+          - `${{ steps.pack.outputs.stage }}.tar.gz`
+          - `${{ steps.pack.outputs.stage }}.zip`
+
+          > ⚠️ **本工作流不签名**。私钥不允许进 CI —— 恶意 PR 合并后可以改
+          > workflow 里的任意步骤，密钥放这里等于直接交给攻击者。
+          > 因此签名由维护者在**本机**对最终产物执行：
+
+          ```bash
+          # 在本机（私钥所在机器）：
+          gh release download ${{ steps.vars.outputs.tag }} \
+            --pattern '${{ steps.pack.outputs.stage }}.tar.gz'
+          ssh-keygen -Y sign -f ~/.ssh/workbuddy-release -n file \
+            '${{ steps.pack.outputs.stage }}.tar.gz'
+          gh release upload ${{ steps.vars.outputs.tag }} \
+            '${{ steps.pack.outputs.stage }}.tar.gz.sig'
+          ```
+
+          > 一键更新（deploy/update.py）会校验该签名，**没有 .sig 的 Release
+          > 会被所有用户拒绝安装**。所以这一步不是可选的。
+
+          部署方式（解压后）：
+          ```bash
+          # 下载后先验签，再安装（手动部署同样建议校验）
+          bash deploy/verify-release.sh ${{ steps.pack.outputs.stage }}.tar.gz
+          tar xzf ${{ steps.pack.outputs.stage }}.tar.gz
+          cd ${{ steps.pack.outputs.stage }}
+          sudo bash deploy/install.sh
+          ```
+          EOF

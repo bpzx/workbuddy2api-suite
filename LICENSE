@@ -1,0 +1,43 @@
+MIT License
+
+Copyright (c) 2026 workbuddy2api-suite contributors
+
+本项目（workbuddy2api-suite）是 workbuddy2api 与 workbuddy-manager 的容器化
+整合发行版。它自身只包含容器化与集成层代码（Dockerfile、compose、入口脚本、
+同步脚本、CI 工作流与文档）；两个上游的代码以**未经修改的快照**形式内置于
+`vendor/` 下，各自的版权归其原作者所有，完整许可证随快照一并保留：
+
+- `vendor/wb2api/`   — Copyright (c) 2026 Sliverkiss
+  （https://github.com/Sliverkiss/workbuddy2api，MIT）
+- `vendor/manager/`  — Copyright (c) 2026 WorkBuddy Manager contributors
+  （https://github.com/ithtelab/workbuddy-manager，MIT）
+
+各上游捆绑的确切 commit 见 `upstreams.json` 与 `UPSTREAMS.md`。
+
+---
+
+Third-party notices:
+
+- `vendor/manager/LICENSE` 内含其自身的第三方声明（UI 设计令牌、shadcn/ui
+  组件层与 floating-dock 组件改编自 linux-do/cdk，
+  Copyright (c) 2025 linux.do，MIT License），随该快照保留，此处不再重复。
+
+---
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

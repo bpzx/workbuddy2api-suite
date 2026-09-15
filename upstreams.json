@@ -1,0 +1,47 @@
+{
+  "_comment": "上游来源锁定记录。由 scripts/sync-upstreams.sh 自动读写；手工编辑时请保持字段完整。",
+  "schema_version": 1,
+  "suite": {
+    "name": "workbuddy2api-suite",
+    "description": "workbuddy2api + workbuddy-manager 的容器化整合发行版",
+    "repo": "https://github.com/<owner>/workbuddy2api-suite"
+  },
+  "upstreams": {
+    "wb2api": {
+      "description": "OpenAI 兼容反代网关（Go）：账号池、熔断冷却、SSE 重建、定时任务",
+      "repo": "Sliverkiss/workbuddy2api",
+      "repo_url": "https://github.com/Sliverkiss/workbuddy2api.git",
+      "branch": "master",
+      "commit": "b5077d513a9e4f4fd0d032d4ae369c850c41da23",
+      "commit_short": "b5077d5",
+      "commit_date": "2026-09-15T00:52:59+08:00",
+      "subject": "refactor(upstream): thinking.go 用模型 defaultEffort 替代硬编码",
+      "vendor_path": "vendor/wb2api",
+      "license": "MIT",
+      "license_file": "vendor/wb2api/LICENSE",
+      "excluded_paths": [
+        ".git"
+      ],
+      "note": "镜像内置于 /opt/wb2api；容器内不设任何 WB2A_* 环境变量，config.json 为唯一事实来源。保留 .github（嵌套工作流不会被 GitHub 触发）",
+      "synced_at": "2026-09-15T09:34:31+08:00"
+    },
+    "manager": {
+      "description": "Web 管理控制台 + 对外多密钥网关（FastAPI + Next.js）",
+      "repo": "ithtelab/workbuddy-manager",
+      "repo_url": "https://github.com/ithtelab/workbuddy-manager.git",
+      "branch": "main",
+      "commit": "e3e7bb93b28ac9b4c01e1eb4165eb24b06834426",
+      "commit_short": "e3e7bb9",
+      "commit_date": "2026-09-14T23:54:40+08:00",
+      "subject": "review(upstream): a50c923b 流式 tool_calls name 收敛 —— 确认无需适配",
+      "vendor_path": "vendor/manager",
+      "license": "MIT",
+      "license_file": "vendor/manager/LICENSE",
+      "excluded_paths": [
+        ".git"
+      ],
+      "note": "镜像内置于 /opt/manager；deploy/update.py 在构建期由 docker/stub/update.py 覆盖（容器内无 git/systemctl）。保留 .github：上游测试会读 .github/workflows/release.yml",
+      "synced_at": "2026-09-15T09:34:31+08:00"
+    }
+  }
+}

@@ -1,0 +1,183 @@
+# workbuddy2api-suite — Docker Compose 部署
+#
+# 三个容器：
+#   wb2api      Go 反代网关（账号池）。**不发布端口**，只在内部网络被 manager 调用。
+#   manager     管理控制台 + 对外多密钥网关。发布 7864，这是唯一对外入口。
+#   dockerproxy socket 代理。让 manager 能 `docker restart/logs wb2api`，
+#               又不把宿主 /var/run/docker.sock 直接交给它。
+#
+# 为什么 wb2api 不发布 7863：manager 的 /v1 才是对外的正式入口，它带密钥鉴权、
+# 每密钥配额、IP 管控与用量统计。若同时暴露上游 7863，任何人都能用一个共享
+# api_key 绕过上面全部管控。确需直连时见 README「直连上游网关」一节。
+
+name: workbuddy2api-suite
+
+services:
+  # ── 上游网关 ─────────────────────────────────────────────
+  wb2api:
+    image: ${SUITE_IMAGE:-ghcr.io/OWNER/workbuddy2api-suite:latest}
+    # 容器名必须与 manager 的 WB2API_CONTAINER 一致：manager 用 `docker restart
+    # <名字>` 重载账号，经 socket 代理按名字找到本容器。
+    container_name: workbuddy2api
+    restart: unless-stopped
+    command: ["/opt/suite/entrypoint-wb2api.sh"]
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      WB_SUITE_DATA_DIR: /data
+      # 有意不设任何 WB2A_* 变量：上游的 applyEnv() 会在读完 config.json 后
+      # 用环境变量覆盖，一旦设置，manager 设置页写入 config.json 的对应项就会被
+      # 静默盖掉（表现为"改了不生效"）。保持 config.json 为唯一事实来源。
+      #
+      # ── 出口代理 ──
+      # 网关出站（聊天/签到等）走这里。Go 的 ProxyFromEnvironment 只认
+      # HTTP_PROXY / HTTPS_PROXY / NO_PROXY，**不认 ALL_PROXY**（与 httpx 不同），
+      # 因此只设 ALL_PROXY 时网关不会走代理。由 docker/patches/apply.py 注入支持。
+      # 留空 = 直连（不设变量时行为与未打补丁时完全一致）。
+      HTTP_PROXY: ${WB_HTTP_PROXY:-}
+      HTTPS_PROXY: ${WB_HTTP_PROXY:-}
+      # 内网不出网：NO_PROXY 让网关访问自身/容器网络时不绕代理。
+      # 含 127.0.0.1 与容器名，避免健康检查、docker DNS 解析被代理劫持。
+      NO_PROXY: ${WB_NO_PROXY:-127.0.0.1,localhost,wb2api,manager,dockerproxy}
+    volumes:
+      # 数据放宿主目录（./data），宿主机可直接查看/备份/迁移。
+      # 若偏好 Docker 管理的命名卷，把下面这行换成 `suite-data:/data`
+      # 并在文件末尾保留 volumes 段（两种方式二选一，见 README「数据与备份」）。
+      - ${WB_DATA_PATH:-./data}:/data
+    expose:
+      - "7863"
+    networks: [suite]
+    # healthcheck 只判「进程活着、HTTP 端口在响应」，**不判有无可用账号**：
+    # 上游 /healthz 在无账号时返回 503，若按 2xx 判定，全新部署（还没加账号）
+    # 会永远停在 unhealthy。这里显式接受 200 与 503 两种。
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:7863/healthz | grep -qE '^(200|503)$$'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ── 管理控制台 + 对外网关 ────────────────────────────────
+  manager:
+    image: ${SUITE_IMAGE:-ghcr.io/OWNER/workbuddy2api-suite:latest}
+    container_name: workbuddy-manager
+    restart: unless-stopped
+    # 默认 CMD 就是 manager 入口，无需覆盖
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      WB_SUITE_DATA_DIR: /data
+      # ── 上游网关可达性（容器网络内按服务名解析）──
+      WB2API_BASE: http://wb2api:7863
+      WB2API_CONTAINER: workbuddy2api
+      # ── 与上游共享的数据文件 ──
+      WB_AUTH_DIR: /data/auths
+      WB_UPSTREAM_CONFIG: /data/config.json
+      WB_UPSTREAM_DIR: /data
+      # ── 本管理端数据 ──
+      WB_DATA_DIR: /data/manager
+      WB_STATIC_DIR: /opt/manager/web/out
+      WB_MANAGER_HOST: 0.0.0.0
+      WB_MANAGER_PORT: "7864"
+      # ── 安全 ──
+      # 生产走 HTTPS 反代时保持 auto；纯 HTTP 直连会被自动判定为不安全而拒发 Cookie
+      WB_SECURE_COOKIE: ${WB_SECURE_COOKIE:-auto}
+      WB_SESSION_DAYS: ${WB_SESSION_DAYS:-7}
+      WB_ENABLE_DOCS: "0"
+      WB_GATEWAY_RATE_PER_MIN: ${WB_GATEWAY_RATE_PER_MIN:-120}
+      # 首次启动留空 → 随机生成管理员密码并打印到容器日志：
+      #   docker compose logs manager | grep -i password
+      WB_ADMIN_PASSWORD: ${WB_ADMIN_PASSWORD:-}
+      # 每密钥每分钟调用上限（0 = 不限）
+      # 可信反代网段：默认已含回环与私网。manager 在本 compose 的网络里，
+      # 前面若另有反代容器，其地址落在私网段内即可被信任；反向代理**不要**
+      # 直接把 7864 暴露公网，否则 IP 类管控与登录锁定会失去意义。
+      WB_TRUST_PROXY: "1"
+      WB_TRUSTED_PROXY_HOPS: ${WB_TRUSTED_PROXY_HOPS:-1}
+      # 上游仓库（用于「检测更新」比对远端最新提交；容器内无 git，本地版本显示未知）
+      WB_UPSTREAM_API_REPO: Sliverkiss/workbuddy2api
+      # docker CLI 走 socket 代理，而不是直接挂宿主 socket
+      DOCKER_HOST: tcp://dockerproxy:2375
+      # ── 出口代理 ──
+      # 用于 manager **直连腾讯**的那批请求（扫码登录、签到、查积分、
+      # 国际版注册/trial）。支持 http:// 与 socks5://。
+      #   * socks5:// 需要 socksio —— 镜像已装 httpx[socks]，可直接用；
+      #   * 调自己上游 wb2api:7863 的请求**不会**走代理（由
+      #     docker/patches/apply.py 注入 mounts 保证），否则内网绕代理必失败；
+      #   * 留空 = 全部直连。
+      WB_HTTP_PROXY: ${WB_HTTP_PROXY:-}
+    volumes:
+      # 与 wb2api 共用同一份数据目录（宿主机可见）
+      - ${WB_DATA_PATH:-./data}:/data
+    ports:
+      - "${MANAGER_PORT:-7864}:7864"
+    depends_on:
+      # 只用启动顺序，**不用 service_healthy**：如上所述，无账号时上游
+      # /healthz 是 503，用健康门控会让全新部署起不来（manager 自己也设计为
+      # 能容忍上游暂时不可用，仪表盘会显示"未连接"而不是崩掉）。
+      wb2api:
+        condition: service_started
+      dockerproxy:
+        condition: service_started
+    networks: [suite]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:7864/api/healthz >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ── docker socket 代理 ───────────────────────────────────
+  # manager 需要 docker restart / docker logs 上游容器。直接把
+  # /var/run/docker.sock 挂进 manager，等于给它宿主机 root 等价权限
+  # （可 exec 进任意容器、挂载宿主目录）。这里改用一个只放行必要 API 的代理。
+  dockerproxy:
+    image: tecnativa/docker-socket-proxy:v0.5.0
+    container_name: workbuddy-dockerproxy
+    restart: unless-stopped
+    environment:
+      # 只开三样：列容器（docker ps）、读日志（docker logs）、重启容器。
+      # POST=1 是 restart 必需的总开关；未显式开启的项一律保持默认 0（关闭）。
+      CONTAINERS: "1"          # 列容器 / 读日志 / 查询容器信息
+      POST: "1"                # 允许非 GET 请求（restart 是 POST）
+      ALLOW_RESTARTS: "1"      # 允许 containers/{id}/restart|stop|kill
+      # 以下高危能力全部显式关闭（本已是默认值，写出来是为了防止将来被误开）：
+      EXEC: "0"                # 禁止 docker exec（否则等同于宿主机 root shell）
+      IMAGES: "0"              # 禁止拉取/删除镜像
+      BUILD: "0"               # 禁止构建
+      VOLUMES: "0"             # 禁止操作卷（避免读取其他服务数据）
+      NETWORKS: "0"
+      SECRETS: "0"
+      SWARM: "0"
+      SYSTEM: "0"
+      AUTH: "0"
+      INFO: "0"
+      # 注意：VERSION 与 PING 默认即为 1，docker CLI 的版本协商需要它们，
+      # 保持默认即可，不要关。
+      LOG_LEVEL: warning
+    volumes:
+      # 不挂 :ro —— unix socket 的 connect() 需要写权限，只读挂载可能连不上。
+      # 真正的安全边界是上面的 API 白名单，不是这个挂载标志。
+      - /var/run/docker.sock:/var/run/docker.sock
+    # 不发布端口：只在内部网络暴露 2375，供 manager 使用
+    expose:
+      - "2375"
+    networks: [suite]
+    # socket 代理本身持有宿主 socket 访问权，尽量收紧
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  suite:
+    driver: bridge
+
+# ── 数据存放位置（二选一）──────────────────────────────────
+# 当前默认：**宿主目录** bind mount（见上面两个服务的 volumes），路径由
+# .env 的 WB_DATA_PATH 控制，默认 ./data。宿主机可直接查看/备份：
+#     ls -la ./data          # auths/ config.json state.json manager/
+#
+# 若偏好 Docker 管理的命名卷（不占项目目录、性能略好），做两处替换：
+#   1) 两个服务的 volumes 改为 `- suite-data:/data`
+#   2) 取消下面 volumes 段的注释
+# 注意：两者不可混用；从 bind mount 切到命名卷时旧数据不会自动迁移。
+#
+# volumes:
+#   suite-data:

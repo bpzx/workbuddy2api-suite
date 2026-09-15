@@ -1,0 +1,197 @@
+# 构建并发布多架构镜像到 ghcr.io。
+#
+# 本工作流**只推镜像、不产 Artifacts**：部署方式统一为 docker compose pull，
+# 不需要离线 tar 包。镜像名固定为 ghcr.io/<owner>/workbuddy2api-suite。
+#
+# 触发：
+#   * push main        → 构建并推 latest + sha-<short>
+#   * push tag v*      → 构建并推 latest + 版本号 + sha-<short>
+#   * 每日定时         → 跟随上游漂移（vendored 快照由人工 sync，这里只是保证
+#                        镜像始终可重建，避免基础镜像层失效后无法复现）
+#   * 手动
+name: Build & Publish
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  schedule:
+    # 每天北京时间 12:00 = UTC 04:00
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+# 同一分支的重复推送取消旧任务，避免排队
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── 先验证，再构建镜像 ────────────────────────────────────
+  # 把上游自带的三套测试作为构建前置门禁：上游的测试就是它逆向成果的护栏
+  # （风控头、错误码表、SSE 白名单），测试红着就不该出镜像。
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 补丁校验放最前：补丁锚点若因上游重构而失效，后面所有测试都没意义
+      # （测的是没打补丁的代码）。这一步把「上游改了、补丁要跟着改」
+      # 变成一次明确的 CI 失败，而不是静默的功能退化。
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Verify integration patches apply cleanly
+        run: |
+          rm -rf /tmp/patched && mkdir -p /tmp/patched
+          cp -r vendor/wb2api vendor/manager /tmp/patched/
+          python docker/patches/apply.py /tmp/patched
+          # 补丁必须真的落到文件里，不能只"没报错"
+          grep -q "Proxy:               http.ProxyFromEnvironment" \
+            /tmp/patched/wb2api/internal/upstream/client.go \
+            || { echo "::error::补丁 2 未生效（client.go 缺少 Proxy 字段）"; exit 1; }
+          grep -q "_internal_direct_mounts" \
+            /tmp/patched/manager/server/config.py \
+            || { echo "::error::补丁 1 未生效（config.py 缺少 mounts 逻辑）"; exit 1; }
+          echo "补丁校验通过"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache-dependency-path: vendor/wb2api/go.sum
+
+      # 在**打过补丁**的副本上编译与测试：镜像里跑的就是这份代码，
+      # 测未打补丁的 vendor/ 会漏掉补丁引入的编译问题。
+      - name: Go build / vet / test (patched)
+        working-directory: /tmp/patched/wb2api
+        run: |
+          go build ./...
+          go vet ./...
+          go test ./...
+
+      - name: Python tests (patched)
+        working-directory: /tmp/patched/manager
+        run: |
+          python -m pip install --quiet -r server/requirements.txt
+          python -m unittest discover -s server/tests -t . -v
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: vendor/manager/web/package-lock.json
+
+      - name: Frontend static export
+        working-directory: vendor/manager/web
+        run: |
+          npm ci
+          npm run build:export
+          test -f out/index.html
+
+  # ── 构建并推送镜像 ────────────────────────────────────────
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 从 upstreams.json 读上游 commit，作为构建参数注入镜像标签（血统）。
+      # 用 Python 而不是 jq：runner 上 python3 一定有。
+      - name: Read upstream pins
+        id: pins
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          with open('upstreams.json', encoding='utf-8') as fh:
+              up = json.load(fh)['upstreams']
+          print(f"wb2api={up['wb2api']['commit']}")
+          print(f"manager={up['manager']['commit']}")
+          print(f"wb2api_short={up['wb2api']['commit'][:7]}")
+          print(f"manager_short={up['manager']['commit'][:7]}")
+          PY
+
+      # ghcr 镜像名必须全小写：github.repository 可能含大写
+      - name: Compute image name (lowercase)
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          NAME="${{ steps.image.outputs.name }}"
+          SHORT="${GITHUB_SHA::7}"
+          {
+            echo "list<<EOF"
+            echo "${NAME}:latest"
+            echo "${NAME}:sha-${SHORT}"
+            # 打 tag 时额外推版本号标签（v1.2.3 与 1.2.3）
+            if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+              TAG="${GITHUB_REF#refs/tags/}"
+              echo "${NAME}:${TAG}"
+              echo "${NAME}:${TAG#v}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build & push multi-arch
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.list }}
+          # 血统注入镜像标签，docker inspect 可直接查到捆的是哪两个 commit
+          build-args: |
+            GITHUB_REPOSITORY=${{ github.repository }}
+            WB2API_COMMIT=${{ steps.pins.outputs.wb2api }}
+            MANAGER_COMMIT=${{ steps.pins.outputs.manager }}
+            SUITE_VERSION=${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          cat <<EOF >> "$GITHUB_STEP_SUMMARY"
+          ## 镜像已发布
+
+          \`\`\`
+          ${{ steps.image.outputs.name }}:latest
+          ${{ steps.image.outputs.name }}:sha-${GITHUB_SHA::7}
+          \`\`\`
+
+          平台：linux/amd64, linux/arm64
+
+          ### 捆绑的上游版本
+
+          | 上游 | Commit |
+          |---|---|
+          | Sliverkiss/workbuddy2api | \`${{ steps.pins.outputs.wb2api_short }}\` |
+          | ithtelab/workbuddy-manager | \`${{ steps.pins.outputs.manager_short }}\` |
+
+          部署：
+
+          \`\`\`bash
+          docker compose pull && docker compose up -d
+          \`\`\`
+          EOF
