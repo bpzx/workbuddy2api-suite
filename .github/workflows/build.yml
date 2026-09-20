@@ -227,26 +227,50 @@ jobs:
           SHORT="${GITHUB_SHA::7}"
           {
             echo "list<<EOF"
-            echo "${NAME}:latest"
+            # 每次构建都有：精确到提交，永不移动
             echo "${NAME}:sha-${SHORT}"
-            # 打 tag 时额外推版本号标签（v1.2.3 与 1.2.3）
             if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+              # 打 tag = 发版：latest 与版本号标签一起指向它
               TAG="${GITHUB_REF#refs/tags/}"
+              echo "${NAME}:latest"
               echo "${NAME}:${TAG}"
               echo "${NAME}:${TAG#v}"
+            else
+              # 非 tag 构建（main 推送 / 每日定时 / 手动触发）：只更新 main
+              echo "${NAME}:main"
             fi
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      # 套件版本：写入镜像的 OCI 标签（org.opencontainers.image.version），
-      # 便于 `docker inspect` 确认"跑的是哪个构建"。
+      # ── 为什么 `latest` **只在打 tag 时**移动 ──────────────
+      # 「一键更新」拉取的是 `SUITE_IMAGE` 指向的标签（默认 `:latest`），
+      # 而面板的「本套件」区块是拿**当前镜像里的版本号**与仓库里最新的
+      # `vX.Y.Z` git tag 比较。两者必须指同一个东西，功能才能收敛：
       #
-      # ⚠️ 它**不参与**面板的版本检测 —— 面板显示的是上游 manager 的版本号
-      # 变化（如 v1.0.31 → v1.0.35），用作"该同步上游快照了"的提醒。
-      # 早期曾试图把面板版本改成套件版本，结果是用户看不到上游版本变化，
-      # 已回退（见 CHANGELOG 与 UPSTREAMS.md）。
+      #   若 latest 每次 main 推送都移动 →
+      #     跑 main 构建（sha-xxx）时面板说"最新正式版 v1.2.3，有更新"，
+      #     点更新却拉到又一个 main 构建（sha-yyy），版本仍是 sha 形态、
+      #     面板继续说"有更新" —— **永远收敛不到它承诺的那个版本**。
       #
-      # 优先用 git tag（vX.Y.Z）；没有 tag 时用 sha-<short>。
+      #   改成 latest 只在 tag 时移动后：
+      #     tag v1.2.4 → latest 指向 v1.2.4 → 面板提示有更新 →
+      #     点更新拉到 v1.2.4 → 镜像内版本号变成 v1.2.4 → 面板显示"已是最新"。✓
+      #
+      # 想跟 main 的人改用 `:main`（跟随最新 main 构建）或 `:sha-xxxxxxx`
+      # （钉死到某次提交），不要再依赖 `latest`。
+      #
+      # ⚠️ 因此**必须先打第一个 tag**：在此之前 `latest` 不会更新
+      # （旧值还在，但不再移动），全新仓库上更是不存在。
+
+      # 套件版本：写入镜像的 OCI 标签（org.opencontainers.image.version）、
+      # 环境变量 WB_SUITE_VERSION 与文件 /opt/suite/version（见 docker/Dockerfile）。
+      #
+      # ⚠️ 它**参与**面板的版本检测 —— 面板「系统更新」第一段「本套件」
+      # 显示的就是它：当前版本 vs 仓库里最新的 `vX.Y.Z` git tag。
+      # （上游 manager 的版本号是**另一条线**，在面板第二、三段显示。）
+      #
+      # 优先用 git tag（vX.Y.Z）；没有 tag 时用 sha-<short>，
+      # 面板会把后者如实显示为「开发构建」而不参与版本比较。
       - name: Compute suite version
         id: suite
         run: |
@@ -280,12 +304,16 @@ jobs:
           cat <<EOF >> "$GITHUB_STEP_SUMMARY"
           ## 镜像已发布
 
+          本次推送的标签：
+
           \`\`\`
-          ${{ steps.image.outputs.name }}:latest
-          ${{ steps.image.outputs.name }}:sha-${GITHUB_SHA::7}
+          ${{ steps.tags.outputs.list }}
           \`\`\`
 
           平台：linux/amd64, linux/arm64
+
+          > \`latest\` **只在打 tag 时移动**（= 最新正式版）；非发版构建只更新
+          > \`main\` 与 \`sha-*\`。原因见 build.yml 的「为什么 latest 只在打 tag 时移动」。
 
           ### 捆绑的上游版本
 
@@ -294,7 +322,7 @@ jobs:
           | Sliverkiss/workbuddy2api | \`${{ steps.pins.outputs.wb2api_short }}\` |
           | ithtelab/workbuddy-manager | \`${{ steps.pins.outputs.manager_short }}\` |
 
-          部署：
+          部署（\`SUITE_IMAGE\` 默认用 \`latest\` = 最新正式版）：
 
           \`\`\`bash
           docker compose pull && docker compose up -d
