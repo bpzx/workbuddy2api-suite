@@ -69,6 +69,14 @@ jobs:
             exit 1
           fi
 
+          # 顶部"发现新版本"弹窗必须已被移除。用它对 sessionStorage 写的标记键
+          # 作为判据 —— 那个键只属于被移除的那个 useEffect，最不容易误判。
+          if grep -q "update-notified" \
+              /tmp/patched/manager/web/components/common/layout/ManagementBar.tsx; then
+            echo "::error::顶部"发现新版本"弹窗未被移除（ManagementBar 补丁未生效）"
+            exit 1
+          fi
+
           # 正向断言：overlay 必须真的落位。
           # 更新面板是**整文件覆写**而不是打补丁，所以这里验证"我们的文件在"，
           # 而不是验证"没有补丁标记" —— 后者对覆写文件毫无意义。

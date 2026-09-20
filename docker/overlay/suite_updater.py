@@ -248,7 +248,7 @@ def _spawn_helper() -> tuple[bool, str]:
 def start_update() -> tuple[int, dict]:
     """处理一次更新请求，返回 (HTTP 状态码, 响应体)。"""
     if not TOKEN:
-        return 500, {'ok': False, 'message': '侧车未配置 SUITE_UPDATER_TOKEN，拒绝执行'}
+        return 500, {'ok': False, 'message': '未启用一键更新：请设置 SUITE_UPDATER_TOKEN 后重启更新服务'}
     # 幂等保护：helper 还在跑就直接拒绝，避免并发重建
     if _helper_running():
         return 409, {'ok': False, 'message': '已有更新任务正在执行'}

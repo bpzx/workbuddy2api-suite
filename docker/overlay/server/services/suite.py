@@ -380,7 +380,7 @@ async def read_status() -> dict:
     if not UPDATER_TOKEN:
         return {
             **base, 'available': False, 'running': False,
-            'reason': '未设置 SUITE_UPDATER_TOKEN，无法向 updater 侧车发起更新',
+            'reason': '未启用一键更新：在 .env 里设置 SUITE_UPDATER_TOKEN 即可启用',
         }
 
     try:
@@ -393,9 +393,9 @@ async def read_status() -> dict:
                 'running': bool(body.get('running')),
                 'status': body.get('status') or local,
             }
-        reason = str(body.get('message') or f'侧车返回 HTTP {code}')
-    except Exception as exc:  # noqa: BLE001
-        reason = f'无法连接 updater 侧车（{UPDATER_BASE}）：{str(exc)[:80]}'
+        reason = str(body.get('message') or f'更新服务返回 HTTP {code}')
+    except Exception:  # noqa: BLE001
+        reason = f'连不上更新服务（{UPDATER_BASE}）：请确认它已启动（docker compose up -d updater）'
 
     # 侧车不可达：只把"新鲜且未结束"的状态当作仍在进行，避免陈旧的
     # running=true 永久卡住界面
@@ -408,11 +408,11 @@ async def read_status() -> dict:
 async def trigger_update() -> tuple[bool, str]:
     """触发一键更新。返回 (是否已开始, 说明)。"""
     if not UPDATER_TOKEN:
-        return False, '未设置 SUITE_UPDATER_TOKEN，无法向 updater 侧车发起更新'
+        return False, '未启用一键更新：在 .env 里设置 SUITE_UPDATER_TOKEN 即可启用'
     try:
         code, body = await _updater_call('POST', '/update', 10)
-    except Exception as exc:  # noqa: BLE001
-        return False, f'无法连接 updater 侧车（{UPDATER_BASE}）：{str(exc)[:80]}'
+    except Exception:  # noqa: BLE001
+        return False, f'连不上更新服务（{UPDATER_BASE}）：请确认它已启动（docker compose up -d updater）'
     if code in (200, 202):
         return True, str(body.get('message') or '更新已开始')
-    return False, str(body.get('message') or f'侧车返回 HTTP {code}')
+    return False, str(body.get('message') or f'更新服务返回 HTTP {code}')

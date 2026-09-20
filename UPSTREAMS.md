@@ -81,17 +81,23 @@ internal/prompt/prompt.go:17:12: pattern defaultprompt.md: no matching files fou
 
 ## 构建期补丁登记
 
-上游代码保持原样入库，但容器化集成需要**三处**上游没有的行为，因此在**构建期**
+上游代码保持原样入库，但容器化集成需要**四组**上游没有的行为，因此在**构建期**
 打补丁（`docker/patches/apply.py`，Dockerfile 的 `vpatch` 阶段）。
+（四组共 6 处文本替换：补丁 1 与 3 各含 2 处。）
 
 | # | 目标 | 上游位置 | 补丁内容 | 为什么需要 |
 |---|---|---|---|---|
 | 1 | manager | `server/config.py` · `http_client()` | 给内部服务（`WB2API_BASE`、`dockerproxy`）挂直连 transport（`mounts`） | httpx 的 `proxy=` 作用于所有请求；配了 SOCKS 后连内网上游 `wb2api:7863` 也会走代理，管理端连不上自己的上游。`no_proxy` 环境变量在显式 `proxy=` 下**不生效**（已实测） |
 | 2 | wb2api | `internal/upstream/transport.go` · `newTransport()` | 给 `http.Transport` 设 `Proxy: http.ProxyFromEnvironment` | 上游未设该字段，Go 零值 = **恒不使用代理**且不读环境变量，网关出站无法走代理 |
 | 3 | manager | `server/main.py` | 加两行：导入并 `include_router(suite_router)` | 注册本项目新增的 `/api/system/suite-*`（套件自更新）路由。**上游路由实现一行未改** —— 见下面的覆写登记 |
+| 4 | manager | `web/components/common/layout/ManagementBar.tsx` | 移除"发现新版本"会话弹窗（整块 `useEffect`） | 那条提示在本发行版**两处都不成立**：① 它显示的版本号是**上游 manager** 的，不是本套件的；② 文案指向「设置 → 系统更新 一键升级」，而该页并不提供升级上游的按钮。留着只会让人误以为点一下就能升级 |
 
 补丁 1、2 都与**出口代理**有关 —— 那是本项目相对上游的实质增量之一；
-补丁 3 只是"挂载我们自己的路由"的接线，不改变上游任何行为。
+补丁 3 只是"挂载我们自己的路由"的接线；补丁 4 是"去掉不该出现的行为"。
+
+> **注意区分「改措辞」与「去行为」**：本项目**不做**前者（见下面的教训），
+> 但做后者。补丁 4 移除的是一个**实际会弹出来的提示**，不是把某句话换个说法 ——
+> 判据是"它是否在误导用户去做一个做不到的操作"。
 
 ### 覆写登记（比补丁更重的手段）
 

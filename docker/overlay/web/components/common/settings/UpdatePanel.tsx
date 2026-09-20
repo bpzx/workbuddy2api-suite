@@ -314,10 +314,14 @@ export function UpdatePanel() {
                   <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
                   {t('suiteUpdate.unavailable')}
                 </div>
-                <div className="mt-1.5 text-muted-foreground">
-                  {t('suiteUpdate.unavailableHint')} <code className="font-mono">{status?.reason}</code>
-                </div>
+                {/* 原因单独一行（后端给的就是可执行的原因，如"未设置 SUITE_UPDATER_TOKEN"），
+                    不跟下面那句"可以在宿主机执行"挤在一起 —— 早期版本把两者拼在一句里，
+                    读起来像"请在宿主机执行：未设置 SUITE_UPDATER_TOKEN"，语义不通。 */}
+                {status?.reason && (
+                  <div className="mt-1.5 text-muted-foreground">{status.reason}</div>
+                )}
                 <div className="mt-2 flex items-center gap-2">
+                  <span className="shrink-0 text-muted-foreground">{t('suiteUpdate.manualHint')}</span>
                   <code className="flex-1 truncate rounded-full bg-background/60 px-3 py-1 font-mono">
                     {MANUAL_COMMAND}
                   </code>
@@ -428,43 +432,41 @@ export function UpdatePanel() {
           </div>
         </div>
 
-        <div className="mt-3 text-[11px] text-muted-foreground">{t('suiteUpdate.upstreamHint')}</div>
-        {/* 能力边界：本容器无法操作 docker（经 socket 代理且关闭了 /info），
-            所以上游更新只能在宿主机做。这是上游 can_update_upstream 想表达的语义。 */}
-        {canControlDocker === false && (
-          <div className="mt-2 flex items-start gap-2 text-[11px] text-muted-foreground">
-            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" />
-            <span>{t('suiteUpdate.capabilityNote')}</span>
-          </div>
-        )}
+        {/* 上游两块只报告、不更新。这句话说明更新该怎么做；容器无法操作 docker
+            时补一句原因 —— 这正是上游 can_update_upstream 能力标志的语义
+            （上游 test_docker_deploy 也要求本文件出现该标志）。
+            刻意用同一段文字追加，而不是另起一行：早期版本写成两句，
+            实际在说同一件事，读起来是废话。 */}
+        <div className="mt-3 text-[11px] text-muted-foreground">
+          {t('suiteUpdate.upstreamHint')}
+          {canControlDocker === false && <> {t('suiteUpdate.noDockerNote')}</>}
+        </div>
       </div>
 
-      {/* ═══ 更新日志 ═══ */}
-      <div className="rounded-[20px] bg-muted p-4">
-        <div className="mb-3 flex items-center justify-between gap-2">
-          <div className="flex items-center gap-2 text-sm font-medium">
-            <Terminal className="h-4 w-4" />
-            {t('suiteUpdate.log')}
-          </div>
-          {logs.length > 0 && (
+      {/* ═══ 更新日志 ═══
+          没有日志时整块隐藏 —— 首次部署时满屏的"暂无日志"只是噪音。
+          触发更新后第一行日志几乎立刻就有（侧车先写一条初始状态）。 */}
+      {logs.length > 0 && (
+        <div className="rounded-[20px] bg-muted p-4">
+          <div className="mb-3 flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 text-sm font-medium">
+              <Terminal className="h-4 w-4" />
+              {t('suiteUpdate.log')}
+            </div>
             <Badge variant="secondary" className="rounded-full">
               {logs.length}
             </Badge>
-          )}
-        </div>
-        <div
-          ref={logRef}
-          className="scroll-slim max-h-[320px] overflow-auto rounded-2xl bg-background/60 p-3"
-        >
-          {logs.length === 0 ? (
-            <div className="text-[11px] text-muted-foreground">{t('suiteUpdate.emptyLog')}</div>
-          ) : (
+          </div>
+          <div
+            ref={logRef}
+            className="scroll-slim max-h-[320px] overflow-auto rounded-2xl bg-background/60 p-3"
+          >
             <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-5 text-muted-foreground">
               {logs.map((l) => l.text).join('\n')}
             </pre>
-          )}
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

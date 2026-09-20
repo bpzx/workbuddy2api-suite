@@ -7,10 +7,11 @@
 逐字节一致 —— 只有这样 `scripts/sync-upstreams.sh` 才能是一条命令的事。
 
 ===== 四类改动（按侵入程度从轻到重）=====
-能用轻的就不用重的。当前用量：文本补丁 3、JSON 键合并 1、文件新增 2、文件覆写 1。
+能用的就用轻的。当前用量：文本补丁 4 组（6 处替换）、JSON 键合并 1、文件新增 2、文件覆写 1。
 
   1. **文本补丁**：锚定上游某段代码原位替换，保留上游其余逻辑。
-     都与「出口代理支持」和「注册套件路由」有关。
+     4 组分别是：出口代理支持（2 组）、注册套件路由（1 组）、
+     移除不该出现的会话弹窗（1 组）。
   2. **JSON 键合并**：给 i18n 词典**新增**一个文案命名空间，不碰上游已有键。
   3. **文件新增**：放入上游没有的新文件（自研的套件更新后端）。
   4. **文件覆写**：整文件替换上游文件。**代价是放弃该文件的上游后续改进**，
@@ -168,6 +169,57 @@ MAIN_ROUTER_OLD = 'app.include_router(system.router)'
 MAIN_ROUTER_NEW = """app.include_router(system.router)
 # 【集成补丁】套件自更新（/api/system/suite-*）
 app.include_router(suite_router.router)"""
+
+
+# ─────────────────────────────────────────────────────────────
+# 文本补丁 4：manager —— 去掉顶部的"发现新版本"会话弹窗
+# ─────────────────────────────────────────────────────────────
+# 上游位置：vendor/manager/web/components/common/layout/ManagementBar.tsx
+#
+# 上游每次会话检测一次新版本，有更新就弹一个 toast。本发行版必须去掉它，因为
+# 那条提示**两处都不成立**：
+#   1. 它显示的版本号是**上游 workbuddy-manager** 的版本（读的是上游
+#      /api/system/check-update），不是本套件的版本 —— 用户会误以为
+#      "管理端 v1.0.60" 说的是自己这个项目。这个误读已经真实发生过。
+#   2. 它的文案是「到设置 → 系统更新 一键升级」，但本发行版的「系统更新」页
+#      **不提供升级上游的按钮**（上游更新必须走宿主机 sync-upstreams.sh +
+#      重建镜像），所以它指向的操作根本不存在。
+# 版本信息统一看「系统更新」页：本套件与两个上游分三段列出，各自标明能否更新。
+#
+# 注：这属于"去掉不该出现的行为"，不是"改措辞"——后者是本项目明确不再做的事
+# （见文件头「曾经打过、现已删除的补丁」）。
+MANAGEMENT_BAR_OLD = """  // 每个浏览器会话检测一次新版本，有更新则弹出提醒（避免打扰不重复提示）
+  useEffect(() => {
+    if (!mounted || typeof window === 'undefined') return;
+    const KEY = 'workbuddy-manager:update-notified';
+    if (window.sessionStorage.getItem(KEY) === '1') return;
+    window.sessionStorage.setItem(KEY, '1');
+
+    (async () => {
+      try {
+        const c = await systemApi.checkUpdate();
+        if (!c.has_any) return;
+        const parts: string[] = [];
+        if (c.manager.has_update) parts.push(t('update.managerVersion', {v: c.manager.latest}));
+        if (c.upstream.has_update) parts.push(t('update.upstreamVersion', {v: c.upstream.latest}));
+        notify.warn(t('update.newVersion'), t('update.notice', {targets: parts.join(' · ')}));
+      } catch {
+        /* 检测失败静默：不打扰用户（如服务器访问 GitHub 受限） */
+      }
+    })();
+  }, [mounted, t]);"""
+
+MANAGEMENT_BAR_NEW = """  // 【集成补丁】本发行版**移除了**上游的"发现新版本"会话弹窗。
+  //
+  // 为什么移除（那条提示在这里两处都不成立）：
+  //   1. 它显示的版本号是**上游 workbuddy-manager** 的版本，不是本套件的版本
+  //      —— 会让人误以为"管理端 vX"说的是本项目。
+  //   2. 它的文案指向「设置 → 系统更新 一键升级」，但本发行的该页并不提供
+  //      升级上游的按钮（上游更新必须走宿主机同步 + 重建镜像），
+  //      也就是说它提示的那个操作不存在。
+  //
+  // 版本信息统一看「系统更新」页：本套件与两个上游分三段列出，各自标明
+  // 能否更新，且不弹窗打扰。见 docker/patches/apply.py。"""
 
 
 # ─────────────────────────────────────────────────────────────
@@ -361,26 +413,39 @@ def _plan_i18n(root: Path, overlay: Path) -> list[tuple[Path, dict, str, dict]]:
     return ops
 
 
+def build_text_edits(root: Path) -> list[tuple[Path, str, str, str]]:
+    """全部文本补丁：(文件, 锚点, 替换成, 说明)。
+
+    抽成函数是为了让测试能在**原始 vendor** 上做预检（见 tests/test_patch_preflight.py）——
+    上游一旦重构、锚点失效，本地就能先发现，不必等构建或 CI。
+    """
+    return [
+        (root / 'manager' / 'server' / 'config.py',
+         MANAGER_ANCHOR, MANAGER_HELPER + MANAGER_ANCHOR,
+         'manager: 注入 _internal_direct_mounts()'),
+        (root / 'manager' / 'server' / 'config.py',
+         MANAGER_OLD, MANAGER_NEW,
+         'manager: 内网请求直连（mounts）'),
+        (root / 'wb2api' / 'internal' / 'upstream' / 'transport.go',
+         GO_OLD, GO_NEW,
+         'wb2api: Transport 读代理环境变量'),
+        (root / 'manager' / 'server' / 'main.py',
+         MAIN_IMPORT_OLD, MAIN_IMPORT_NEW,
+         'manager: 导入套件路由'),
+        (root / 'manager' / 'server' / 'main.py',
+         MAIN_ROUTER_OLD, MAIN_ROUTER_NEW,
+         'manager: 注册套件路由'),
+        (root / 'manager' / 'web' / 'components' / 'common' / 'layout' / 'ManagementBar.tsx',
+         MANAGEMENT_BAR_OLD, MANAGEMENT_BAR_NEW,
+         'manager: 移除"发现新版本"会话弹窗'),
+    ]
+
+
 def main() -> int:
     root = Path(sys.argv[1] if len(sys.argv) > 1 else '/src/vendor')
     overlay = _overlay_dir(sys.argv[2] if len(sys.argv) > 2 else None)
 
-    manager_cfg = root / 'manager' / 'server' / 'config.py'
-    go_transport = root / 'wb2api' / 'internal' / 'upstream' / 'transport.go'
-    manager_main = root / 'manager' / 'server' / 'main.py'
-
-    text_edits: list[tuple[Path, str, str, str]] = [
-        (manager_cfg, MANAGER_ANCHOR, MANAGER_HELPER + MANAGER_ANCHOR,
-         'manager: 注入 _internal_direct_mounts()'),
-        (manager_cfg, MANAGER_OLD, MANAGER_NEW,
-         'manager: 内网请求直连（mounts）'),
-        (go_transport, GO_OLD, GO_NEW,
-         'wb2api: Transport 读代理环境变量'),
-        (manager_main, MAIN_IMPORT_OLD, MAIN_IMPORT_NEW,
-         'manager: 导入套件路由'),
-        (manager_main, MAIN_ROUTER_OLD, MAIN_ROUTER_NEW,
-         'manager: 注册套件路由'),
-    ]
+    text_edits = build_text_edits(root)
 
     print(f'[patches] vendor 根 {root}')
     print(f'[patches] overlay  {overlay}')
