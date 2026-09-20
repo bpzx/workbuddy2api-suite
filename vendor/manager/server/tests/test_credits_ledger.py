@@ -38,7 +38,7 @@ class CreditsCacheAndLedger(unittest.TestCase):
 
         async def fake_fetch(auth: dict):
             self._calls += 1
-            return True, self.value, 'ok'
+            return True, self.value, 'ok', []
 
         self.value = 1000
         tencent.fetch_credits = fake_fetch  # type: ignore[assignment]
@@ -60,7 +60,7 @@ class CreditsCacheAndLedger(unittest.TestCase):
 
     # ── 缓存可见性 ──────────────────────────────────────
     def test_first_call_is_live(self) -> None:
-        ok, value, msg, cached, age = self._get()
+        ok, value, msg, cached, age, _exp = self._get()
         self.assertTrue(ok)
         self.assertEqual(value, 1000)
         self.assertFalse(cached, '首次查询不应标记为缓存')
@@ -69,7 +69,7 @@ class CreditsCacheAndLedger(unittest.TestCase):
 
     def test_second_call_reports_cache(self) -> None:
         self._get()
-        ok, value, msg, cached, age = self._get()
+        ok, value, msg, cached, age, _exp = self._get()
         self.assertTrue(cached, 'TTL 内应命中缓存')
         self.assertEqual(value, 1000)
         self.assertIsNotNone(age)
@@ -78,7 +78,7 @@ class CreditsCacheAndLedger(unittest.TestCase):
 
     def test_force_bypasses_cache(self) -> None:
         self._get()
-        ok, _, _, cached, age = self._get(force=True)
+        ok, _, _, cached, age, _exp = self._get(force=True)
         self.assertFalse(cached)
         self.assertIsNone(age)
         self.assertEqual(self._calls, 2)
@@ -130,11 +130,11 @@ class CreditsCacheAndLedger(unittest.TestCase):
 
     def test_error_is_not_cached(self) -> None:
         async def failing(auth: dict):
-            return False, None, 'network down'
+            return False, None, 'network down', []
 
         tencent.fetch_credits = failing  # type: ignore[assignment]
         self._get()
-        ok, _, _, cached, _ = self._get()
+        ok, _, _, cached, _, _exp = self._get()
         self.assertFalse(ok)
         self.assertFalse(cached, '失败结果不应被缓存')
 

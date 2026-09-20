@@ -3,6 +3,7 @@
 import {memo, useEffect} from 'react';
 import {useRouter} from 'next/navigation';
 import {ManagementBar} from '@/components/common/layout/ManagementBar';
+import {LanguageToggle} from '@/components/common/layout/LanguageToggle';
 import {RealmToggle} from '@/components/common/layout/RealmToggle';
 import {RealmProvider} from '@/lib/realm-context';
 import {useAuth} from '@/lib/auth-context';
@@ -34,7 +35,8 @@ export default function MainLayout({
                   版本切换固定在右上角：底栏是照 LDC 原样保留的，控件不往那里加。
                   移动端只显示图标（compact），避免窄屏被它占掉一行。
                 */}
-                <div className="flex justify-end">
+                <div className="flex flex-wrap items-center justify-end gap-2">
+                  <LanguageToggle />
                   <RealmToggle />
                 </div>
                 {children}

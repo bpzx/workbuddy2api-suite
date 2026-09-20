@@ -47,7 +47,18 @@ def _request(body: bytes, headers: dict | None = None) -> Request:
 
 
 class BodyLimitResolution(unittest.TestCase):
-    """上限应跟随上游 server.max_body_mb。"""
+    """上限的取值来源。
+
+    上游 9d1a21b **移除了** `server.max_body_mb`（chat handler 也去掉了预拦截），
+    所以「跟随上游配置」不再是唯一来源：
+
+      · 旧版上游（配置里仍有该键）→ 继续尊重它，升级顺序不受限；
+      · 新版上游（无该键）→ 用**本端自己**的默认值（WB_GATEWAY_MAX_BODY_MB）。
+
+    为什么本端不能也取消上限：上游是 Go，读的是流、能背压；本端要把完整 body
+    读进内存再 json.loads（见 _read_json_body），几个并发大请求就能把内存吃光。
+    保留上限是必要的，只是默认值要够大（32 MB），免得变成比上游更紧的隐性瓶颈。
+    """
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -74,8 +85,22 @@ class BodyLimitResolution(unittest.TestCase):
         self.assertEqual(self._mb({'server': {'max_body_mb': 64}}), 64)
 
     def test_missing_config_falls_back(self) -> None:
-        """读不到配置不能导致拒绝服务，退回默认 8 MiB。"""
+        """读不到配置不能导致拒绝服务，退回本端默认值。"""
         self.assertEqual(self._mb('missing'), gateway.DEFAULT_MAX_BODY_MB)
+
+    def test_default_is_generous_after_upstream_removed_the_key(self) -> None:
+        """上游移除该键后，本端默认值必须足够大，否则会成为隐性瓶颈。
+
+        上游现在不限制请求体；本端若还按老默认 8 MB 拦，用户发个正常的大上下文
+        请求就会被 413，而上游其实能处理 —— 且报错指的配置项在上游已不存在。
+        """
+        self.assertGreaterEqual(gateway.DEFAULT_MAX_BODY_MB, 16,
+                                '默认值太小会让本端比上游更先拒绝')
+
+    def test_new_upstream_without_the_key_uses_our_default(self) -> None:
+        """新版上游的配置里没有 server 段 → 用本端默认值，不是「无限制」。"""
+        self.assertEqual(self._mb({}), gateway.DEFAULT_MAX_BODY_MB)
+        self.assertGreater(gateway.max_body_bytes(), 0, '上限不能变成 0（等于全拒）')
 
     def test_invalid_values_fall_back(self) -> None:
         for bad in ({'server': {}}, {'server': {'max_body_mb': 0}},
@@ -150,11 +175,17 @@ class BodyLimitEnforcement(unittest.TestCase):
         self.assertEqual(err.status_code, 400)
 
     def test_error_message_has_guidance(self) -> None:
-        """报错要说清怎么改，而不是只丢一个 413。"""
+        """报错要说清怎么改，而不是只丢一个 413。
+
+        指导必须指向**真正能改的地方**：上游 9d1a21b 起移除了
+        `server.max_body_mb`，再让用户去调那个键等于指错路（按上游文档怎么找
+        都找不到）。现在指本网关自己的环境变量。
+        """
         _, err = self._read(self.big, {})
         msg = json.loads(err.body)['error']['message']
         self.assertIn('上限', msg)
-        self.assertIn('max_body_mb', msg)
+        self.assertIn('WB_GATEWAY_MAX_BODY_MB', msg,
+                      '要指出本网关自己的环境变量（上游那个键已经不存在了）')
 
 
 if __name__ == '__main__':

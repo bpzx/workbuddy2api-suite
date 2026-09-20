@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -67,9 +68,24 @@ class EndpointTest(unittest.TestCase):
         self.assertEqual(realm.billing_base('global'), 'https://www.workbuddy.ai')
 
     def test_chat_paths(self) -> None:
+        """两个版本都固定 `/v2`（上游 #119）。
+
+        国际版曾以 `/console` 优先，但那个端点上挂了腾讯云 WAF 的请求体内容规则：
+        正文里出现反引号 `printf` / `whoami` 等命令执行特征会被确定性拦成 403
+        ——用户只是问一句 shell 命令就中招。`/v2` 是同一 base 下的等价端点，不挂
+        该规则。
+
+        这条断言的意义不是「路径长什么样」，而是**我们的探测打的端点必须与上游
+        转发用的端点一致**：否则某天 `/console` 真被 WAF 封死时，我们的「测活」
+        会告诉用户账号不可用，而实际上游转发一切正常。
+        """
         self.assertEqual(realm.chat_paths('cn'), ['/v2/chat/completions'])
-        self.assertEqual(realm.chat_paths('global'),
-                         ['/console/chat/completions', '/v2/chat/completions'])
+        self.assertEqual(realm.chat_paths('global'), ['/v2/chat/completions'])
+        for r in ('cn', 'global'):
+            self.assertNotIn(
+                '/console/chat/completions', realm.chat_paths(r),
+                '不得再走 /console：该端点挂 WAF 内容规则，含命令特征的消息会被 403',
+            )
 
     def test_billing_path_order_is_reversed(self) -> None:
         """国际版无 /v2 前缀优先，国内版只有 /v2——两者顺序相反，照上游实现。"""
@@ -203,6 +219,273 @@ class StateRealmTest(unittest.TestCase):
         import asyncio
         out = asyncio.run(tencent.poll_login('nope', 'cn'))
         self.assertEqual(out['status'], 'invalid')
+
+    def test_ttl_is_generous_enough_for_phone_login(self) -> None:
+        """state 有效期要够手机号登录用（社区反馈：手机号登录「返回登录有问题」）。
+
+        腾讯授权页除了扫码，也支持**手机号 + 短信验证码**登录：短信有运营商延迟、
+        用户还可能中途去翻手机，全程超过 5 分钟很常见。此前 TTL 写 300 秒，
+        超时后前端报「二维码已失效」，而用户觉得自己刚授权成功 —— 现象对不上。
+
+        上游 workbuddy2api 对这个 state **没有任何超时**（它的 login.sh 是手动按 y
+        才 poll）。我们保留 TTL 只为清理内存，放宽的开销可以忽略（人工低频操作、
+        每条几十字节）。
+        """
+        self.assertGreaterEqual(
+            tencent.STATE_TTL, 900,
+            f'STATE_TTL={tencent.STATE_TTL}s 对手机号登录偏紧，用户会被误报过期')
+
+    def test_state_survives_a_realistic_phone_login(self) -> None:
+        """手机号登录耗时 8 分钟时**不能**判过期（拿真实 poll_login 走一遍）。
+
+        poll_login 的过期判定发生在出站请求**之前**，所以这里不需要打网络：
+        只要不返回 expired 就说明判定通过了（后续会因拿不到 token 而 waiting）。
+        """
+        import asyncio
+        import time as _t
+
+        tencent._state_cache['phone'] = (_t.time() - 8 * 60, 'cn')
+
+        class _Resp:
+            def json(self) -> dict:
+                return {'code': 0, 'data': {}}
+
+        class _Ctx:
+            async def __aenter__(self):
+                class _C:
+                    async def get(self, *a, **kw):
+                        return _Resp()
+                return _C()
+
+            async def __aexit__(self, *a):
+                return False
+
+        with mock.patch.object(config, 'http_client', lambda *a, **k: _Ctx()):
+            out = asyncio.run(tencent.poll_login('phone', 'cn'))
+        self.assertNotEqual(out['status'], 'expired',
+                            '8 分钟就判过期 —— 手机号登录很容易踩到')
+        self.assertEqual(out['status'], 'waiting')
+        tencent._state_cache.clear()
+        _ = asyncio  # 保持导入一致性
+
+
+class PollDoesNotDropStateTest(unittest.TestCase):
+    """issue #26：`poll_login` 拿到 ready 后**不能**自己丢 state。
+
+    报障现象：微信扫码确认后，弹窗显示「二维码已失效」。
+
+    根因链：`poll_login` 早先是拿到 uid 就 `drop_state`，而真正落盘在**路由**里
+    （`accounts.py` 的 `write_auth_file`）。若落盘抛错（宝塔/1Panel 部署下 auths
+    目录属主不对 → PermissionError 很常见），那次请求 500、前端 catch 静默吞掉；
+    下一轮轮询时 state 已被丢掉 → 返回 `invalid` → 界面显示「二维码已失效」，
+    把用户引向「重新扫码」—— 而重扫必然同样失败，因为问题是目录权限。
+
+    正确语义：state 的有效期是「发码起 5 分钟」（由 TTL 分支负责），
+    不是「拿到 token 就作废」；成功路径由调用方在**落盘之后**显式 drop。
+    """
+
+    def setUp(self) -> None:
+        tencent._state_cache.clear()
+
+    def tearDown(self) -> None:
+        tencent._state_cache.clear()
+
+    def _poll_with_stubbed_tencent(self, tokens: dict) -> dict:
+        """跑一次 poll_login，把出站 HTTP 换成假响应，避免真发请求。"""
+        import asyncio
+
+        class _Resp:
+            def __init__(self, payload: dict) -> None:
+                self._payload = payload
+
+            def json(self) -> dict:
+                return self._payload
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, url, params=None, headers=None):
+                if 'auth/token' in url:
+                    return _Resp({'code': 0, 'data': tokens})
+                return _Resp({'code': 0, 'data': {'uid': 'u123', 'nickname': 'n',
+                                                  'enterpriseId': ''}})
+
+        class _Ctx:
+            async def __aenter__(self):
+                return _Client()
+
+            async def __aexit__(self, *a):
+                return False
+
+        with mock.patch.object(config, 'http_client', lambda *a, **k: _Ctx()):
+            return asyncio.run(tencent.poll_login('s1', 'cn'))
+
+    def test_ready_keeps_state_for_caller(self) -> None:
+        """拿到 ready 后 state 必须还在 —— 落盘失败时用户才能重试。"""
+        import time
+
+        tencent._state_cache['s1'] = (time.time(), 'cn')
+        out = self._poll_with_stubbed_tencent(
+            {'accessToken': 'AT', 'refreshToken': 'RT', 'expiresIn': 3600, 'domain': ''})
+        self.assertEqual(out['status'], 'ready')
+        self.assertTrue(tencent.is_pending('s1'),
+                        'poll_login 提前丢了 state —— 落盘失败后重试会被误报成「二维码失效」')
+
+    def test_caller_can_drop_after_saving(self) -> None:
+        """成功路径由调用方在落盘后收尾，drop 之后才判 invalid。"""
+        import time
+
+        tencent._state_cache['s1'] = (time.time(), 'cn')
+        self._poll_with_stubbed_tencent(
+            {'accessToken': 'AT', 'refreshToken': 'RT', 'expiresIn': 3600, 'domain': ''})
+        tencent.drop_state('s1')
+        self.assertFalse(tencent.is_pending('s1'))
+
+    def test_ttl_still_bounds_the_retry_window(self) -> None:
+        """不 drop 不等于永不过期：TTL 仍会兜住（否则 state 缓存会无限涨）。"""
+        import asyncio
+        import time
+
+        tencent._state_cache['old'] = (time.time() - tencent.STATE_TTL - 1, 'cn')
+        out = asyncio.run(tencent.poll_login('old', 'cn'))
+        self.assertEqual(out['status'], 'expired')
+        self.assertFalse(tencent.is_pending('old'), '过期时应顺手清掉')
+
+
+class AuthPollSaveFailureTest(unittest.TestCase):
+    """落盘失败要给出**可执行的**提示，且不能把 state 一起弄丢（issue #26）。"""
+
+    def setUp(self) -> None:
+        tencent._state_cache.clear()
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_auth = config.AUTH_DIR
+        self._orig_db = config.DB_PATH
+        self._orig_users = config.USERS_FILE
+        config.AUTH_DIR = Path(self._tmp.name) / 'auths'
+        config.DB_PATH = Path(self._tmp.name) / 'm.db'
+        config.USERS_FILE = Path(self._tmp.name) / 'users.json'
+        from server import db
+        db._conn = None
+        db.connect()
+        self._db = db
+
+    def tearDown(self) -> None:
+        if self._db._conn is not None:
+            self._db._conn.close()
+        self._db._conn = None
+        config.AUTH_DIR = self._orig_auth
+        config.DB_PATH = self._orig_db
+        config.USERS_FILE = self._orig_users
+        tencent._state_cache.clear()
+        self._tmp.cleanup()
+
+    def test_save_failure_message_is_actionable_and_keeps_state(self) -> None:
+        import time
+
+        from fastapi.testclient import TestClient
+        from server import security
+        from server.main import app
+        from server.routers import accounts as accounts_mod
+
+        security.save_users({'secret': 'S', 'users': [
+            {'username': 'admin', 'role': 'admin', 'pwd_hash': security.make_hash('p')}],
+            'api_keys': []})
+        c = TestClient(app)
+        self.assertEqual(c.post('/api/login',
+                                json={'username': 'admin', 'password': 'p'}).status_code, 200)
+
+        tencent._state_cache['s1'] = (time.time(), 'cn')
+        ready = {
+            'status': 'ready', 'uid': 'u1', 'nickname': 'n', 'enterprise_id': '',
+            'access_token': 'AT', 'refresh_token': 'RT',
+            'expires_at': int(time.time()) + 3600, 'domain': '', 'realm': 'cn',
+        }
+        with mock.patch.object(tencent, 'poll_login', return_value=ready), \
+             mock.patch.object(tencent, 'checkin', return_value=(0, 'ok')), \
+             mock.patch.object(tencent, 'write_auth_file',
+                               side_effect=PermissionError('permission denied')), \
+             mock.patch.object(accounts_mod.reload, 'request_restart'):
+            r = c.get('/api/auth/poll', params={'state': 's1', 'realm': 'cn'})
+
+        self.assertEqual(r.status_code, 500, r.text)
+        detail = r.json()['detail']
+        # 提示必须说清三件事：已授权成功、去哪查权限、不用重新扫码
+        self.assertIn('授权成功', detail)
+        self.assertIn('权限', detail)
+        self.assertIn('不需要重新扫码', detail)
+        # 最关键的：state 还在，用户重试能成功
+        self.assertTrue(tencent.is_pending('s1'),
+                        '落盘失败却丢了 state —— 用户重试会看到「二维码已失效」')
+
+    def test_retry_does_not_repeat_side_effects(self) -> None:
+        """重试只补落盘，**不重跑签到与 trial**。
+
+        这是「不丢 state」带来的连带问题（发版前自审发现）：前端每 2 秒轮询同一个
+        state，而 poll_login 每次都返回 ready —— 落盘失败后不记一笔，每次轮询都会
+        重跑签到（重复写 checkin_logs）并重复调腾讯接口。用户看到的「重试」本该
+        是幂等的。
+        """
+        from fastapi.testclient import TestClient
+        from server import security
+        from server.main import app
+        from server.routers import accounts as accounts_mod
+
+        accounts_mod._provisioned_states.clear()
+        security.save_users({'secret': 'S', 'users': [
+            {'username': 'admin', 'role': 'admin', 'pwd_hash': security.make_hash('p')}],
+            'api_keys': []})
+        c = TestClient(app)
+        c.post('/api/login', json={'username': 'admin', 'password': 'p'})
+
+        tencent._state_cache['s2'] = (time.time(), 'cn')
+        ready = {
+            'status': 'ready', 'uid': 'u2', 'nickname': 'n2', 'enterprise_id': '',
+            'access_token': 'AT', 'refresh_token': 'RT',
+            'expires_at': int(time.time()) + 3600, 'domain': '', 'realm': 'cn',
+        }
+        # 必须是 AsyncMock：路由里是 `await tencent.checkin(...)`，
+        # 用同步 MagicMock 会得到 "object tuple can't be used in 'await' expression"
+        checkin = mock.AsyncMock(return_value=(0, 'ok'))
+
+        # 第一次：落盘失败 → 500
+        with mock.patch.object(tencent, 'poll_login', return_value=ready), \
+             mock.patch.object(tencent, 'checkin', checkin), \
+             mock.patch.object(tencent, 'write_auth_file',
+                               side_effect=PermissionError('permission denied')), \
+             mock.patch.object(accounts_mod.reload, 'request_restart'):
+            r1 = c.get('/api/auth/poll', params={'state': 's2', 'realm': 'cn'})
+        self.assertEqual(r1.status_code, 500, r1.text)
+        self.assertEqual(checkin.call_count, 1, '首次应正常签到一次')
+
+        # 第二次（用户重试）：落盘成功 → 不该再签到
+        with mock.patch.object(tencent, 'poll_login', return_value=ready), \
+             mock.patch.object(tencent, 'checkin', checkin), \
+             mock.patch.object(tencent, 'write_auth_file',
+                               return_value=('workbuddy-u2.json', False)), \
+             mock.patch.object(accounts_mod.reload, 'request_restart'):
+            r2 = c.get('/api/auth/poll', params={'state': 's2', 'realm': 'cn'})
+        self.assertEqual(r2.status_code, 200, r2.text)
+        self.assertEqual(checkin.call_count, 1,
+                         f'重试又签到了一次（共 {checkin.call_count} 次）—— 会重复写记录')
+        self.assertFalse(tencent.is_pending('s2'), '成功落盘后应丢弃 state')
+        self.assertEqual(list(accounts_mod._provisioned_states), [],
+                         '成功后要清掉供给标记，避免长期占用内存')
+
+    def test_provisioned_marker_expires_with_state(self) -> None:
+        """供给标记要与 state 同一有效期，不能无限堆积。"""
+        from server.routers import accounts as accounts_mod
+
+        accounts_mod._provisioned_states.clear()
+        # 一条过期的 + 一条新鲜的
+        accounts_mod._provisioned_states['old'] = time.time() - tencent.STATE_TTL - 10
+        accounts_mod._mark_provisioned('new')
+        self.assertNotIn('old', accounts_mod._provisioned_states, '过期标记应被清掉')
+        self.assertIn('new', accounts_mod._provisioned_states)
+        accounts_mod._provisioned_states.clear()
 
 
 class WriteAuthFileTest(unittest.TestCase):

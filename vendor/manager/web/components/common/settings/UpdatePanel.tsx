@@ -26,38 +26,41 @@ import {Button} from '@/components/ui/button';
 import {Badge} from '@/components/ui/badge';
 import {Input} from '@/components/ui/input';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
+import {RichText} from '@/lib/i18n/rich-text';
+import {useT} from '@/lib/i18n/provider';
 
-/** 更新对象说明，用于确认弹窗与按钮文案 */
+/** 更新对象说明（文案走 i18n 键），用于确认弹窗与按钮文案 */
 const TARGETS = [
   {
     id: 'both' as const,
-    label: '全部更新',
-    desc: '上游 workbuddy2api + 管理端',
-    hint: '上游会重建容器（保留账号与配置），管理端会重启服务',
+    labelKey: 'updatePanel.targetBoth',
+    descKey: 'updatePanel.targetBothDesc',
+    hintKey: 'updatePanel.targetBothHint',
   },
   {
     id: 'upstream' as const,
-    label: '仅上游',
-    desc: 'workbuddy2api（账号池 / 反代核心）',
-    hint: '拉取上游代码 → 重建容器。端口绑定会重新收敛为仅本机',
+    labelKey: 'updatePanel.targetUpstream',
+    descKey: 'updatePanel.targetUpstreamDesc',
+    hintKey: 'updatePanel.targetUpstreamHint',
   },
   {
     id: 'manager' as const,
-    label: '仅管理端',
-    desc: '本控制台程序',
-    hint: '下载最新 Release → 替换代码与前端 → 重启服务',
+    labelKey: 'updatePanel.targetManager',
+    descKey: 'updatePanel.targetManagerDesc',
+    hintKey: 'updatePanel.targetManagerHint',
   },
 ];
 
 /** 把检测结果拼成一句可读摘要，用于提醒 */
-function describeAvailable(c: UpdateCheck): string {
+function describeAvailable(c: UpdateCheck, t: (key: string, params?: Record<string, string | number>) => string): string {
   const parts: string[] = [];
-  if (c.manager.has_update) parts.push(`管理端 ${c.manager.latest}`);
-  if (c.upstream.has_update) parts.push(`上游 ${c.upstream.latest}`);
+  if (c.manager.has_update) parts.push(t('update.managerVersion', {v: c.manager.latest}));
+  if (c.upstream.has_update) parts.push(t('update.upstreamVersion', {v: c.upstream.latest}));
   return parts.join(' · ');
 }
 
 export function UpdatePanel() {
+  const t = useT();
   const {isAdmin} = useAuth();
   const [status, setStatus] = useState<UpdateStatus | null>(null);
   const [busy, setBusy] = useState(false);
@@ -104,9 +107,9 @@ export function UpdatePanel() {
       const r = await systemApi.checkUpdate(true);
       setCheck(r);
       if (r.has_any) {
-        notify.warn('发现新版本', describeAvailable(r));
+        notify.warn(t('updatePanel.newVersion'), describeAvailable(r, t));
       } else {
-        notify.ok('已是最新版本', '管理端与上游均无更新');
+        notify.ok(t('updatePanel.upToDate'), t('updatePanel.upToDateDesc'));
       }
     } catch (e) {
       notify.err(errText(e));
@@ -151,7 +154,7 @@ export function UpdatePanel() {
     setBusy(true);
     try {
       const r = await systemApi.startUpdate(target);
-      notify.ok('更新已开始', r.message);
+      notify.ok(t('updatePanel.updateStarted'), r.message);
       // 立即拉一次，进入高频轮询
       await load();
     } catch (e) {
@@ -168,9 +171,12 @@ export function UpdatePanel() {
       const r = await systemApi.setUpstreamRef(refInput.trim());
       setRefInput(r.upstream_ref || '');
       if (r.upstream_ref) {
-        notify.ok('已固定上游版本', `下次「更新上游」将检出 ${r.upstream_ref}，不再跟随分支`);
+        notify.ok(
+          t('updatePanel.refPinned'),
+          t('updatePanel.refPinnedDesc', {ref: r.upstream_ref}),
+        );
       } else {
-        notify.info('已取消固定', '上游更新将恢复跟随分支');
+        notify.info(t('updatePanel.refUnpinned'), t('updatePanel.refUnpinnedDesc'));
       }
       await load();
     } catch (e) {
@@ -189,7 +195,7 @@ export function UpdatePanel() {
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-2 text-sm font-medium">
             <Server className="h-4 w-4" />
-            当前版本
+            {t('updatePanel.currentVersion')}
           </div>
           <div className="flex items-center gap-2">
             <Button
@@ -200,65 +206,74 @@ export function UpdatePanel() {
               disabled={checking || running}
             >
               <RefreshCw className={checking ? 'animate-spin' : ''} />
-              检测更新
+              {t('updatePanel.checkUpdate')}
             </Button>
             <Button variant="outline" size="sm" className="rounded-full" onClick={load} disabled={running}>
               <RefreshCw className={running ? 'animate-spin' : ''} />
-              刷新
+              {t('common.refresh')}
             </Button>
           </div>
         </div>
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
           <div className="rounded-2xl bg-background/60 px-3.5 py-3">
-            <div className="text-[11px] text-muted-foreground">管理端</div>
+            <div className="text-[11px] text-muted-foreground">{t('updatePanel.manager')}</div>
             <div className="mt-1 flex items-center gap-1.5 text-sm font-semibold tabular-nums">
               {versions?.manager || status?.version || '—'}
               {/* 供应链防护：本次更新的包是否经过签名校验，必须让用户看得见 */}
               {status?.signature?.status === 'verified' && (
                 <span
                   className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-400"
-                  title={`发布包已验签通过${status.signature.detail ? `（${status.signature.detail}）` : ''}`}
+                  title={
+                    status.signature.detail
+                      ? t('updatePanel.signedTitleDetail', {detail: status.signature.detail})
+                      : t('updatePanel.signedTitle')
+                  }
                 >
                   <ShieldCheck className="h-3 w-3" />
-                  已验签
+                  {t('updatePanel.signed')}
                 </span>
               )}
               {status?.signature?.status === 'skipped' && (
                 <span
                   className="inline-flex items-center gap-1 rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400"
-                  title="本次更新跳过了签名校验（WB_SKIP_SIGNATURE=1），包内容未经验证"
+                  title={t('updatePanel.unsignedTitle')}
                 >
                   <ShieldOff className="h-3 w-3" />
-                  未验签
+                  {t('updatePanel.unsigned')}
                 </span>
               )}
             </div>
           </div>
           <div className="rounded-2xl bg-background/60 px-3.5 py-3">
-            <div className="text-[11px] text-muted-foreground">上游连接</div>
+            <div className="text-[11px] text-muted-foreground">{t('updatePanel.upstreamConn')}</div>
             <div className="mt-1 flex items-center gap-1.5 text-sm font-semibold">
               {versions?.upstream_connected ? (
                 <>
-                  <span className="text-emerald-600 dark:text-emerald-400">正常</span>
+                  <span className="text-emerald-600 dark:text-emerald-400">{t('updatePanel.connOk')}</span>
                   {typeof versions.upstream_accounts === 'number' && (
-                    <span className="text-xs font-normal text-muted-foreground">({versions.upstream_accounts} 个账号)</span>
+                    <span className="text-xs font-normal text-muted-foreground">
+                      {t('updatePanel.accountCount', {
+                        count: versions.upstream_accounts,
+                        n: versions.upstream_accounts,
+                      })}
+                    </span>
                   )}
                 </>
               ) : (
-                <span className="text-red-600 dark:text-red-400">不可用</span>
+                <span className="text-red-600 dark:text-red-400">{t('updatePanel.connDown')}</span>
               )}
             </div>
           </div>
           <div className="rounded-2xl bg-background/60 px-3.5 py-3">
-            <div className="text-[11px] text-muted-foreground">上次更新</div>
+            <div className="text-[11px] text-muted-foreground">{t('updatePanel.lastUpdate')}</div>
             <div className="mt-1 text-sm font-semibold">
-              {status?.finished_at ? fmtAgo(status.finished_at) : '从未'}
+              {status?.finished_at ? fmtAgo(status.finished_at) : t('format.never')}
             </div>
           </div>
         </div>
         {status?.upstream_dir && (
           <div className="mt-2 truncate font-mono text-[11px] text-muted-foreground" title={status.upstream_dir}>
-            上游目录：{status.upstream_dir}
+            {t('updatePanel.upstreamDir', {dir: status.upstream_dir})}
           </div>
         )}
       </div>
@@ -270,20 +285,20 @@ export function UpdatePanel() {
             <div className="flex items-start gap-2.5">
               <Sparkles className="mt-0.5 h-4 w-4 shrink-0 text-blue-500" />
               <div className="space-y-1.5">
-                <div className="text-xs font-medium">发现新版本可用</div>
+                <div className="text-xs font-medium">{t('updatePanel.newVersionAvailable')}</div>
                 {check.manager.has_update && (
                   <div className="text-[11px] text-muted-foreground">
-                    管理端：{check.manager.current} →{' '}
+                    {t('updatePanel.managerUpgrade', {from: check.manager.current})}{' '}
                     <span className="font-medium text-foreground">{check.manager.latest}</span>
                   </div>
                 )}
                 {check.upstream.has_update && (
                   <div className="space-y-1 text-[11px] text-muted-foreground">
                     <div>
-                      上游：{check.upstream.current || '未知'} →{' '}
+                      {t('updatePanel.upstreamUpgrade', {from: check.upstream.current || t('metric.unknown')})}{' '}
                       <span className="font-medium text-foreground">{check.upstream.latest}</span>
                       {!!check.upstream.ahead && (
-                        <span className="ml-1">（落后 {check.upstream.ahead} 个提交）</span>
+                        <span className="ml-1">{t('updatePanel.commitsBehind', {n: check.upstream.ahead})}</span>
                       )}
                     </div>
                     {/* 变更列表：上游常一次累积多个提交，列出各自说明才能判断
@@ -292,10 +307,12 @@ export function UpdatePanel() {
                       <details className="group">
                         <summary className="cursor-pointer list-none">
                           <span className="text-foreground/80 group-open:hidden">
-                            查看这 {check.upstream.ahead || check.upstream.changes.length} 个提交改了什么
+                            {t('updatePanel.viewCommits', {
+                              n: check.upstream.ahead || check.upstream.changes.length,
+                            })}
                           </span>
                           <span className="hidden text-foreground/80 group-open:inline">
-                            收起变更说明
+                            {t('updatePanel.hideCommits')}
                           </span>
                         </summary>
                         <ul className="mt-1 max-h-[220px] space-y-0.5 overflow-auto rounded-xl bg-background/60 p-2">
@@ -309,7 +326,7 @@ export function UpdatePanel() {
                           ))}
                           {check.upstream.truncated && (
                             <li className="pt-0.5 text-[10px] text-muted-foreground/70">
-                              仅显示最近 {check.upstream.changes.length} 条，完整列表见仓库比较页
+                              {t('updatePanel.changesTruncated', {n: check.upstream.changes.length})}
                             </li>
                           )}
                         </ul>
@@ -317,7 +334,7 @@ export function UpdatePanel() {
                     ) : (
                       check.upstream.subject && (
                         <div className="break-all">
-                          最新提交：{check.upstream.subject}
+                          {t('updatePanel.latestCommit', {subject: check.upstream.subject})}
                           {check.upstream.date && `（${check.upstream.date.slice(0, 10)}）`}
                         </div>
                       )
@@ -325,7 +342,7 @@ export function UpdatePanel() {
                   </div>
                 )}
                 <div className="text-[11px] text-muted-foreground">
-                  点下方按钮即可更新，账号与配置会自动保留。
+                  {t('updatePanel.updateHint')}
                 </div>
               </div>
             </div>
@@ -340,7 +357,7 @@ export function UpdatePanel() {
                     setBusy(true);
                     try {
                       const r = await systemApi.startUpdate('upstream');
-                      notify.ok('更新已开始', r.message);
+                      notify.ok(t('updatePanel.updateStarted'), r.message);
                       await load();
                     } catch (e) {
                       notify.err(errText(e));
@@ -349,7 +366,7 @@ export function UpdatePanel() {
                     }
                   }}
                 >
-                  更新上游
+                  {t('updatePanel.updateUpstream')}
                 </Button>
               )}
               {check.manager.has_update && (
@@ -361,7 +378,7 @@ export function UpdatePanel() {
                     setBusy(true);
                     try {
                       const r = await systemApi.startUpdate('manager');
-                      notify.ok('更新已开始', r.message);
+                      notify.ok(t('updatePanel.updateStarted'), r.message);
                       await load();
                     } catch (e) {
                       notify.err(errText(e));
@@ -371,7 +388,7 @@ export function UpdatePanel() {
                   }}
                 >
                   <DownloadCloud />
-                  更新管理端
+                  {t('updatePanel.updateManager')}
                 </Button>
               )}
             </div>
@@ -382,9 +399,11 @@ export function UpdatePanel() {
       {check && !check.has_any && !check.manager.error && !check.upstream.error && !status?.running && (
         <div className="flex items-center gap-2 rounded-[20px] border border-emerald-500/30 bg-emerald-500/10 px-4 py-3">
           <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-500" />
-          <span className="text-xs">管理端与上游均为最新版本</span>
+          <span className="text-xs">{t('updatePanel.allUpToDate')}</span>
           {check.checked_at > 0 && (
-            <span className="text-[11px] text-muted-foreground">（{fmtAgo(check.checked_at)}检测）</span>
+            <span className="text-[11px] text-muted-foreground">
+              {t('updatePanel.checkedAgo', {ago: fmtAgo(check.checked_at)})}
+            </span>
           )}
         </div>
       )}
@@ -394,10 +413,11 @@ export function UpdatePanel() {
         <div className="flex items-start gap-2.5 rounded-[20px] border border-blue-500/30 bg-blue-500/10 p-4">
           <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-blue-500" />
           <div className="min-w-0 flex-1 space-y-1">
-            <div className="text-xs font-medium">正在更新：{status.step || '执行中'}</div>
+            <div className="text-xs font-medium">
+              {t('updatePanel.updatingNow', {step: status.step || t('updatePanel.stepRunning')})}
+            </div>
             <div className="text-[11px] text-muted-foreground">
-              更新期间服务可能短暂重启（页面自动重连），请勿关闭服务器。
-              进度每 1.5 秒刷新。
+              {t('updatePanel.updatingHint')}
             </div>
           </div>
         </div>
@@ -418,28 +438,29 @@ export function UpdatePanel() {
             <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-500" />
           )}
           <div className="min-w-0 flex-1 space-y-1">
-            <div className="text-xs font-medium">{status?.ok ? '更新完成' : '更新未完成'}</div>
+            <div className="text-xs font-medium">
+              {status?.ok ? t('updatePanel.updateDone') : t('updatePanel.updateNotDone')}
+            </div>
             <div className="text-[11px] text-muted-foreground">
               {status?.ok
-                ? (status?.duration ? `耗时 ${status.duration} 秒。` : '') +
-                  '服务已重启，建议刷新页面确认版本号。' +
-                  (status?.signature?.status === 'verified' ? ' 本次发布包已通过签名校验。' : '')
-                : '请查看下方日志排查；账号与配置未受影响。'}
+                ? (status?.duration ? t('updatePanel.doneDuration', {n: status.duration}) : '') +
+                  t('updatePanel.doneRestart') +
+                  (status?.signature?.status === 'verified' ? t('updatePanel.doneSigned') : '')
+                : t('updatePanel.failedDetail')}
             </div>
             {status?.ok && status?.signature?.status === 'skipped' && (
               <div className="flex items-start gap-1.5 pt-1 text-[11px] text-amber-600 dark:text-amber-400">
                 <ShieldOff className="mt-0.5 h-3 w-3 shrink-0" />
                 <span>
-                  本次更新<b>跳过了签名校验</b>（WB_SKIP_SIGNATURE=1），包内容未经验证。
-                  如非更换签名密钥等紧急情况，请去掉该开关后重新更新一次。
+                  <RichText text={t('updatePanel.skippedWarn')} />
                 </span>
               </div>
             )}
           </div>
           <button
             type="button"
-            aria-label="关闭提示"
-            title="关闭提示"
+            aria-label={t('updatePanel.closeTip')}
+            title={t('updatePanel.closeTip')}
             className="-m-1 shrink-0 rounded-full p-1 text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
             onClick={() => setResultDismissed(true)}
           >
@@ -452,10 +473,9 @@ export function UpdatePanel() {
         <div className="flex items-start gap-2.5 rounded-[20px] border border-amber-500/30 bg-amber-500/10 p-4">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
           <div className="space-y-1">
-            <div className="text-xs font-medium">未找到更新脚本</div>
+            <div className="text-xs font-medium">{t('updatePanel.updaterMissing')}</div>
             <div className="text-[11px] text-muted-foreground">
-              需要 <code className="font-mono">deploy/update.py</code> 存在。
-              若使用旧版安装包，请先用新包重新部署一次。
+              <RichText text={t('updatePanel.updaterMissingHint')} />
             </div>
           </div>
         </div>
@@ -463,23 +483,34 @@ export function UpdatePanel() {
 
       {/* 更新操作 */}
       <div className="rounded-[20px] bg-muted p-4">
-        <div className="mb-1 text-sm font-medium">一键更新</div>
+        <div className="mb-1 text-sm font-medium">{t('updatePanel.oneClickUpdate')}</div>
         <div className="mb-3 text-[11px] leading-4 text-muted-foreground">
-          从 GitHub 拉取最新代码并自动重建/重启。
-          账号授权文件、上游配置、密钥与日志数据都会保留。
+          {t('updatePanel.oneClickUpdateDesc')}
         </div>
         <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
-          {TARGETS.map((t, i) => (
+          {TARGETS.map((target, i) => {
+            // 能否更新上游取决于**能否操作 docker**（后端按实际能力判定），
+            // 而不是"是否在容器里"：容器挂了 docker.sock 就能做这些事。
+            // 不可用时直接禁用并说明替代做法，而不是让用户点了才失败。
+            const blocked = status?.can_update_upstream === false && target.id !== 'manager';
+            const text = blocked
+              ? t('updatePanel.dockerBlocked')
+              : t('updatePanel.targetDescText', {
+                  desc: t(target.descKey),
+                  hint: t(target.hintKey),
+                });
+            return (
             <ConfirmDialog
-              key={t.id}
-              title={`确认${t.label}？`}
-              description={`${t.desc}。${t.hint}。更新过程中服务会短暂中断，已完成的任务不受影响。`}
-              confirmText="开始更新"
-              onConfirm={() => start(t.id)}
+              key={target.id}
+              title={t('updatePanel.targetConfirmTitle', {label: t(target.labelKey)})}
+              description={text}
+              confirmText={t('updatePanel.startUpdate')}
+              onConfirm={() => start(target.id)}
               trigger={
                 <button
                   type="button"
-                  disabled={!isAdmin || busy || running}
+                  disabled={!isAdmin || busy || running || blocked}
+                  title={blocked ? t('updatePanel.targetBlockedTitle') : undefined}
                   className={
                     'flex flex-col items-start gap-1 rounded-2xl px-3.5 py-3 text-left transition-colors ' +
                     'bg-background/60 hover:bg-background disabled:cursor-not-allowed disabled:opacity-50'
@@ -487,16 +518,22 @@ export function UpdatePanel() {
                 >
                   <div className="flex items-center gap-1.5 text-xs font-medium">
                     {i === 0 ? <DownloadCloud className="h-3.5 w-3.5" /> : <RotateCcw className="h-3.5 w-3.5" />}
-                    {t.label}
+                    {t(target.labelKey)}
                   </div>
-                  <div className="text-[11px] leading-4 text-muted-foreground">{t.desc}</div>
+                  <div className="text-[11px] leading-4 text-muted-foreground">{t(target.descKey)}</div>
                 </button>
               }
             />
-          ))}
+            );
+          })}
         </div>
+        {status?.can_update_upstream === false && (
+          <p className="mt-2 text-[11px] leading-4 text-muted-foreground">
+            <RichText text={t('updatePanel.dockerNote')} />
+          </p>
+        )}
         {!isAdmin && (
-          <p className="mt-2 text-[11px] text-muted-foreground">只读角色无法执行更新。</p>
+          <p className="mt-2 text-[11px] text-muted-foreground">{t('updatePanel.readonlyNote')}</p>
         )}
       </div>
 
@@ -504,28 +541,25 @@ export function UpdatePanel() {
       <div className="rounded-[20px] bg-muted p-4">
         <div className="mb-1 flex flex-wrap items-center gap-2 text-sm font-medium">
           <Pin className="h-4 w-4" />
-          固定上游版本
+          {t('updatePanel.pinTitle')}
           {status?.upstream_ref ? (
             <Badge variant="secondary" className="rounded-full text-amber-600 dark:text-amber-400">
-              已固定 {status.upstream_ref}
+              {t('updatePanel.pinPinned', {ref: status.upstream_ref})}
             </Badge>
           ) : (
             <Badge variant="secondary" className="rounded-full text-muted-foreground">
-              跟随分支
+              {t('updatePanel.pinFollowing')}
             </Badge>
           )}
         </div>
         <div className="mb-3 text-[11px] leading-4 text-muted-foreground">
-          默认跟随上游 master。若上游某个提交自身有问题（例如 Dockerfile 引用了
-          已删除的文件导致重建失败），在这里填上一个可用的<strong>提交号或标签</strong>，
-          之后「更新上游」就会检出该版本而不是最新代码，用来快速回退。
-          留空并保存即恢复跟随分支。
+          <RichText text={t('updatePanel.pinDesc')} />
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <Input
             value={refInput}
             disabled={!isAdmin || refBusy}
-            placeholder="例如 98b5e160（留空 = 跟随分支）"
+            placeholder={t('updatePanel.pinPlaceholder')}
             className="h-8 w-full max-w-[320px] bg-background font-mono text-xs"
             onChange={(e) => setRefInput(e.target.value)}
           />
@@ -537,7 +571,7 @@ export function UpdatePanel() {
             onClick={saveUpstreamRef}
           >
             {refBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Pin className="h-3.5 w-3.5" />}
-            保存
+            {t('common.save')}
           </Button>
           {status?.upstream_ref && (
             <Button
@@ -550,7 +584,7 @@ export function UpdatePanel() {
                 setRefBusy(true);
                 try {
                   await systemApi.setUpstreamRef('');
-                  notify.info('已取消固定', '上游更新将恢复跟随分支');
+                  notify.info(t('updatePanel.refUnpinned'), t('updatePanel.refUnpinnedDesc'));
                   await load();
                 } catch (e) {
                   notify.err(errText(e));
@@ -560,7 +594,7 @@ export function UpdatePanel() {
               }}
             >
               <RotateCcw className="h-3.5 w-3.5" />
-              取消固定
+              {t('updatePanel.unpin')}
             </Button>
           )}
         </div>
@@ -571,11 +605,11 @@ export function UpdatePanel() {
         <div className="mb-2 flex items-center justify-between">
           <div className="flex items-center gap-2 text-sm font-medium">
             <Terminal className="h-4 w-4" />
-            更新日志
+            {t('updatePanel.logTitle')}
           </div>
           {logs.length > 0 && (
             <Badge variant="secondary" className="rounded-full text-[10px]">
-              {logs.length} 行
+              {t('updatePanel.logLines', {count: logs.length, n: logs.length})}
             </Badge>
           )}
         </div>
@@ -590,7 +624,7 @@ export function UpdatePanel() {
           </div>
         ) : (
           <div className="rounded-2xl bg-background/60 px-3 py-8 text-center text-xs text-muted-foreground">
-            暂无日志。执行更新后这里会实时显示进度。
+            {t('updatePanel.logEmpty')}
           </div>
         )}
       </div>

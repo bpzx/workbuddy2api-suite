@@ -12,12 +12,13 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from '@/components/ui/alert-dialog';
+import {useT} from '@/lib/i18n/provider';
 
 export function ConfirmDialog({
   trigger,
   title,
   description,
-  confirmText = '确认',
+  confirmText,
   destructive = false,
   onConfirm,
 }: {
@@ -28,6 +29,7 @@ export function ConfirmDialog({
   destructive?: boolean;
   onConfirm: () => void | Promise<void>;
 }) {
+  const t = useT();
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
 
@@ -40,7 +42,7 @@ export function ConfirmDialog({
           {description && <AlertDialogDescription>{description}</AlertDialogDescription>}
         </AlertDialogHeader>
         <AlertDialogFooter>
-          <AlertDialogCancel disabled={busy}>取消</AlertDialogCancel>
+          <AlertDialogCancel disabled={busy}>{t('common.cancel')}</AlertDialogCancel>
           <AlertDialogAction
             disabled={busy}
             className={destructive ? 'bg-destructive text-white hover:bg-destructive/90' : ''}
@@ -55,7 +57,7 @@ export function ConfirmDialog({
               }
             }}
           >
-            {confirmText}
+            {confirmText ?? t('common.confirm')}
           </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>

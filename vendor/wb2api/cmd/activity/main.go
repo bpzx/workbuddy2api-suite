@@ -9,6 +9,9 @@
 //	# 本地：在项目根目录（需 config.json + auths/ + data/）直接 run
 //	go run ./cmd/activity
 //
+//	# 单号模式（实测/消耗类先 1 个号）：uid 前缀过滤，只跑命中账号
+//	go run ./cmd/activity 00e26541
+//
 // 读取工作目录的 config.json（auth_dir / state_file / schedule / upstream.timeout_seconds），
 // 加载 auths 后构建 pool + upstream，调用 scheduler.RunActivityNow 立即执行一次。
 //
@@ -20,6 +23,7 @@ import (
 	"encoding/json"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"workbuddy2api/internal/auth"
@@ -41,6 +45,12 @@ type cfgFile struct {
 }
 
 func main() {
+	// 可选位置参数：uid 前缀过滤（如 `./activity-run 00e26541`），只跑单号——
+	// 实测/消耗类验证先 1 个号的入口。缺省跑全池（与旧行为一致）。
+	var uidPrefix string
+	if len(os.Args) > 1 {
+		uidPrefix = os.Args[1]
+	}
 	raw, err := os.ReadFile("config.json")
 	if err != nil {
 		log.Fatalf("read config: %v", err)
@@ -66,10 +76,26 @@ func main() {
 	if err != nil {
 		log.Fatalf("load auths: %v", err)
 	}
-	log.Printf("loaded %d account(s)", len(auths))
-
 	p := pool.New(c.StateFile)
-	p.SyncToDir(auths)
+	if uidPrefix != "" {
+		// 单号模式：不做 SyncToDir（它会按筛选结果剔除池内其余账号并落盘，
+		// 污染共享 state.json）。只 Add 命中账号——池内其余账号不受影响，
+		// state.json 也不会被本工具改写。
+		var hits int
+		for _, a := range auths {
+			if strings.HasPrefix(a.UID, uidPrefix) {
+				p.Add(a)
+				hits++
+			}
+		}
+		if hits == 0 {
+			log.Fatalf("no account matches uid prefix %q", uidPrefix)
+		}
+		log.Printf("single-account mode: %d account(s) match %q", hits, uidPrefix)
+	} else {
+		log.Printf("loaded %d account(s)", len(auths))
+		p.SyncToDir(auths)
+	}
 
 	sch := scheduler.New(scheduler.Config{
 		Pool:                p,
@@ -77,7 +103,7 @@ func main() {
 		CheckinHours:        c.Schedule.CheckinHours,
 		TravelHours:         c.Schedule.TravelHours,
 		ActivityHours:       c.Schedule.ActivityHours,
-		KeepaliveHours:      c.Schedule.KeepaliveHours,
+		KeepaliveHours:       c.Schedule.KeepaliveHours,
 		ActivityReportCount: c.Schedule.ActivityReportCount,
 	})
 	sch.RunActivityNow()

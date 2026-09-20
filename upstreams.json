@@ -12,10 +12,10 @@
       "repo": "Sliverkiss/workbuddy2api",
       "repo_url": "https://github.com/Sliverkiss/workbuddy2api.git",
       "branch": "master",
-      "commit": "39f3c3fbd485c9a5f15b05daf81c3c67141632d4",
-      "commit_short": "39f3c3f",
-      "commit_date": "2026-09-15T14:17:46+08:00",
-      "subject": "fix(scheduler): 去串行化 + sleep 换 select-ctx 可取消",
+      "commit": "b08f518c9bb21cdf90f93fb671fe99a0637c8e8b",
+      "commit_short": "b08f518",
+      "commit_date": "2026-09-19T16:44:20+08:00",
+      "subject": "prompt: 默认提示词换用 GLM5.3 适配版小码酱 spec",
       "vendor_path": "vendor/wb2api",
       "license": "MIT",
       "license_file": "vendor/wb2api/LICENSE",
@@ -23,17 +23,17 @@
         ".git"
       ],
       "note": "镜像内置于 /opt/wb2api；容器内不设任何 WB2A_* 环境变量，config.json 为唯一事实来源。保留 .github（嵌套工作流不会被 GitHub 触发）",
-      "synced_at": "2026-09-15T14:22:08+08:00"
+      "synced_at": "2026-09-20T08:44:18+08:00"
     },
     "manager": {
       "description": "Web 管理控制台 + 对外多密钥网关（FastAPI + Next.js）",
       "repo": "ithtelab/workbuddy-manager",
       "repo_url": "https://github.com/ithtelab/workbuddy-manager.git",
       "branch": "main",
-      "commit": "3ed6c4894fceca017a1d7e3631c94c0e4453dc22",
-      "commit_short": "3ed6c48",
-      "commit_date": "2026-09-15T13:47:37+08:00",
-      "subject": "improve(update): deploy/ 差异提示说清「要不要紧」",
+      "commit": "8bc9b0d959752448f187836a3c05478249b8df85",
+      "commit_short": "8bc9b0d",
+      "commit_date": "2026-09-19T11:41:50+08:00",
+      "subject": "chore(release): v1.0.57",
       "vendor_path": "vendor/manager",
       "license": "MIT",
       "license_file": "vendor/manager/LICENSE",
@@ -41,7 +41,7 @@
         ".git"
       ],
       "note": "镜像内置于 /opt/manager；deploy/update.py 在构建期由 docker/stub/update.py 覆盖（容器内无 git/systemctl）。保留 .github：上游测试会读 .github/workflows/release.yml",
-      "synced_at": "2026-09-15T14:22:08+08:00"
+      "synced_at": "2026-09-20T08:44:18+08:00"
     }
   }
 }

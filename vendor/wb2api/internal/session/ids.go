@@ -111,13 +111,13 @@ func TurnKey(body []byte) string {
 		if obj.Messages[i].Role != "user" {
 			continue
 		}
-		text := contentText(obj.Messages[i].Content)
-		if text == "" {
-			// 最后一条 user 消息没有文本（纯图片等）→ 本轮不建立聚合键。
+		sig := contentSignature(obj.Messages[i].Content)
+		if sig == "" {
+			// 最后一条 user 消息没有可签名内容（空/null/空 parts）→ 本轮不建立聚合键。
 			// 不继续往前找：整轮内该消息位置恒定，往前找反而会让键随 step 漂移。
 			return ""
 		}
-		return fmt.Sprintf("u%d:%s", i, text)
+		return fmt.Sprintf("u%d:%s", i, sig)
 	}
 	return ""
 }
@@ -150,6 +150,66 @@ func contentText(raw json.RawMessage) string {
 		return b.String()
 	}
 	return ""
+}
+
+// contentSignature 取消息 content 的确定性签名（G1 修复——纯图片轮不再碎片化）：
+//   - string 形态：返回文本，与 contentText 结果**完全一致**——纯文本路径键值
+//     不变，存量会话的轮键/粘性键零漂移（向后兼容契约）；
+//   - 数组形态（多模态 parts）：文本 part（type 为 "" 或 "text"，与 contentText
+//     的拼接口径一致）按原文无缝拼接；非文本 part 追加 "[type:摘要]"——摘要取该
+//     part 原始字节的 sha256 前 8 hex。data: base64 内联图可能超长，原文入键会
+//     放大派生哈希压力（见 TurnKey 头注），只入短摘要；type + 原文摘要天然区分
+//     不同内容/数量的非文本 part 集合，无需额外计数占位。
+//
+// 无可签名内容（空 / null / 空数组 / 纯文本 part 全为空串）返回 ""（不伪造——
+// 调用方回落原有的空键语义）。TurnKey 与 firstUserText（粘性兜底）共用本函数，
+// 两条链路的图片盲区一并修复。
+func contentSignature(raw json.RawMessage) string {
+	s := strings.TrimSpace(string(raw))
+	if s == "" || s == "null" {
+		return ""
+	}
+	// 字符串形态：纯文本路径签名 == contentText 结果（键值零漂移）。
+	if s[0] == '"' {
+		var str string
+		if err := json.Unmarshal(raw, &str); err != nil {
+			return ""
+		}
+		return str
+	}
+	if s[0] != '[' {
+		return ""
+	}
+	var parts []json.RawMessage
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return ""
+	}
+	var b strings.Builder
+	hasNonText := false
+	for _, pr := range parts {
+		var p struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal(pr, &p); err != nil {
+			return ""
+		}
+		if p.Type == "" || p.Type == "text" {
+			// 文本 part：无缝拼接（与 contentText 完全同口径——全文本 part 的数组
+			// 签名 == contentText 结果，存量键零漂移）。
+			b.WriteString(p.Text)
+			continue
+		}
+		// 非文本 part：type + 原文 sha256 前 8 hex（超长 data: URL 只入短摘要）。
+		hasNonText = true
+		sum := sha256.Sum256(pr)
+		fmt.Fprintf(&b, "\n[%s:%s]\n", p.Type, hex.EncodeToString(sum[:4]))
+	}
+	out := b.String()
+	if !hasNonText {
+		return out
+	}
+	return strings.TrimSpace(out)
 }
 
 // TurnRequestID 返回轮级键对应的聚合 ID：sha256(盐|键) 前 16 字节的 hex（32 位，

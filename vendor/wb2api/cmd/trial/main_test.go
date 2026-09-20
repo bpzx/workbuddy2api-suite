@@ -2,7 +2,11 @@ package main
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
+
+	"workbuddy2api/internal/auth"
 )
 
 // TestClassifyTrial ClaimTrial 结果归一化：错误 → FAIL；claimed → OK；
@@ -35,5 +39,20 @@ func TestClassifyTrialDetail(t *testing.T) {
 	}
 	if _, d := classifyTrial(false, errors.New("boom")); d != "boom" {
 		t.Errorf("fail detail=%q want boom", d)
+	}
+}
+
+// TestTrialFileGlobViaAuthLoadFiles (P2-10)：trial 的文件清单改走
+// auth.LoadAuthFiles 后，不带连字符的文件与网关 LoadDir 同口径加载。
+// main() 不可直测，此处锁共享契约（宽侧 workbuddy*.json）。
+func TestTrialFileGlobViaAuthLoadFiles(t *testing.T) {
+	dir := t.TempDir()
+	doc := `{"auth":{"accessToken":"at","refreshToken":"r","expiresAt":1,"domain":"www.workbuddy.ai","realm":"global"},"account":{"uid":"gu1"}}`
+	if err := os.WriteFile(filepath.Join(dir, "workbuddy_new.json"), []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files, err := auth.LoadAuthFiles(dir)
+	if err != nil || len(files) != 1 {
+		t.Fatalf("LoadAuthFiles: files=%v err=%v want 1", files, err)
 	}
 }

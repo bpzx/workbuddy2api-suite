@@ -89,7 +89,13 @@ def access_logs(limit: int = 200, user: dict = Depends(security.current_user)) -
         (min(1000, max(1, limit)),),
     )
     return [
-        {'id': r['id'], 'ts': r['ts'], 'ip': r['ip'], 'path': r['path'], 'blocked': bool(r['blocked']), 'ua': r['ua']}
+        {
+            'id': r['id'], 'ts': r['ts'], 'ip': r['ip'], 'path': r['path'],
+            'blocked': bool(r['blocked']), 'ua': r['ua'],
+            # 拦截原因短码（issue #33）。存量记录为 NULL——那时没记原因，
+            # 界面按「未记录」展示，不编造。
+            'reason': r['reason'] if 'reason' in r.keys() else None,
+        }
         for r in rows
     ]
 

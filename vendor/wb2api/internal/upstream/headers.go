@@ -3,6 +3,8 @@
 package upstream
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"strings"
 
@@ -70,11 +72,6 @@ func (c *Client) defaultWorkBuddyUAFor(a *auth.Auth) string {
 	return "WorkBuddy/" + c.clientVersion() + " " + platform + "/" + c.clientVersion() + " CLI/" + c.cliVersion()
 }
 
-// defaultWorkBuddyUA 返回 CN 形态的默认 UA（默认账号形态即 CN，零回归兼容既有调用/测试）。
-func (c *Client) defaultWorkBuddyUA() string {
-	return c.defaultWorkBuddyUAFor(nil)
-}
-
 // userAgent 返回当前出站 UA（客户端出站路径：chat/refresh/FetchModels）。
 // 优先级：Client.UserAgent（config user_agent）显式覆盖 > 按账号 realm 的默认 WorkBuddy 三段式。
 // 显式覆盖兼容既有覆盖逻辑：用户配了即以用户值为准（自定义品牌/版本），
@@ -124,6 +121,34 @@ func (c *Client) injectDeviceToken(req *http.Request, a *auth.Auth) {
 	}
 }
 
+// deriveAccountStableID 按 uid + 用途盐稳定派生 36 hex 设备/会话标识。
+// 跨重启稳定（固定盐 "wb2a:"，不随进程换——这是与 session 包 deriveSalt 的本质差异：
+// 那是会话键维度的进程级随机盐，重启换新；本函数是账号维度，必须跨重启恒定）、
+// 账号间互异（uid 不同则不同）、同 uid 同用途恒同值（幂等）。对齐 hub
+// wb_fingerprint.py:derive_id 的 md5(salt:uid)[:36] 语义。
+// 用 sha256（非 md5）——项目既有派生（session/ids.go、cache_key.go）全用 sha256，
+// 保持一致；截 36 hex 与 hub 的 [:36] 同形态（提供更长熵）。
+//
+// 两个用途：
+//   - purpose="machine" → X-Machine-ID（设备级，跨会话稳定）
+//   - purpose="session" → X-Session-ID（账号固定会话，跨重启稳定——hub 语义）
+func deriveAccountStableID(uid, purpose string) string {
+	sum := sha256.Sum256([]byte("wb2a:" + purpose + ":" + uid))
+	return hex.EncodeToString(sum[:18]) // 36 hex chars
+}
+
+// injectAccountStableHeaders 在 req 注入 X-Machine-ID / X-Session-ID：按 uid 稳定
+// 派生，跨重启固定、账号间互异。对齐官方桌面端「每账号一台固定虚拟设备」语义，
+// 防多号被上游按设备指纹缺失/漂移关联风控。uid 为空时不注入（匿名请求无设备
+// 标识，上游不要求）。
+func (c *Client) injectAccountStableHeaders(req *http.Request, a *auth.Auth) {
+	if a == nil || a.UID == "" {
+		return
+	}
+	req.Header.Set("X-Machine-ID", deriveAccountStableID(a.UID, "machine"))
+	req.Header.Set("X-Session-ID", deriveAccountStableID(a.UID, "session"))
+}
+
 // CommonHeaders 设置所有 API 共享的请求头。
 func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Content-Type", "application/json")
@@ -141,6 +166,11 @@ func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	// Accept-Language 按 realm 切（D5）：CN zh-CN，global en-US。官方客户端按账号域
 	// 发对应语言标识，对齐避免上游风控按语言缺失误判。
 	req.Header.Set("Accept-Language", acceptLanguageFor(a))
+	// X-Machine-ID / X-Session-ID：按 uid 稳定派生的账号级设备头（见
+	// injectAccountStableHeaders）。注入在 CommonHeaders 而非 ChatHeaders——hub 在
+	// 所有出站路径的公共 headers() 注入（wb_accounts.py:250-251），本网关同样全覆盖
+	// （chat 经 ChatHeaders 叠加 CommonHeaders 天然继承；billing 域另行注入）。
+	c.injectAccountStableHeaders(req, a)
 }
 
 // acceptLanguageFor 按账号 realm 返回 Accept-Language：global → en-US，cn → zh-CN。
@@ -191,8 +221,10 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	c.CommonHeaders(req, a)
 	// chat 流式 Accept 覆盖 CommonHeaders 的非流式默认（D6）。
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	if a.AccessToken != "" {
-		req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	// AccessToken 加锁快照：keepalive 定时刷新会在 a.mu 内改写它，锁外直读构成数据竞争
+	// （见 auth.AccessTokenValue 注释与 upstream.TestChatHeadersRacesRefreshToken）。
+	if at := a.AccessTokenValue(); at != "" {
+		req.Header.Set("Authorization", "Bearer "+at)
 	} else {
 		req.Header.Set("X-No-Authorization", "1")
 	}
@@ -212,8 +244,8 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 		} else {
 			req.Header.Set("X-No-Enterprise-Id", "1")
 		}
-		if a.Domain != "" {
-			req.Header.Set("X-Domain", a.Domain)
+		if d := a.DomainValue(); d != "" {
+			req.Header.Set("X-Domain", d)
 		} else {
 			req.Header.Set("X-No-Department-Info", "1")
 		}
@@ -239,7 +271,9 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 //   - X-Conversation-ID：会话级，多轮稳定（body 的 conversationId）。空则不发——
 //     透传客户端原值优先，客户端没给就不伪造，避免误导后台建错会话。
 //   - X-Conversation-Request-ID：**对话轮级聚合主键**，必发。一次 user send 内的
-//     所有 tool call/重试/换号/降级复用同一个 → 后台按它聚合成一条（不再碎片化）。
+//     所有 tool call/重试/换号/降级复用同一个 → 后台按它聚合成一条（不再碎片化）；
+//     换 user 消息即换键（#170 统一轮级，对齐官方 CLI 的 USER_PROMPT_SUBMIT 重生成
+//     语义；调用方 handler 负责保证轮级键的生成，透传客户端值优先）。
 //   - X-Conversation-Message-ID = X-Request-ID：消息级，每条独立（32 位 hex）。
 //   - X-Root-Request-ID：= conversationRequestID（根请求追踪）。
 //   - X-Trace-ID：入站透传或 = conversationRequestID。
@@ -362,7 +396,8 @@ func ExtractClientIP(r *http.Request) string {
 //     （官方 banner/check-in 显式覆写 UA 的形态，不带 CLI 段）；
 //  3. 显式 client_name="SaaS" → 不设置（Go 客户端自带默认 UA，还原旧行为）。
 func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	// AccessToken 加锁快照（同 ChatHeaders：keepalive 可在 a.mu 内改写）。
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
 	c.injectCodeBuddyRequest(req)
@@ -380,8 +415,8 @@ func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
 		req.Header.Set("X-Tenant-Id", a.EnterpriseID)
 	}
-	if a.Domain != "" {
-		req.Header.Set("X-Domain", a.Domain)
+	if d := a.DomainValue(); d != "" {
+		req.Header.Set("X-Domain", d)
 	}
 	// 设备风控头：billing 域（report/travel/balance/checkin）同样注入（见 resolveDeviceToken）。
 	c.injectDeviceToken(req, a)

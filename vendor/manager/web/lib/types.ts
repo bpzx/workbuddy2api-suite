@@ -44,9 +44,45 @@ export interface Account {
   success_count?: number | null;
   err_total?: number | null;
   breaker_fails?: number | null;
+  /**
+   * 连败降权截止（上游 issue #114，RFC3339 字符串）。在未来 = 正被降权。
+   *
+   * 为什么要有：上游把降权**计入 cooling**，所以「冷却中」里混着两类原因完全不同
+   * 的情况——限流退避（等一会儿就好）与连败降权（这个号在持续失败）。不区分时
+   * 用户看到「冷却中」无从判断该等还是该处理。
+   */
+  degrade_until?: string | null;
+  /** 连续失败计数（降权进度：达阈值即降权，成功后清零） */
+  consecutive_fails?: number | null;
   last_success?: string | null;
   last_used?: number | null;
   source: 'file' | 'pool';
+  /**
+   * 该账号是否出现在上游账号池里（`/status.accounts`）。
+   *
+   * 我们读的是 auths/ 目录下的文件，上游读的才是池——两者不总一致：上游
+   * `LoadDir` 对解析失败的文件静默跳过（`Parse` 在 accessToken 为空时报错）。
+   * 那种文件不在池里、永远选不中；若不标出来，界面会显示成「在线」，
+   * 出现「面板全绿但调用报没有健康账号」的矛盾。
+   */
+  in_pool?: boolean;
+  /**
+   * 本次没取到上游状态（`/status` 里 `connected: false`）——运行时字段全部未知。
+   *
+   * 与 `in_pool: false` 是**两回事**：前者是「看不到上游」，后者是「上游明确没
+   * 加载它」。混为一谈会把正常账号误报成文件损坏（实测确认过这个误报）。
+   */
+  poolUnknown?: boolean;
+  /** 已知上游不会加载该文件时的原因（空 = 未发现明显问题） */
+  invalid_reason?: string;
+  /**
+   * 本面板**主动临时禁用**（issue #21）——文件名带 `.disabled` 后缀，
+   * 上游的 `workbuddy*.json` glob 因此不再匹配它、不加载该账号。
+   *
+   * 与 `disabled` 是两回事：那个是上游按错误分类自动禁的（需重新登录），
+   * 这个是运维手动停用的，在面板上再点一次「启用」即可恢复。
+   */
+  disabled_by_panel?: boolean;
   /** 账号所属版本（cn / global）；存量账号按域名回退，无该字段时视为 cn */
   realm?: 'cn' | 'global';
   /** 该版本是否支持签到体系（国际版没有） */
@@ -64,6 +100,15 @@ export interface AccountsResponse {
   pool_available?: boolean;
 }
 
+/** 上游为一组账号给出的计数（`/status` 的顶层汇总与 realm_totals 同构） */
+export interface PoolCounts {
+  total: number;
+  healthy: number;
+  cooling: number;
+  disabled: number;
+  in_flight_full: number;
+}
+
 export interface UpstreamStatus {
   connected: boolean;
   accounts?: Record<string, unknown>[];
@@ -72,6 +117,13 @@ export interface UpstreamStatus {
   healthy?: number;
   total?: number;
   in_flight_full?: number;
+  /**
+   * 上游**按版本分好组**的计数（cn / global）。
+   * 界面切到某个版本时要的是这一份，而不是顶层那份全局汇总——
+   * 后者的 healthy/cooling 含两个版本，直接用会在国际版视图下显示国内版的数。
+   * 注意 healthy 是**汇总层**字段，账号明细里没有它（曾因此在界面上恒显示 0）。
+   */
+  realm_totals?: Record<string, PoolCounts>;
   redis_mode?: string;
   sticky_sessions?: number;
   error?: string;
@@ -112,6 +164,25 @@ export interface CatalogModel {
   max_output_tokens: number;
   /** 支持的推理档位，如 ['low','high','max']；空数组 = 非推理模型或未提供 */
   efforts: string[];
+  /** 模型描述（腾讯的 descriptionZh，中文）；空串 = 未提供 */
+  description?: string;
+  /**
+   * 积分倍率原文（如 "x0.05"）：同一 prompt 在不同模型上的扣费倍率。
+   * **仅展示**，不参与选号（与上游口径一致）。空串 = 未提供。
+   */
+  credits?: string;
+  /** 厂商标识（如 volc / deepseek）；空串 = 未提供 */
+  vendor?: string;
+  /** 模型标签（含 badge:限时免费 等） */
+  tags?: string[];
+  /** 是否默认模型 */
+  is_default?: boolean;
+  supports_reasoning?: boolean;
+  supports_tool_call?: boolean;
+  /** 纯推理模型（不产出正文，只出思维链） */
+  only_reasoning?: boolean;
+  /** 推理摘要模式（如 "auto"） */
+  reasoning_summary?: string;
   /** 默认推理档位；空串 = 上游未声明（由上游自行回退到硬编码默认） */
   default_effort: string;
   /** 是否支持图片输入（多模态） */
@@ -166,8 +237,24 @@ export interface ApiKey {
   max_ips: number;
   ip_allowlist: string[];
   models: string[];
+  /**
+   * 版本归属：'cn' | 'global'，空串 = 不限制（两版都能调）。
+   *
+   * 空串是**存量密钥**的形态（该字段引入前创建的），保持其原有行为不变；
+   * 新建密钥会跟随当前所在版本写入。
+   */
+  realm: 'cn' | 'global' | '';
   quota: number | null;
   used_tokens: number;
+  /**
+   * 积分额度与已用量（issue #27）：按上游返回的**真实扣费**（usage.credit）累计。
+   *
+   * 与 token 额度各自独立，任一超限即拒绝调用；0 = 不限。
+   * 为什么不只按 token 限额：同样 1M token，便宜模型与贵模型的扣费能差几十倍，
+   * 按 token 估不出实际花了多少积分（提需求的人遇到的正是这个问题）。
+   */
+  quota_credit: number;
+  used_credit: number;
   created_at: number;
   last_used_at: number | null;
   /** 仅在创建时返回一次 */
@@ -207,6 +294,16 @@ export interface UsagePoint {
   completion_tokens: number;
   /** 当日实际扣费合计 */
   credit: number;
+  /**
+   * 当日失败请求数（4xx + 5xx 合计）。
+   *
+   * 单独来自 `request_logs` 而非用量汇总——后者只含有 token 或扣费的请求，
+   * 被拒绝的调用与全池不可用（503，零 token）在里面根本不存在。所以这一项
+   * 补上了「用量表天然看不到失败」的盲区。
+   *
+   * 可选：老版本后端不返回该字段，界面按 0 处理（不显示失败）。
+   */
+  failed?: number;
 }
 
 export interface UsageBreakdown {
@@ -231,6 +328,35 @@ export interface StatsSummary {
   total_tokens: number;
   active_keys: number;
   top_model: string | null;
+  /**
+   * 统计写入的健康状态。`ok: false` 时详情说明为什么可疑。
+   *
+   * 存在意义：统计是旁路写入（失败不影响转发），坏了以后界面看不出异常——
+   * 数字只是停着不动，页面照常轮询。所以要把「今天有请求但统计为 0」这种
+   * 组合显式报出来，而不是等用户自己发现。
+   */
+  /**
+   * `logs_today` 是**本该累计用量**的今日调用数（服务端按与 `bump_usage`
+   * 相同的条件统计）。界面用它拼译文，不要去正则解析 `detail` 那句中文——
+   * 那样改文案会让译文静默失效（曾经如此）。
+   */
+  usage_health?: {ok: boolean; detail: string; logs_today?: number};
+  /**
+   * 失败请求数（4xx / 5xx 分档，今天与近 7 天）。
+   *
+   * 为什么不在 `today_requests` 里体现：那个数来自用量汇总，只含**成功**
+   * 请求（有 token 或有扣费）。失败请求在汇总里完全不存在，于是界面上的
+   * 「请求数」与趋势图都只反映成功量——全池中断那天看起来像「没有请求」。
+   * 这一项把失败显式补出来。
+   *
+   * 可选：老版本后端不返回，界面按全 0 处理（不显示失败相关提示）。
+   */
+  failures?: {
+    today_4xx: number;
+    today_5xx: number;
+    week_4xx: number;
+    week_5xx: number;
+  };
 }
 
 export interface IpRule {
@@ -248,6 +374,16 @@ export interface IpAccessLog {
   path: string;
   blocked: boolean;
   ua: string | null;
+  /**
+   * 拦截原因短码（issue #33）：missing_key / invalid_key / ip_blocked /
+   * key_disabled / key_expired / quota_exhausted / credit_quota_exhausted /
+   * ip_not_allowed / too_many_ips / realm_mismatch / model_not_allowed /
+   * rate_limited 等。
+   *
+   * 稳定短码而非散文：展示侧按语言翻译，改文案不必迁移历史数据。
+   * 存量记录为 null（那时没记原因），界面显示「未记录」。
+   */
+  reason?: string | null;
 }
 
 export interface SecurityConfig {
@@ -272,6 +408,11 @@ export interface UpstashConfig {
 export interface UpstreamConfig {
   /** 是否成功读取到上游配置文件；false 时前端应提示并禁止保存 */
   available?: boolean;
+  /**
+   * 保存后若需要用户手动做一步（容器部署下无法自动重启上游），后端带回此提示。
+   * 有值时界面用醒目提示转达，而不是显示「正在自动应用」。
+   */
+  reload_hint?: string;
   /** 上游配置文件路径 */
   config_path?: string;
   /** 读取失败原因 */
@@ -294,11 +435,21 @@ export interface UpstreamConfig {
   upstash?: UpstashConfig;
 }
 
+/** 一个套餐的到期时刻与它名下的可用额度 */
+export interface CreditExpiry {
+  /** 到期时刻（epoch 秒）。腾讯下发的是 UTC+8 墙钟，后端已换算成绝对时刻 */
+  at: number;
+  /** 该套餐当前的可用额度 */
+  amount: number;
+}
+
 /** 积分查询来源：实时查询 or 命中 60 秒缓存 */
 export interface CreditsMeta {
   cached: boolean;
   cache_age: number | null;
   message?: string;
+  /** 各套餐到期时间，按到期时刻升序；只含仍有余额的套餐 */
+  expiries?: CreditExpiry[];
 }
 
 export interface CheckinLog {
@@ -348,6 +499,32 @@ export interface TaskLogResponse {
   collector: {at?: number; parsed?: number; added?: number; error?: string};
 }
 
+/**
+ * 成长任务一键执行的状态（调用上游自带的 scripts/task_runner.py）。
+ *
+ * 三种模式按**风险分级**，界面必须让用户看清区别：
+ *   preview 只查询（dry-run，不发写请求）
+ *   claim   只领已完成任务的奖励（幂等，不伪造行为）
+ *   full    点亮 + 领奖（会伪造活跃上报，有风控风险，需二次确认）
+ */
+export interface TaskRunStatus {
+  running: boolean;
+  mode: string;
+  target: string;
+  started_at: number;
+  finished_at: number;
+  exit_code: number | null;
+  timed_out: boolean;
+  error: string;
+  /** 输出尾部（脚本按行打印，后端只保留最近若干行） */
+  lines: string[];
+  /** 上游脚本与账号目录是否就位；false 时 unavailable_reason 说明原因与做法 */
+  available: boolean;
+  unavailable_reason: string;
+  /** 定时领奖配置（只有幂等的认领，不含点亮） */
+  schedule: {enabled?: boolean; hours?: number[]};
+}
+
 
 /** 签到记录分页返回 */
 export interface CheckinLogPage {
@@ -368,6 +545,13 @@ export interface UpdateLogLine {
 
 export interface UpdateStatus {
   available: boolean;
+  /** 是否运行在容器里（决定能力边界，见 can_update_upstream） */
+  in_container?: boolean;
+  /**
+   * 是否支持「更新上游」。容器部署为 false —— 重建上游容器需要 docker CLI，
+   * 而挂载 docker.sock 会把宿主 root 权限交给容器内进程，是本项目刻意不做的事。
+   */
+  can_update_upstream?: boolean;
   /** 是否正在更新 */
   running: boolean;
   /** 上次更新是否成功（null = 未运行过） */

@@ -1,16 +1,33 @@
+/**
+ * 本地化格式化工具。
+ *
+ * 这些函数是纯函数（非组件），语言取自 lib/i18n 的模块级当前语言，
+ * 由 I18nProvider 在渲染期同步——调用它们的组件会随语言切换重渲染。
+ * 因此本文件里不要写死任何语言：日期、数字、时长、相对时间都跟随界面语言。
+ */
+import {intlLocale, t} from '@/lib/i18n';
+
 /** 秒级时长格式化：已过期 / 分钟 / 小时 / 天 */
 export function fmtRemain(seconds: number): string {
-  if (seconds <= 0) return '已过期';
-  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟`;
-  if (seconds < 86400) return `${(seconds / 3600).toFixed(1)} 小时`;
-  return `${(seconds / 86400).toFixed(1)} 天`;
+  if (seconds <= 0) return t('format.expired');
+  if (seconds < 3600) {
+    const minutes = Math.floor(seconds / 60);
+    return t('format.minutes', {count: minutes, n: minutes});
+  }
+  // count 传数值（决定英文单复数），n 传展示串（与原实现一致，保留一位小数）
+  if (seconds < 86400) {
+    const hrs = Math.round((seconds / 3600) * 10) / 10;
+    return t('format.hours', {count: hrs, n: hrs.toFixed(1)});
+  }
+  const ds = Math.round((seconds / 86400) * 10) / 10;
+  return t('format.days', {count: ds, n: ds.toFixed(1)});
 }
 
 export function fmtDateTime(ts: number | null | undefined): string {
   if (!ts) return '—';
   const ms = ts > 1e12 ? ts : ts * 1000;
   const d = new Date(ms);
-  return d.toLocaleString('zh-CN', {
+  return d.toLocaleString(intlLocale(), {
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
@@ -23,13 +40,13 @@ export function fmtDateTime(ts: number | null | undefined): string {
 export function fmtDate(ts: number | null | undefined): string {
   if (!ts) return '—';
   const ms = ts > 1e12 ? ts : ts * 1000;
-  return new Date(ms).toLocaleDateString('zh-CN');
+  return new Date(ms).toLocaleDateString(intlLocale());
 }
 
 /** 千分位数字 */
 export function fmtNumber(n: number | null | undefined): string {
   if (n === null || n === undefined) return '0';
-  return n.toLocaleString('zh-CN');
+  return n.toLocaleString(intlLocale());
 }
 
 /** 大数紧凑显示：1.2k / 3.4M */
@@ -92,7 +109,7 @@ export function expiryVisual(remainSeconds: number): ExpiryVisual {
       tier: 'expired',
       textClass: 'text-red-600 dark:text-red-400',
       barColor: 'var(--destructive)',
-      label: '已过期',
+      label: t('expiry.expired'),
     };
   }
   if (remainSeconds < 3600) {
@@ -100,7 +117,7 @@ export function expiryVisual(remainSeconds: number): ExpiryVisual {
       tier: 'urgent',
       textClass: 'text-amber-600 dark:text-amber-400',
       barColor: '#f59e0b',
-      label: '即将过期',
+      label: t('expiry.urgent'),
     };
   }
   if (remainSeconds < 6 * 3600) {
@@ -108,28 +125,39 @@ export function expiryVisual(remainSeconds: number): ExpiryVisual {
       tier: 'soon',
       textClass: 'text-blue-600 dark:text-blue-400',
       barColor: '#3b82f6',
-      label: '偏紧',
+      label: t('expiry.soon'),
     };
   }
   return {
     tier: 'healthy',
     textClass: 'text-emerald-600 dark:text-emerald-400',
     barColor: '#10b981',
-    label: '在线',
+    // 文案是「有效」而不是「在线」：这一档只说明**令牌在有效期内**，不说明账号
+    // 可用（它可能没进上游池、被禁用或一直在失败）。此前这里写「在线」，被首页
+    // 当成账号状态直接渲染，于是出现「首页说在线、账号页说未加载」的矛盾。
+    // 账号可用性一律走 `lib/account-status` 的 `availabilityOf()`。
+    label: t('expiry.valid'),
   };
 }
 
 /** 相对时间：3 分钟前 */
 export function fmtAgo(ts: number | null | undefined): string {
-  if (!ts) return '从未';
+  if (!ts) return t('format.never');
   const ms = ts > 1e12 ? ts : ts * 1000;
   const diff = Date.now() - ms;
-  if (diff < 0) return '刚刚';
+  if (diff < 0) return t('format.justNow');
   const s = Math.floor(diff / 1000);
-  if (s < 60) return `${s} 秒前`;
-  if (s < 3600) return `${Math.floor(s / 60)} 分钟前`;
-  if (s < 86400) return `${Math.floor(s / 3600)} 小时前`;
-  return `${Math.floor(s / 86400)} 天前`;
+  if (s < 60) return t('format.secondsAgo', {count: s, n: s});
+  if (s < 3600) {
+    const minutes = Math.floor(s / 60);
+    return t('format.minutesAgo', {count: minutes, n: minutes});
+  }
+  if (s < 86400) {
+    const hrs = Math.floor(s / 3600);
+    return t('format.hoursAgo', {count: hrs, n: hrs});
+  }
+  const ds = Math.floor(s / 86400);
+  return t('format.daysAgo', {count: ds, n: ds});
 }
 
 export async function copyText(text: string): Promise<boolean> {

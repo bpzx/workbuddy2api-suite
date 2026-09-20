@@ -5,7 +5,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -33,19 +32,35 @@ func newGlobalModelsHandlerFake(t *testing.T, status int, body string) *globalMo
 	t.Helper()
 	cf := &globalModelsHandlerFake{up: &upstream.Client{}, status: status, body: body}
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		isCN := r.Header.Get("Authorization") == "Bearer at_cn"
 		cf.mu.Lock()
-		cf.cnt++
-		cf.path = r.URL.Path
-		cf.auth = r.Header.Get("Authorization")
-		cf.host = r.Host
+		if !isCN {
+			// cnt/path/auth/host 只记 global 探测请求；CN 动态拉取（FetchModels，
+			// Bearer at_cn）不计——纯动态后 CN 面也需要 fake 数据源，但不能污染
+			// global 探测计数断言（本文件所有 CN 号均为 at_cn）。
+			cf.cnt++
+			cf.path = r.URL.Path
+			cf.auth = r.Header.Get("Authorization")
+			cf.host = r.Host
+		}
 		cf.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
+		if isCN {
+			// CN 动态拉取：返回含 cli agent 的动态模型表，让 CN 面在纯动态下有产出
+			//（无静态兜底后需要真实数据源）。console 路径与 global 探测家族的
+			// /console fallback 同名，故按鉴权头而非路径分流。
+			w.WriteHeader(200)
+			_, _ = io.WriteString(w, `{"code":0,"data":{"models":[
+				{"id":"cn-dyn-model","maxInputTokens":65536,"maxOutputTokens":8192}
+			],"agents":[{"name":"cli","models":["cn-dyn-model"]}]}}`)
+			return
+		}
 		w.WriteHeader(cf.status)
 		_, _ = io.WriteString(w, cf.body)
 	}))
 	cf.up = &upstream.Client{
 		HTTP:           &http.Client{},
-		ChatBaseCN:     "http://cn.invalid", // CN 动态探测若被触发，本地解析失败即回落，绝不外连
+		ChatBaseCN:     strings.TrimSuffix(ts.URL, "/"), // CN 动态拉取同 fake（鉴权头分流）
 		ChatBaseGlobal: strings.TrimSuffix(ts.URL, "/"),
 		GlobalEnabled:  true,
 	}
@@ -73,7 +88,7 @@ func modelsProbeBody(ids ...string) string {
 }
 
 // TestModelListTwoFamilies 断言 /v1/models 同时含 cn:* 与 global:* 两族；
-// global 名单 = 探测结果 ∪ 静态 21 名（去重）；探测走 global base（httptest host）。
+// global 名单 = 纯探测结果（不合并静态）；探测走 global base（httptest host）。
 func TestModelListTwoFamilies(t *testing.T) {
 	auth.SetGlobalEnabled(true)
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
@@ -114,21 +129,25 @@ func TestModelListTwoFamilies(t *testing.T) {
 	if len(globIDs) == 0 {
 		t.Fatal("no global:* models in /v1/models")
 	}
-	// global 名单须同时含探测独有与静态 21 名（去重）。
+	// global 名单 = 纯探测结果：探测独有/下发全在；静态历史名单成员不出现。
 	if !contains(globIDs, "probe-only-x") {
 		t.Errorf("global models missing probe-only-x: %v", globIDs)
 	}
-	if !contains(globIDs, "default-model") || !contains(globIDs, "kimi-k2.6") {
-		t.Errorf("global models missing static §7.2 names: %v", globIDs)
+	if contains(globIDs, "default-model") || contains(globIDs, "kimi-k2.6") {
+		t.Errorf("global models must not contain unprobed static names: %v", globIDs)
 	}
 	if countOf(globIDs, "gpt-5.4") != 1 {
 		t.Errorf("global models dedupe failed: gpt-5.4 count=%d", countOf(globIDs, "gpt-5.4"))
 	}
 
-	// 探测走 global base（httptest Host）+ Bearer 鉴权头 + /v2 家族首选。
+	// 探测走 global base（httptest Host）+ Bearer 鉴权头；v3-config-merge 后单次探测
+	// = /v3/config + /v2 企业路并发（cnt=2，path 记录的是最近一次——两路之一）。
 	cnt, path, authz, host := cf.snapshot()
-	if cnt == 0 || path != "/v2/enterprises/personal/models" {
-		t.Errorf("probe path=%q cnt=%d want /v2/enterprises/personal/models", path, cnt)
+	if cnt != 2 {
+		t.Errorf("probe cnt=%d want 2 (v3/config + v2 enterprise, concurrent)", cnt)
+	}
+	if path != "/v2/enterprises/personal/models" && path != "/v3/config" {
+		t.Errorf("probe path=%q want one of [/v2/enterprises/personal/models /v3/config]", path)
 	}
 	if authz != "Bearer at_gl" {
 		t.Errorf("probe authz=%q want Bearer at_gl", authz)
@@ -136,12 +155,12 @@ func TestModelListTwoFamilies(t *testing.T) {
 	if host == "" || host == "fake.example" {
 		t.Errorf("probe host=%q want global base (httptest)", host)
 	}
-	// 无 CN 动态调用（CN 侧需要健康 CN 号触发 FetchModels；本池有 cn 号但 fake 未服务该端点，
-	// fetchDynamicModels 会失败回退静态——这里不断言 CN 调用，避免耦合 CN 缓存重置时序）。
+	// CN 动态拉取走同一 fake（ChatBaseCN 同 host，console 路径分流返回动态模型表），
+	// cn-dyn-model 已在上面 cnIDs 断言覆盖——不断言 CN 请求计数，避免耦合 CN 缓存重置时序。
 }
 
-// TestModelListNoGlobalAccountZeroProbe 无 global 账号：直接静态名单，探测零调用。
-func TestModelListNoGlobalAccountZeroProbe(t *testing.T) {
+// TestModelListNoGlobalAccountEmpty 无 global 账号：global 名单为空（纯动态，无静态兜底），探测零调用。
+func TestModelListNoGlobalAccountEmpty(t *testing.T) {
 	auth.SetGlobalEnabled(true)
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
 	resetModelsCache()
@@ -159,11 +178,8 @@ func TestModelListNoGlobalAccountZeroProbe(t *testing.T) {
 			globIDs = append(globIDs, strings.TrimPrefix(id, "global:"))
 		}
 	}
-	if len(globIDs) != len(upstream.GlobalModelNames) {
-		t.Fatalf("no-global-account: global ids=%d want %d (static only)", len(globIDs), len(upstream.GlobalModelNames))
-	}
-	if !reflect.DeepEqual(globIDs, upstream.GlobalModelNames) {
-		t.Errorf("no-global-account: global names != static GlobalModelNames")
+	if len(globIDs) != 0 {
+		t.Fatalf("no-global-account: global ids=%v want empty (pure dynamic)", globIDs)
 	}
 	cnt, _, _, _ := cf.snapshot()
 	if cnt != 0 {
@@ -171,8 +187,8 @@ func TestModelListNoGlobalAccountZeroProbe(t *testing.T) {
 	}
 }
 
-// TestModelListProbeFailureFallsBackStatic 探测失败（家族全 500）→ global 名单 = 静态 21 名。
-func TestModelListProbeFailureFallsBackStatic(t *testing.T) {
+// TestModelListProbeFailureEmpty 探测失败（家族全 500）→ global 名单为空（无静态回落）。
+func TestModelListProbeFailureEmpty(t *testing.T) {
 	auth.SetGlobalEnabled(true)
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
 	resetModelsCache()
@@ -190,8 +206,8 @@ func TestModelListProbeFailureFallsBackStatic(t *testing.T) {
 			globIDs = append(globIDs, strings.TrimPrefix(id, "global:"))
 		}
 	}
-	if !reflect.DeepEqual(globIDs, upstream.GlobalModelNames) {
-		t.Errorf("probe-failure: global names != static GlobalModelNames: %v", globIDs)
+	if len(globIDs) != 0 {
+		t.Errorf("probe-failure: global ids=%v want empty (no static fallback)", globIDs)
 	}
 }
 
@@ -209,8 +225,9 @@ func TestModelListProbeCacheWithinTTL(t *testing.T) {
 
 	h.modelList()
 	cnt1, _, _, _ := cf.snapshot()
-	if cnt1 != 1 {
-		t.Fatalf("first probe calls=%d want 1", cnt1)
+	// v3-config-merge：单次探测 = v3/config + /v2 企业路并发 = 2 个请求。
+	if cnt1 != 2 {
+		t.Fatalf("first probe calls=%d want 2 (v3 + v2, concurrent)", cnt1)
 	}
 	h.modelList()
 	cnt2, _, _, _ := cf.snapshot()

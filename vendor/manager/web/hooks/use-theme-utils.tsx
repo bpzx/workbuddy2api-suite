@@ -1,6 +1,7 @@
 import {useTheme} from 'next-themes';
 import {SunIcon, MoonIcon} from 'lucide-react';
 import {useCallback} from 'react';
+import {t} from '@/lib/i18n';
 
 const SystemTheme = {
   LIGHT: 'light',
@@ -99,13 +100,13 @@ export function useThemeUtils() {
   };
 
   const getAction = () => {
-    const baseRules = getBaseRules('切换深色模式', '切换浅色模式');
+    const baseRules = getBaseRules(t('theme.switchToDark'), t('theme.switchToLight'));
     return select({
       ...baseRules,
       system: selectSystem({
         ...baseRules,
       }),
-      default: '切换深色模式',
+      default: t('theme.switchToDark'),
     });
   };
 

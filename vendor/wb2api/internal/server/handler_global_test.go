@@ -47,47 +47,41 @@ func newRealmFake(t *testing.T) *realmFake {
 				Body:       io.NopCloser(strings.NewReader(sseOK)),
 			}, nil
 		})},
-		ChatBaseCN:       "https://fake.cn",
-		BillingBaseCN:    "https://fake.cn",
-		ChatBaseGlobal:   "https://fake.global",
+		ChatBaseCN:        "https://fake.cn",
+		BillingBaseCN:     "https://fake.cn",
+		ChatBaseGlobal:    "https://fake.global",
 		BillingBaseGlobal: "https://fake.global",
-		GlobalEnabled:    true,
+		GlobalEnabled:     true,
 	}
 	return cf
 }
 
 // TestChatRealmSelectionAndBodyRewrite 断言 realm 贯穿：
-// global: 前缀 → 全局号 + 出站 body 剥前缀 + /console 路径 + ensureConsoleSystem 补 system；
+// global: 前缀 → 全局号 + 出站 body 剥前缀 + /v2 路径（#119 固定单路径） + ensureConsoleSystem 补 system；
 // 裸名 → CN 号 + /v2 路径 + body 原样（零回归）。
-// TestModelsGlobalListGating 断言 global 名单（§7.2 21 名）在 GlobalEnabled=true（缺省）时
-// 列出（带 global: 前缀）、false（逃生门）时不出现——CN 模型恒加 cn: 前缀。
+// TestModelsGlobalListGating 断言 GlobalEnabled 逃生门仍生效：true 时 global 域探测名单
+// 可列出（带 global: 前缀）、false 时 global 名单不出现（纯动态，两侧均无静态兜底——
+// 无可上游时列表为空，不再断言具体模型名）。
 func TestModelsGlobalListGating(t *testing.T) {
-	// 关闭动态（无健康 CN 账号）→ 回退静态表，便于精确计数。
+	auth.SetGlobalEnabled(true)
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
 	resetModelsCache()
-	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
-	up := upstream.New()
+	// 无健康上游（fake base 不可达）→ CN/global 两域均拉取失败 → 空列表（纯动态）。
+	p := testPoolWith(&auth.Auth{UID: "g1", AccessToken: "at_gl", Domain: "www.workbuddy.ai", ExpiresAt: 9999999999})
+	up := &upstream.Client{
+		HTTP:           &http.Client{},
+		ChatBaseCN:     "https://fake.cn",
+		ChatBaseGlobal: "https://fake.global",
+		GlobalEnabled:  true,
+	}
 	h := NewHandler(Config{Pool: p, Upstream: up, GlobalEnabled: true})
-	data := h.modelList()
-
-	hasGlobal := false
-	hasCN := false
-	for _, m := range data {
-		id := m["id"].(string)
-		if strings.HasPrefix(id, "global:") {
-			hasGlobal = true
-		}
-		if id == "cn:glm-5.2" {
-			hasCN = true
+	for _, m := range h.modelList() {
+		if strings.HasPrefix(m["id"].(string), "global:") {
+			t.Fatalf("pure-dynamic: unreachable upstream must not list global models: %q", m["id"])
 		}
 	}
-	if !hasCN {
-		t.Error("cn:glm-5.2 missing from list")
-	}
-	if !hasGlobal {
-		t.Error("GlobalEnabled=true: global: models should be listed (PLAN §7.2)")
-	}
 
-	// 缺省（GlobalEnabled=false）不列 global 名单。
+	// 缺省（GlobalEnabled=false）不列 global 名单（逃生门）。
 	h2 := NewHandler(Config{Pool: p, Upstream: up, GlobalEnabled: false})
 	for _, m := range h2.modelList() {
 		if strings.HasPrefix(m["id"].(string), "global:") {
@@ -122,8 +116,8 @@ func TestChatRealmSelectionAndBodyRewrite(t *testing.T) {
 	if gotModel != "gpt-5.4" {
 		t.Errorf("global chat outbound model=%q want gpt-5.4 (prefix stripped)", gotModel)
 	}
-	if gotPath != "/console/chat/completions" {
-		t.Errorf("global chat path=%q want /console/chat/completions", gotPath)
+	if gotPath != "/v2/chat/completions" {
+		t.Errorf("global chat path=%q want /v2/chat/completions", gotPath)
 	}
 	if gotMsgs != 2 { // ensureConsoleSystem：user 前置补 system
 		t.Errorf("global chat messages=%d want 2 (system fallback)", gotMsgs)

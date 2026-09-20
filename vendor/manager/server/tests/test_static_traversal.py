@@ -181,11 +181,30 @@ class SafeAuthFilenameTest(unittest.TestCase):
                 self._wb2api._safe_file(bad)
 
     def test_other_files_in_dir_blocked(self) -> None:
-        """白名单形态之外的一律拒绝（隐藏文件、非 workbuddy 前缀、无扩展名）。"""
+        """同目录里**不是账号文件**的一律拒绝（隐藏文件、非 workbuddy 前缀、非 .json）。
+
+        形态是 `workbuddy*.json`（**与上游 `auth.AuthFileGlob` 一致**），不是更窄的
+        `workbuddy-*.json`。上游为这个问题留过注释：它曾用窄模式，导致
+        `workbuddy_new.json` 被网关加载却被运维工具跳过、两边口径对不上。
+        我们此前正是窄模式 —— 那种账号在上游池里能被选中、面板却看不到。
+
+        放宽不会引入越权：前缀固定为 `workbuddy`、后缀必须是 `.json`、
+        字符类里不含路径分隔符与点号，所以能命中的只可能是 auths 目录下的账号文件。
+        """
         for bad in ('.hidden.json', 'users.json', 'config.json',
-                    'workbuddy-.json', 'workbuddy-1.txt', 'notes.json'):
+                    'workbuddy-1.txt',            # 结尾不是 .json
+                    'notes.json',
+                    'workbuddy.json.bak',         # 结尾不是 .json
+                    '.workbuddy-x.json'):         # 点开头（隐藏文件）
             with self.assertRaises(ValueError, msg=bad):
                 self._wb2api._safe_file(bad)
+
+    def test_upstream_compatible_names_accepted(self) -> None:
+        """与上游同宽的形态要能通过 —— 否则面板列出了却操作不了（checkin/delete 都会失败）。"""
+        for good in ('workbuddy-89374120.json',   # 网关自己写的形态
+                     'workbuddy_new.json',        # 不带连字符（上游特意兼容的）
+                     'workbuddy_x-1.json'):
+            self.assertTrue(self._wb2api._safe_file(good))
 
     def test_null_byte_blocked(self) -> None:
         with self.assertRaises(ValueError):

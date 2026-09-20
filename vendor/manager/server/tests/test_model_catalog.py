@@ -117,9 +117,12 @@ class CatalogSourceTest(unittest.TestCase):
             out = asyncio.run(modelcatalog.catalog('cn', force=True))
         self.assertEqual(out['source'], 'upstream')
         self.assertEqual(out['models'][0]['id'], 'glm-5.2')
-        # 回退数据没有显示名/档位，不能凭空造
+        # 回退数据没有显示名 —— 不能凭空造
         self.assertEqual(out['models'][0]['name'], '')
-        self.assertEqual(out['models'][0]['efforts'], [])
+        # 档位则可以补：上游 /v1/models 本身会给出 reasoning_supported_efforts，
+        # 缺失时还有产品级兜底表（见 _EFFORT_FALLBACK）。glm-5.2 在兜底表里是
+        # high/xhigh —— 这与上游模型中心的口径一致，不是我们编的。
+        self.assertEqual(out['models'][0]['efforts'], ['high', 'xhigh'])
         self.assertTrue(out['errors'], '应保留失败原因便于排查')
 
     def test_all_sources_failed_is_empty_not_crash(self) -> None:

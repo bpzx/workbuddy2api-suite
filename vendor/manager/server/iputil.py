@@ -88,11 +88,18 @@ def client_ip(request: Request) -> str:
 
 
 def ip_matches(ip: str, cidr: str) -> bool:
-    """支持单 IP 与 CIDR；非法输入一律不匹配。"""
+    """支持单 IP 与 CIDR；非法输入一律不匹配。
+
+    `cidr` 两侧空白会被去掉：写入时已归一化（见 keysvc._norm_cidrs），但
+    **存量库里可能已有带空白的条目**（旧版本写入的），而
+    `ip_network(' 10.0.0.0/8')` 会解析失败 → 这条规则永远匹配不上 →
+    白名单里只要有一条这样的记录，那把密钥就对**所有**来源都拒绝。
+    这里兜一层，让老数据也能正确生效。
+    """
     try:
         addr = ipaddress.ip_address(ip)
         try:
-            net = ipaddress.ip_network(cidr, strict=False)
+            net = ipaddress.ip_network(str(cidr or '').strip(), strict=False)
         except ValueError:
             return False
         return addr in net

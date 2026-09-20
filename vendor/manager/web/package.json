@@ -1,7 +1,6 @@
 {
   "name": "workbuddy-manager-web",
   "version": "1.0.0",
-  "buildDate": "2026-09-11 00:00:00",
   "private": true,
   "scripts": {
     "dev": "next dev --turbopack",

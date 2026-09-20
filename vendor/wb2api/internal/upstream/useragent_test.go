@@ -128,15 +128,17 @@ func TestUserAgentOverrideBilling(t *testing.T) {
 }
 
 // TestFetchModelsUsesConfiguredUA FetchModels 手工 Set UA 也走覆盖。
+// v3-config-merge：FetchModels 并发打企业端点 + /v3/config 两路，两路都须带覆盖 UA。
 func TestFetchModelsUsesConfiguredUA(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
 	c := &Client{
 		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
-			if !strings.HasSuffix(r.URL.Path, "/console/enterprises/personal/models") {
+			if !strings.HasSuffix(r.URL.Path, "/console/enterprises/personal/models") &&
+				!strings.HasSuffix(r.URL.Path, "/v3/config") {
 				t.Errorf("path=%s", r.URL.Path)
 			}
 			if got := r.Header.Get("User-Agent"); got != "FetchAgent/2" {
-				t.Errorf("FetchModels UA = %q want FetchAgent/2", got)
+				t.Errorf("FetchModels UA = %q want FetchAgent/2 (path=%s)", got, r.URL.Path)
 			}
 			return jsonResp(200, `{"code":0,"data":{"models":[{"id":"glm-5.2","name":"GLM","maxInputTokens":131072,"maxOutputTokens":8192,"reasoning":{"effort":"high","supportedEfforts":[]},"disabled":false}],"agents":[{"name":"cli","models":["glm-5.2"]}]}}`), nil
 		})},

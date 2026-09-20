@@ -33,6 +33,25 @@ _KINDS = 'travel|activity|checkin|keepalive|user-resource'
 # 账号 uid 的形态：字母数字（允许 - _），长度 >= 6。
 _UID_SHAPE = re.compile(r'^[0-9A-Za-z_-]{6,64}$')
 
+# 账号**标签**形态（上游 7e43884 起）：`昵称(uid8)`，昵称为空时退化成纯 uid8。
+#
+# 为什么必须认它：上游 `logfmt.Label()` 把调度日志里的账号标识从纯 uid8 改成
+# `昵称(uid8)`（`internal/scheduler/scheduler.go:340` 等约 30 处），理由是排障时
+# 人眼没法从 uid8 认出是哪个号。**而我们的解析器只认 `[0-9A-Za-z_-]`**，于是
+# 全部账号维度的行会静默消失——不报错、不崩溃，只是「任务记录」里越来越少。
+# 最要命的是 `travel …: claim ok record=… reward=…` 是唯一能拿到旅行积分的日志源，
+# 丢掉它等于积分收益恒显示 0（把「赚到了」显示成「没赚」）。
+#
+# 解析出的 uid 一律**归一化回 uid8**（见 `_normalize_uid`）：界面按 uid 聚合
+# 「某账号 N 条记录」，若直接拿 `昵称(uid8)` 当 uid，同一个号会因昵称变化而分裂成
+# 好几个不存在的账号。昵称本身由 `routers/accounts.py` 的 `_nickname_resolver`
+# 从账号表查，不依赖日志里的这一份。
+_LABEL_SHAPE = re.compile(r'^(.{1,64}?)\(([0-9A-Za-z_-]{6,64})\)$')
+
+# 账号标识的**贪婪**匹配式（含中文昵称与括号），用在下面那几种行形态里。
+# 用非贪婪 + 回溯定位紧随其后的分隔符，比穷举字符集稳：昵称可以是任意文本。
+_LABEL_TOKEN = r'(.+?)'
+
 # 但上游除任务行外还会打「阶段行」与「汇总行」，形如
 #   `checkin done: total=3 ok=1 ...`
 #   `scheduled checkin skipped: ...`
@@ -47,17 +66,18 @@ _RESERVED_TOKENS = {
     'already', 'scheduled', 'start', 'end', 'begin', 'result', 'error',
 }
 
-# 主形态：[WARN:|ERR:] <kind> <uid>: <rest>
+# 主形态：[WARN:|ERR:] <kind> <uid 或 昵称(uid8)>: <rest>
 # 上游 2026-09-12 起：uid 截前 8 位，可疑/失败行加 WARN:/ERR: 前缀
+# 上游 7e43884 起：uid8 前面多了 `昵称(…)`，故改用 _LABEL_TOKEN 匹配。
 _TASK_LINE = re.compile(
-    r'(?:(WARN|ERR):\s+)?\b(' + _KINDS + r')\s+([0-9A-Za-z_-]+):\s*(.*)$'
+    r'(?:(WARN|ERR):\s+)?\b(' + _KINDS + r')\s+' + _LABEL_TOKEN + r':\s*(.*)$'
 )
 
-# 阶段形态：[WARN:|ERR:] <kind> <uid> <stage>: <rest>
-# 例：`checkin 9b212d8c refresh: <err>`、`checkin 9b212d8c save: <err>`
-# 注意 uid 与阶段名之间是空格而非冒号，主形态匹配不到，需单独认。
+# 阶段形态：[WARN:|ERR:] <kind> <标签> <stage>: <rest>
+# 例：`checkin 9b212d8c refresh: <err>`、`checkin 猫猫(9b212d8c) save: <err>`
+# 注意标签与阶段名之间是空格而非冒号，主形态匹配不到，需单独认。
 _STAGE_LINE = re.compile(
-    r'(?:(WARN|ERR):\s+)?\b(' + _KINDS + r')\s+([0-9A-Za-z_-]+)\s+'
+    r'(?:(WARN|ERR):\s+)?\b(' + _KINDS + r')\s+' + _LABEL_TOKEN + r'\s+'
     r'([a-z][a-z0-9_-]{1,20}):\s*(.*)$'
 )
 
@@ -112,6 +132,8 @@ KIND_LABELS = {
     # 脚本类任务（开学季 / 夜猫）：整批跑脚本，日志只有成败两行
     'school': '开学季任务',
     'cat': '夜猫任务',
+    # 面板发起的「一键执行」（taskrun._record_history 写入）：claim / full 各记一行
+    'taskrun': '一键执行',
 }
 
 # 明确表示「什么都没做，也不算失败」的前缀
@@ -134,11 +156,27 @@ def _event(ts: int, kind: str, uid: str, level: str, credits: int, message: str)
     }
 
 
-def _is_uid(token: str) -> bool:
+def _normalize_uid(token: str) -> str:
+    """把日志里的账号标识归一化成 uid8；不是已知形态则返回空串。
+
+    ``昵称(uid8)`` → uid8；纯 uid8 原样返回；其余（含保留字 done / skipped）
+    返回空串，调用方据此跳过该行。
+
+    昵称里可能自带括号（如「猫猫(小)」），所以 `_LABEL_SHAPE` 用**非贪婪**匹配
+    最外层的一对括号，并以「括号内必须是合法 uid 形态」为判据 —— `a(b)(c)` 这种
+    会正确取到 `(c)`。
+    """
     tok = token or ''
     if tok.lower() in _RESERVED_TOKENS:
-        return False
-    return bool(_UID_SHAPE.match(tok))
+        return ''
+    m = _LABEL_SHAPE.match(tok)
+    if m:
+        return m.group(2)
+    return tok if _UID_SHAPE.match(tok) else ''
+
+
+def _is_uid(token: str) -> bool:
+    return bool(_normalize_uid(token))
 
 
 def _classify(rest: str, sev: str | None) -> tuple[int, str]:
@@ -147,11 +185,50 @@ def _classify(rest: str, sev: str | None) -> tuple[int, str]:
     lower = rest.lower()
 
     m_reward = re.search(r'reward=(\d+)', rest)
-    m_adopt = re.search(r'adopt ok\s*\(\+?(\d+)\s*credits?\)', rest, re.IGNORECASE)
     if m_reward:
         return int(m_reward.group(1)), 'credit'
-    if m_adopt:
-        return int(m_adopt.group(1)), 'credit'
+
+    # 通用收益形态：`<动作> ok (+N credit[s])`，括号里**只有** credit 一项。
+    #
+    # 为什么写成通用而不是逐个动作列举：上游这类「动作 + ok (+N credit)」的日志
+    # 一直在增加，每加一个我们就要跟着补一条规则——漏掉的后果是收益显示为 0
+    # （把「赚到了」显示成「没赚」，用户看到的数字是错的，但不会有任何报错）。
+    # 已经出现过三次：`adopt ok (+300 credits)`、连登的 `gift` / `compensation`。
+    # 收紧条件为「括号里只有 credit、后面直接是右括号」，因此不会误吞
+    # `redeem tier=7d ok (+100 credit, +5 energy, +1 chances)` 那种多项括号
+    # （那条由下面的 redeem 规则单独处理）。
+    m_gain = re.search(r'ok\s*\(\+?(\d+)\s*credits?\s*\)', rest, re.IGNORECASE)
+    if m_gain:
+        return int(m_gain.group(1)), 'credit'
+
+    # 连登奖励（上游 91418c5 新增）：`redeem tier=7d ok (+100 credit, +5 energy, +1 chances)`。
+    # 不解析的话界面上收益显示为 0——而这是真实到账的积分，等于把「赚到了」显示成「没赚」。
+    # 只取 credit 段（energy / chances 不是积分，不并入收益）。
+    m_redeem = re.search(r'redeem\s+tier=\S+\s+ok\s*\(\+?(\d+)\s*credits?', rest, re.IGNORECASE)
+    if m_redeem:
+        return int(m_redeem.group(1)), 'credit'
+
+    # 连登抽奖：上游的日志是
+    #     `lottery drawn prize=<PrizeName> (<PrizeType>)`
+    # 例如 `prize=10 积分 (credit)` / `prize=谢谢参与 (none)` / 实物奖。
+    #
+    # 注意**判据是括号里的 PrizeType，不是奖品名里的数字**：奖品名是腾讯返回的
+    # 中文文本（`10 积分`），不是 `50 credits` 这种英文串 —— 上一版按
+    # `prize=(\d+)\s*credits?` 写，匹配的是一个上游从未产生过的格式，于是真实
+    # 日志一律被提取成 0（格式取自上游 scheduler.go:622 与它自己的测试夹具）。
+    #
+    # 积分奖的名字里带数量（`10 积分`），从中取第一个整数；取不到时仍标成 credit
+    # 事件（说明这次确实发的是积分）但收益记 0，不编造数字。
+    m_draw = re.search(r'lottery\s+drawn\s+prize=([^()]*?)\s*(?:\(([^)]*)\))?$',
+                       rest.strip(), re.IGNORECASE)
+    if m_draw:
+        prize_name = (m_draw.group(1) or '').strip()
+        prize_type = (m_draw.group(2) or '').strip().lower()
+        if prize_type == 'credit':
+            num = re.search(r'(\d+)', prize_name)
+            return (int(num.group(1)), 'credit') if num else (0, 'credit')
+        # 实物 / 未中奖等：算成功，但没有积分收益
+        return 0, 'ok'
 
     # 账号被禁用属于严重结果，即使上游只标了 WARN 也按失败展示
     if '禁用' in rest or 'session dead' in lower:
@@ -165,6 +242,11 @@ def _classify(rest: str, sev: str | None) -> tuple[int, str]:
     # 「今天已签到」是幂等成功：腾讯以业务错误返回，但语义上没问题。
     # 不特判就会在界面上显示成红色的签到失败。
     if any(m in rest or m in lower for m in _ALREADY_MARKERS):
+        return 0, 'ok'
+
+    # 抽奖成功（无积分奖或未命中上面的 credit 形态）：不能落到末尾的 error——
+    # 它没有 ` ok ` 字样，全靠这一条兜住，否则中奖反而显示成红色失败。
+    if re.match(r'lottery\s+drawn\b', rest, re.IGNORECASE):
         return 0, 'ok'
 
     if re.match(r'report \d+/\d+:', lower):
@@ -249,22 +331,26 @@ def parse_line(line: str) -> dict | None:
             f'计划任务未执行：{reason}' if reason else '计划任务未执行',
         )
 
-    # 形态 1：任务结果（uid 必须像 uid）
+    # 形态 1：任务结果（账号标识必须认得出来）
     m = _TASK_LINE.search(body)
-    if m and _is_uid(m.group(3)):
-        sev, kind, uid = m.group(1), m.group(2), m.group(3)
-        rest = m.group(4).strip()
-        credits, level = _classify(rest, sev)
-        return _event(ts, kind, uid, level, credits, rest)
+    if m:
+        uid = _normalize_uid(m.group(3))
+        if uid:
+            sev, kind = m.group(1), m.group(2)
+            rest = m.group(4).strip()
+            credits, level = _classify(rest, sev)
+            return _event(ts, kind, uid, level, credits, rest)
 
-    # 形态 2：阶段失败（uid 后跟阶段名，如 `checkin <uid> refresh: ...`）
+    # 形态 2：阶段失败（标签后跟阶段名，如 `checkin <标签> refresh: ...`）
     m = _STAGE_LINE.search(body)
-    if m and _is_uid(m.group(3)):
-        sev, kind, uid = m.group(1), m.group(2), m.group(3)
-        stage, rest = m.group(4), m.group(5).strip()
-        message = f'{stage}: {rest}'
-        credits, level = _classify(message, sev)
-        return _event(ts, kind, uid, level, credits, message)
+    if m:
+        uid = _normalize_uid(m.group(3))
+        if uid:
+            sev, kind = m.group(1), m.group(2)
+            stage, rest = m.group(4), m.group(5).strip()
+            message = f'{stage}: {rest}'
+            credits, level = _classify(message, sev)
+            return _event(ts, kind, uid, level, credits, message)
 
     return None
 
@@ -326,6 +412,31 @@ _MESSAGE_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r'连续 (\d+) 次 12153 session dead — 禁用'), '连续 {0} 次会话失效，账号已禁用'),
     (re.compile(r'^(\d+) session dead$'), '会话失效（错误码 {0}）'),
     (re.compile(r'连续 (\d+) 次 12153 session dead'), '连续 {0} 次会话失效'),
+    # ── 成长中心（连登 / 礼包 / 抽奖）───────────────────────────
+    # 上游 2026-09-16 起新增的这一批日志，任务页会把原始英文当主文案显示，
+    # 不翻译的话用户看到的是 `gift ok (+100 credit)` 这种开发者文本。
+    # 顺序要紧：`redeem` 与 `lottery` 的形态更具体，必须排在通用 `ok (+N credit)`
+    # 之前，否则会被它先匹配掉（`_MESSAGE_RULES` 是首次命中即返回）。
+    (re.compile(r'redeem tier=(\S+) ok \(\+(\d+) credit'), '连登奖励领取成功（{0} 档，获得 {1} 积分）'),
+    (re.compile(r'redeem tier=(\S+) skip'), '连登奖励跳过（{0} 档：已领过或天数不足）'),
+    (re.compile(r'redeem tier=(\S+):'), '连登奖励领取失败（{0} 档）'),
+    (re.compile(r'lottery drawn prize=([^()]*?)\s*\(credit\)'), '抽奖中奖：{0}'),
+    (re.compile(r'lottery drawn prize=([^()]*?)\s*\(physical\)'), '抽奖中奖（实物）：{0}'),
+    (re.compile(r'lottery drawn prize=([^()]*?)\s*\(none\)'), '抽奖未中奖'),
+    (re.compile(r'lottery draw ok'), '抽奖成功'),
+    (re.compile(r'lottery skip \(no chances or disabled\)'), '抽奖跳过：无次数或未开启'),
+    (re.compile(r'lottery skip \(no chances\)'), '抽奖跳过：无抽奖次数'),
+    (re.compile(r'lottery-chances:'), '查询抽奖次数失败'),
+    (re.compile(r'lottery draw:'), '抽奖失败'),
+    (re.compile(r'makeup ok (\S+) \(\+streak kept\)'), '已用补签卡保住连登（{0}）'),
+    (re.compile(r'makeup (\S+):'), '补签失败（{0}）'),
+    (re.compile(r'gift ok \(\+(\d+) credit\)'), '新手礼包领取成功（获得 {0} 积分）'),
+    (re.compile(r'compensation ok \(\+(\d+) credit\)'), '活动补偿领取成功（获得 {0} 积分）'),
+    (re.compile(r'gift already claimed'), '新手礼包已领过'),
+    (re.compile(r'compensation already claimed'), '活动补偿已领过'),
+    (re.compile(r'reward-state:'), '查询奖励状态失败'),
+    # 通用兜底放最后：`<动作> ok (+N credit)`（上游还在持续加新动作）
+    (re.compile(r'^(\w[\w-]*) ok \(\+(\d+) credits?\)$'), '任务成功（获得 {0} 积分）'),
 )
 
 _MESSAGE_EXACT = {

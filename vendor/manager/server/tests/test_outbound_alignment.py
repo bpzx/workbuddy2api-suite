@@ -441,3 +441,80 @@ class WriteAuthFilePreservesDeviceTokenTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class DeviceFingerprintHeaderTest(_Base):
+    """X-Machine-ID / X-Session-ID：按账号稳定派生的设备指纹头。
+
+    上游 2026-09-15 新增（deriveAccountStableID），语义是「每账号一台固定虚拟
+    设备」——跨重启恒定、账号间互异，对齐官方桌面端，防多号被按设备指纹缺失
+    或漂移关联风控。
+
+    我们直连腾讯的那批请求（扫码登录/签到/积分/注册/trial/探测）必须同样携带：
+    上游给它的出站加了这两个头，我们这条路不加，就成了唯一「没有设备标识」
+    的流量 —— 与 D1/D5 那批风控头是同一个道理。
+
+    派生必须与上游**逐字一致**（固定盐 "wb2a:"、sha256 前 18 字节 hex）：
+    否则同一账号在「经上游」与「直连」两条路上会是两台设备，反而制造出
+    可被关联的异常。
+    """
+
+    UID = '76a5e629-dcdf-4c62-8607-e2de2571e26c'
+
+    def _expect(self, purpose: str) -> str:
+        import hashlib
+        return hashlib.sha256(f'wb2a:{purpose}:{self.UID}'.encode()).hexdigest()[:36]
+
+    def test_derivation_matches_upstream(self) -> None:
+        h = realm.device_fingerprint_headers(self.UID)
+        self.assertEqual(h['X-Machine-ID'], self._expect('machine'))
+        self.assertEqual(h['X-Session-ID'], self._expect('session'))
+        # 上游截 18 字节 → 36 hex
+        self.assertEqual(len(h['X-Machine-ID']), 36)
+
+    def test_accounts_are_isolated(self) -> None:
+        a = realm.device_fingerprint_headers('uid-A')
+        b = realm.device_fingerprint_headers('uid-B')
+        self.assertNotEqual(a['X-Machine-ID'], b['X-Machine-ID'])
+        self.assertNotEqual(a['X-Session-ID'], b['X-Session-ID'])
+
+    def test_purposes_are_salted_apart(self) -> None:
+        """machine 与 session 必须是不同值（用途盐隔离）。"""
+        h = realm.device_fingerprint_headers(self.UID)
+        self.assertNotEqual(h['X-Machine-ID'], h['X-Session-ID'])
+
+    def test_idempotent(self) -> None:
+        """同 uid 恒同值 —— 跨重启稳定是它存在的意义。"""
+        self.assertEqual(realm.device_fingerprint_headers(self.UID),
+                         realm.device_fingerprint_headers(self.UID))
+
+    def test_empty_uid_injects_nothing(self) -> None:
+        for v in ('', '   ', None):
+            self.assertEqual(realm.device_fingerprint_headers(v), {},
+                             '匿名请求没有设备可言，不应注入')
+
+    # ── 接线：两条出站路径都要带上 ──
+
+    def test_billing_headers_include_fingerprint(self) -> None:
+        h = realm.billing_headers('cn', {'access_token': 't', 'uid': self.UID})
+        self.assertEqual(h.get('X-Machine-ID'), self._expect('machine'))
+        self.assertEqual(h.get('X-Session-ID'), self._expect('session'))
+
+    def test_generic_headers_include_fingerprint_when_uid_given(self) -> None:
+        h = realm.headers('cn', 't', self.UID)
+        self.assertEqual(h.get('X-Machine-ID'), self._expect('machine'))
+
+    def test_checkin_request_carries_fingerprint(self) -> None:
+        """端到端：签到请求（billing 域）实际带上这两个头。"""
+        _run(tencent.checkin({'access_token': 'TOK', 'uid': self.UID}, 'cn'))
+        h = self._last()[2]['headers']
+        self.assertEqual(h.get('X-Machine-ID'), self._expect('machine'),
+                         '签到请求没带设备指纹 —— 会被当作异常流量')
+        self.assertEqual(h.get('X-Session-ID'), self._expect('session'))
+
+    def test_probe_request_carries_fingerprint(self) -> None:
+        """端到端：探测请求（chat 域）也要带。"""
+        _run(tencent.probe_account({'access_token': 'TOK', 'uid': self.UID,
+                                    'realm': 'cn'}, 'glm-5.2'))
+        h = self._last()[2]['headers']
+        self.assertEqual(h.get('X-Machine-ID'), self._expect('machine'))

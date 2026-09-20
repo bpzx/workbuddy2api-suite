@@ -41,7 +41,10 @@ func readDeviceTokenFile(path string) string {
 	if path == "" {
 		return ""
 	}
-	// 快路径：缓存命中且未过期，直接返回（不持锁读返回值，仅判读时间）。
+	// 快路径：缓存命中且未过期，直接返回缓存值。注意全程持锁（defer Unlock）——
+	// 含 5 分钟一次的过期重读（锁内 os.Stat + os.ReadFile）。调用频率极低
+	// （每 5min 最多一次文件 IO，文件上限 1KB），锁内 IO 可接受；若未来出现
+	// NFS 挂载 + 高并发的部署形态，再上 singleflight 包住重读段（YAGNI，现在不做）。
 	dtFileCache.mu.Lock()
 	defer dtFileCache.mu.Unlock()
 	if path == dtFileCache.path && time.Since(dtFileCache.readAt) < deviceTokenFileTTL {

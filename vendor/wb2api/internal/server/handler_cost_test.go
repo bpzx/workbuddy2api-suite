@@ -1,12 +1,14 @@
 package server
 
 import (
+	"encoding/json"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/pool"
 )
 
 // sseWithCredit 末帧带 usage.credit 的流式响应：2.0 credit / 2000 token。
@@ -197,5 +199,68 @@ func TestRotationPreservesFullContext(t *testing.T) {
 	}
 	if strings.Contains(rec.Body.String(), `"error"`) {
 		t.Errorf("成功响应不应含 error 字段: %s", rec.Body.String())
+	}
+}
+
+// TestStatusModelCostsLedger end-to-end（P1-anti-monopoly 可观测性）：成功请求
+// 记入成本账本后，GET /status 的 accounts[].model_costs 透出台账——每模型一行
+//（model/cost_per_1k/last_seen/samples），免费观测 per1k=0、收费观测 per1k>0，
+// 无观测账号该字段为空。
+func TestStatusModelCostsLedger(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		if authz == "Bearer at-u2" {
+			return 200, sseFree, true // u2 显式 credit:0（免费）
+		}
+		return 200, sseWithCredit, true // u1 收费
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at-u1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at-u2", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
+	for i := 0; i < 12; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+			strings.NewReader(`{"model":"m2","messages":[],"stream":true}`)))
+		if rec.Code != 200 {
+			t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+		}
+	}
+
+	statusRec := httptest.NewRecorder()
+	h.ServeHTTP(statusRec, httptest.NewRequest("GET", "/status", nil))
+	if statusRec.Code != 200 {
+		t.Fatalf("status code=%d body=%s", statusRec.Code, statusRec.Body)
+	}
+	var sbody struct {
+		Accounts []pool.Status `json:"accounts"`
+	}
+	if err := json.Unmarshal(statusRec.Body.Bytes(), &sbody); err != nil {
+		t.Fatalf("status not json: %v", err)
+	}
+	if len(sbody.Accounts) != 2 {
+		t.Fatalf("accounts=%d want 2", len(sbody.Accounts))
+	}
+	for _, st := range sbody.Accounts {
+		if len(st.ModelCosts) != 1 {
+			t.Fatalf("u%s model_costs 行数=%d want 1: %+v", st.UID, len(st.ModelCosts), st.ModelCosts)
+		}
+		row := st.ModelCosts[0]
+		if row.Model != "m2" {
+			t.Errorf("u%s model=%q want m2", st.UID, row.Model)
+		}
+		if row.LastSeen.IsZero() {
+			t.Errorf("u%s last_seen 未透出", st.UID)
+		}
+		switch st.UID {
+		case "u1": // 收费：2.0 credit / 2000 token → per1k = 1.0
+			if row.CostPer1k != 1.0 {
+				t.Errorf("u1 cost_per_1k=%v want 1.0", row.CostPer1k)
+			}
+		case "u2": // 免费（显式 credit:0）
+			if row.CostPer1k != 0 {
+				t.Errorf("u2 cost_per_1k=%v want 0", row.CostPer1k)
+			}
+		}
 	}
 }

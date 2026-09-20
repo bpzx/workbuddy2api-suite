@@ -6,6 +6,11 @@ workbuddy2api 只在进程启动时读取 config.json 与扫描 auths/ 目录
 （见 cmd/server/main.go：auth.LoadDir + p.SyncToDir + 各 SetXxx 注入），
 之后不再重读，也不处理 SIGHUP。因此任何影响这两者的改动都必须重启容器。
 
+**一处例外**（上游 2026-09-18 起）：auths 目录加了热加载——每 5 秒轮询目录指纹，
+凭证文件增删改会自动重新加载，那时不必重启（见其 internal/pool/watch.go）。
+但 **config.json 仍然只读一次**，所以改配置依旧必须重启；账号相关的改动我们
+照旧触发一次重启，好处是新旧上游都能立即生效（新版不必等那 5 秒轮询）。
+
 为什么可以直接自动重启
 --------------------
 - 实测 `docker restart` 到服务可用约 0.45 秒

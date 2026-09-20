@@ -1,5 +1,4 @@
 const core = require('@actions/core');
-const github = require('@actions/github');
 const OpenAI = require('openai');
 
 const { loadConfig, parseInputs } = require('./utils/config');
@@ -39,7 +38,9 @@ async function run() {
       config
     } = parseInputs(baseConfig);
 
-    // 初始化GitHub客户端
+    // 初始化GitHub客户端（@actions/github v9 是纯 ESM 包，exports 无 require 条件，
+    // CJS 侧必须走动态 import 加载——顶层 require 会抛 ERR_PACKAGE_PATH_NOT_EXPORTED）
+    const github = await import('@actions/github');
     const octokit = github.getOctokit(token);
     const context = github.context;
 

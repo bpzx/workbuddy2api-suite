@@ -18,6 +18,11 @@
 [![Release](https://img.shields.io/github/v/release/ithtelab/workbuddy-manager?color=22c55e&label=Release)](https://github.com/ithtelab/workbuddy-manager/releases)
 [![Changelog](https://img.shields.io/badge/更新日志-CHANGELOG-blue)](CHANGELOG.md)
 [![Issues](https://img.shields.io/github/issues/ithtelab/workbuddy-manager?color=f59e0b&label=反馈)](https://github.com/ithtelab/workbuddy-manager/issues)
+[![LINUX DO](https://img.shields.io/badge/社区-LINUX%20DO-1f6feb)](https://linux.do)
+
+[English](README.en.md) · **简体中文**
+
+本项目在 [**LINUX DO**](https://linux.do) 社区发布与交流，欢迎佬友来玩。
 
 <img src="docs/images/dashboard.png" alt="WorkBuddy Manager 仪表盘" width="100%" />
 
@@ -27,7 +32,7 @@
 
 ## 这是什么
 
-[`workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api) 是一个把腾讯 CodeBuddy 账号池包装成 OpenAI 兼容接口的反代服务（Go 编写）。它很强大，但**只有命令行**：加账号要跑脚本、看状态要 `curl /status`、发密钥没有任何界面。
+[`workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api) 是一个把腾讯 CodeBuddy 账号池包装成 OpenAI 兼容接口的反代服务（Go 编写）。它的能力很完整，但只有命令行：加账号要跑脚本、看状态要 `curl /status`、发密钥没有界面。
 
 本项目补上这一块 —— 一个可以公网运营的 Web 控制台：
 
@@ -40,7 +45,20 @@
 | 无法知道谁用了多少 | 每次调用的模型、Token、延迟、来源 IP 全量留痕 |
 | 无任何 IP 防护 | 入站白/黑名单 + 每密钥 IP 上限与白名单 |
 
-> **不改动 workbuddy2api 一行代码**。账号轮询、并发、熔断仍由它负责，本项目管理端与网关独立部署。
+**与 workbuddy2api 的关系**：本项目是为它做**可视化**的配套项目 —— 让能力强大的
+上游网关变得看得见、管得动。面板不侵入上游：**没有修改它一行代码**，账号轮询、
+并发与熔断仍由它负责。两者配合的方式很自然：
+
+- **上游负责能力，面板负责呈现**：账号调度、令牌刷新、限流熔断由 workbuddy2api
+  完成；面板把这些能力可视化，并补上密钥分发、IP 管控、用量统计这些运营环节
+- **互为参照、一起演进**：上游新增能力时本项目跟随适配，面板侧发现的运营需求也
+  会反哺上游。上游在它的 README 里把本项目列为「社区前端面板」之一，我们希望
+  一起把这个生态做得更好用
+- **上游专注自己的核心**：面板不要求上游为它改代码，让上游能保持精简
+
+欢迎参与共建：上游的改进建议提到
+[workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)，面板相关的问题与想法
+提到[本仓库](https://github.com/ithtelab/workbuddy-manager/issues)。
 
 ---
 
@@ -56,6 +74,10 @@
   （上游 `/status` 的积分滞后可达数小时）：打开页面自动拉取、签到后即时更新，
   另有「刷新积分」按钮可手动刷新全部账号。每个数字旁标注 **`实时`** 或
   **`缓存 Ns 前`**，一眼看出是刚查的还是 60 秒内复用的缓存
+- **积分到期倒计时** —— 积分按套餐分批过期、过期即作废，每笔各算各的到期时间。
+  余额旁显示最近一笔的额度与倒计时（如 `300 · 8 天后到期`，按紧迫度分三档着色），
+  悬停可看全部套餐的额度、具体到期时刻与合计；首页积分卡片同时提示最近一笔的金额
+  与到期日期，避免攒着攒着就白白过期
 - **积分变动流水** —— 所有让余额增加的渠道都会留痕：上游只在旅行领奖时打日志，
   签到与活跃上报**根本不打**，因此改为每次查积分后比对余额、只要增加就记一条
   （如 `余额 +100（1300 → 1400）`），在「自动任务与积分记录」里按「积分变动」筛选查看
@@ -75,15 +97,17 @@
 
 ### 反代网关（对外 `/v1`）
 - **OpenAI 兼容** —— 下游用标准 SDK 直连，支持流式（SSE）与非流式
-- **多密钥分发** —— 每把密钥独立设置有效期、最大 IP 数、IP 白名单、模型白名单、Token 配额
+- **多密钥分发** —— 每把密钥独立设置**限定版本**（国内版 / 国际版）、有效期、最大 IP 数、IP 白名单、模型白名单、Token 配额
 - **密钥安全** —— 库中仅存 SHA-256 哈希，明文只在创建时展示一次
 - **模型别名映射** —— 把 `gpt-4o-mini` 之类映射到实际模型，方便下游无感迁移
 - **国内版 / 国际版切换** —— 页面右上角一键切换（上游单实例双版本共存，共用账号池）：
-  账号、模型、测试台、任务记录按版本过滤；「添加账号」跟随切换（国际版会走地区注册
-  与一次性 trial）。请求日志与用量是全局记录，页面已标注含两种版本
-- **模型中心** —— 账号实际可用模型单列一页：显示名、上下文、最大输出、**推理档位**、
-  系列分组，支持搜索与按能力筛选。数据直连腾讯模型接口（上游 `/v1/models` 会丢掉
-  显示名与推理档位）；取不到时回退上游简表并**如实标注来源**，绝不编造数据
+  账号、模型、测试台、任务记录、请求日志与用量统计全部按版本过滤；「添加账号」跟随切换
+  （国际版会走地区注册与一次性 trial）。**密钥也可限定版本**——国内版密钥只能调国内版
+  模型，反之亦然
+- **模型中心** —— 账号实际可用模型单列一页：显示名、描述、上下文、最大输出、
+  **推理档位**、**积分倍率**、多模态/仅推理等能力标记，按系列分组，支持搜索、
+  能力筛选与**按积分倍率排序**（挑省积分的模型时最实用）。数据直连腾讯模型接口
+  （那里有比上游更全的字段）；取不到时回退上游清单并**如实标注来源**，绝不编造数据
 - **国际版能力边界**（上游如此，非本端缺失）：无签到 / 猫猫旅行 / 开学季 / 夜猫，
   积分仅一次性 trial；**保活与活跃上报照常**。任务页对国际版会写明原因，
   不显示成空白
@@ -105,7 +129,7 @@
 - **并发与熔断**：单账号并发、失败阈值、熔断冷却与封顶、闲置补偿权重、
   快过期积分窗口（到期在窗口内的积分优先消耗，留空或 0 = 关闭）
 - **功能开关 / 会话粘性**：出站指纹脱敏、会话绑定时长与清理周期
-- **可用模型**：从上游实时拉取，如实标注来源（动态 / 内置静态回退表），并提供
+- **可用模型**：从上游实时拉取，如实标注来源，并提供
   手动「重新拉取」（上游自身缓存 1 小时）。列表由上游随机挑一个账号拉取，
   **取决于该账号授权**，故不同账号可见的模型数量可能不同
 - 输入即校验（时刻限 0-23 且去重排序、时长须为 `30s / 10m / 2h / 1d`），
@@ -194,7 +218,7 @@
 <img src="docs/images/tasks.png" alt="任务记录" width="100%" />
 
 ### API 密钥
-> 独立配额、IP 限制、模型白名单，明文仅创建时展示一次
+> 限定版本（国内版 / 国际版）、独立配额、IP 限制、模型白名单，明文仅创建时展示一次
 
 <img src="docs/images/keys.png" alt="API 密钥" width="100%" />
 
@@ -312,7 +336,7 @@ npm run dev                          # http://localhost:3000
 > 本项目对内部请求默认 `trust_env=False`（不读取系统代理）；确需走代理时设置 `WB_HTTP_PROXY`。
 > TUN 模式下请在代理软件中把 `127.0.0.1` 加入直连 / 绕过列表。
 
-### 二、运行测试
+#### 运行测试
 
 ```bash
 # 配置读写的回归测试：时刻数组 / 时长字符串 / 部分提交不覆盖同段其他键
@@ -323,7 +347,104 @@ python -m unittest discover -s server/tests -t . -v
 > 这一组测试专门守住两个曾经写坏配置的坑：把整点数组当成数字间隔、
 > 把时长字符串当成秒数。
 
-### 二、部署到服务器（一键脚本）
+### 二、Windows 原生部署（无需 Docker）
+
+前提：`workbuddy2api` 已在本机运行，并有可用的启停脚本与文件日志。
+
+```powershell
+git clone https://github.com/ithtelab/workbuddy-manager.git
+cd workbuddy-manager
+Copy-Item .env.example .env
+```
+
+在 `.env` 中至少设置以下项目（Windows 路径建议使用 `/`）：
+
+```dotenv
+WB_MANAGER_HOST=127.0.0.1
+WB_SECURE_COOKIE=false
+WB2API_MODE=native
+WB_UPSTREAM_DIR=C:/path/to/workbuddy2api
+WB_AUTH_DIR=C:/path/to/workbuddy2api/auths
+WB_UPSTREAM_CONFIG=C:/path/to/workbuddy2api/config.json
+WB2API_START_SCRIPT=C:/path/to/workbuddy2api/start-workbuddy2api.cmd
+WB2API_STOP_SCRIPT=C:/path/to/workbuddy2api/stop-workbuddy2api.cmd
+WB2API_LOG_FILE=C:/path/to/workbuddy2api/data/server.err.log
+```
+
+安装依赖、构建前端并后台启动：
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r server\requirements.txt
+Set-Location web
+npm ci
+npm run build:export
+Set-Location ..
+powershell -ExecutionPolicy Bypass -File .\service-tools.ps1 start
+```
+
+用 `service-tools.ps1 status|restart|stop` 管理后台进程。Windows 原生模式支持
+保存配置后重启上游及读取上游日志；网页一键更新依赖 Linux/Docker，当前会明确拒绝，
+请手动更新代码后重启服务。
+
+> **启停脚本优先用上游自带的**：上游 `workbuddy2api` 2026-09-18 起自带
+> `start/stop/status-workbuddy2api.cmd`（PID 文件 + 进程路径校验，不会误杀同名进程），
+> 直接把 `WB2API_START_SCRIPT` / `WB2API_STOP_SCRIPT` 指过去即可。若你的上游目录里
+> 没有这三个文件（旧版上游），`deploy/windows-native/` 下有一对可直接改用的模板。
+
+> **两个约定必须满足**（上游脚本已满足）：启动脚本要**立即返回**（前台运行会让
+> 「重启」等到超时才报失败），日志要写到 `WB2API_LOG_FILE`（否则「任务记录」读不到
+> 自动任务日志）。细节见 `deploy/windows-native/README.md`。
+
+### 三、Docker 部署
+
+仓库自带 `Dockerfile` 与 `docker-compose.yml`，适合已经用 Docker 跑上游的用户：
+
+```bash
+git clone https://github.com/ithtelab/workbuddy-manager.git
+cd workbuddy-manager
+# 按需改 compose 里的 WB2API_BASE 与卷路径（默认假设上游在 ../workbuddy2api）
+docker compose up -d --build
+docker compose logs workbuddy-manager | grep -A2 密码   # 首启随机密码
+```
+
+> **前端会在镜像里自动构建**：`web/out`（前端产物）不入库，所以 `git clone` 得到的
+> 工作区里没有它。构建时若发现没有，就自动在容器内 `npm ci && next build`
+> （约 1-2 分钟，首次会拉取 Node 镜像）；若已有（例如从 Release 包解压出来的），
+> 则直接复用、跳过这一步。两条路都不需要你事先装 Node 或手动构建。
+>
+> 国内网络下 npm 官方源可能很慢，可加镜像：
+> `docker compose build --build-arg NPM_REGISTRY=https://registry.npmmirror.com`
+
+也可以直接用构建好的镜像（每次发版会推到 GHCR）：
+
+```bash
+docker pull ghcr.io/ithtelab/workbuddy-manager:latest
+```
+
+> 镜像**同时提供 `linux/amd64` 与 `linux/arm64`**（Apple Silicon、ARM 云主机可直接拉取，
+> 无需 QEMU 模拟）。`docker pull` 会按你的机器架构自动选择对应的那一份。
+
+**容器版与宿主版的能力是一致的** —— compose 里默认挂载了三样东西让它们对齐：
+
+| 挂载 | 作用 |
+|---|---|
+| 上游仓库目录 | 读上游 compose 做端口收敛；`git pull` 更新上游；读写 `config.json` 与 `auths/`（**扫码添加账号会写 auths**，所以不能只读） |
+| `./data` | 数据库、日志、更新状态。必须持久化 |
+| `/var/run/docker.sock` | 让容器内的管理端能重启/重建上游容器 —— 即「更新上游」「保存设置后自动重载」「读上游日志」 |
+
+> **关于 docker.sock 的取舍**：挂它等于把宿主 root 权限交给本容器。但这**不是新增的风险等级**——宿主部署时本服务本来就是 root 运行（systemd 单元无 `User=`、安装脚本要求 root），而 root 进程本来就能 `docker run -v /:/host` 拿到宿主文件系统，两者权限等价。
+> 若你的要求是最小权限，把那一行注释掉即可：依赖 docker 的功能会**自动降级为「请到宿主机操作」**，界面如实提示，不会静默失败。
+
+还有两处与宿主部署的差异（界面都会提示）：
+
+- **更新管理端会重启整个容器**：容器无法自我重启。流程是「替换代码 → 结束容器 → 由 compose 的 `restart` 策略用新代码拉起」，所以 compose 里必须保留 `restart: unless-stopped`。
+- **端口默认只绑定 `127.0.0.1`**：管理端持有全部账号凭据，应当藏在反向代理之后。确需直接访问请自行改 compose，并确保 HTTPS。
+
+> 与宿主机安装一样，一键更新**强制验签**发布包。镜像本身不参与这套签名
+> （那是另一条信任链，依赖 GHCR 的 digest 与 GitHub 账号安全）。
+
+### 四、部署到服务器（一键脚本）
 
 本项目依赖上游 [`workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api)
 （账号池与 OpenAI 兼容接口），**单独 clone 本仓库无法运行**。
@@ -348,8 +469,9 @@ sudo bash deploy/install.sh
 **全程无需手工编辑配置。** 若已自备上游，加 `--skip-upstream` 即可跳过，
 脚本不会改动已有配置与账号。
 
-> 通过 `git clone` 部署时，需先在 `web/` 执行 `npm ci && npm run build:export`
-> （构建产物不入库），或改用 Release 包。
+> 通过 `git clone` 部署时**不需要**手动构建前端：安装脚本会发现缺少
+> `web/out`（前端产物不入库）并自动 `npm ci && npm run build:export`
+> （需机器上有 Node.js；没有则提示改用 Release 包 —— 那里面已含构建好的产物）。
 
 首次启动的管理员密码：
 
@@ -371,13 +493,19 @@ journalctl -u workbuddy-web | grep -A3 '初始管理员'
 | `WB_MANAGER_PORT` | `7864` | 监听端口 |
 | `WB2API_BASE` | `http://127.0.0.1:7863` | workbuddy2api 地址 |
 | `WB2API_KEY` | 读 config.json | 上游 API Key |
+| `WB2API_MODE` | `docker` | 上游运行方式：`docker` 或 `native` |
 | `WB2API_CONTAINER` | `workbuddy2api` | 重载用的容器名 |
 | `WB_AUTH_DIR` | `/opt/workbuddy2api/auths` | 账号授权目录 |
 | `WB_UPSTREAM_CONFIG` | `/opt/workbuddy2api/config.json` | 上游配置文件 |
+| `WB2API_START_SCRIPT` | 上游目录下的 `.cmd` | native 模式启动脚本 |
+| `WB2API_STOP_SCRIPT` | 上游目录下的 `.cmd` | native 模式停止脚本 |
+| `WB2API_LOG_FILE` | `data/server.err.log` | native 模式上游日志 |
 | `WB_DATA_DIR` | `./data` | 本服务数据目录 |
 | `WB_STATIC_DIR` | `./web/out` | 静态导出目录 |
 | `WB_ADMIN_PASSWORD` | 随机生成 | 首次启动的 admin 密码 |
-| `WB_SECURE_COOKIE` | `auto` | 依 `X-Forwarded-Proto` 判定 |
+| `WB_SECURE_COOKIE` | `auto` | 会话 Cookie 的 `Secure` 标志：`auto` 依 `X-Forwarded-Proto` 判定、也可写死 `true`/`false` |
+| `WB_SESSION_DAYS` | `1` | 会话**总时长**上限（天），到点必须重新登录 |
+| `WB_SESSION_IDLE_HOURS` | `12` | 会话**空闲**上限（小时）：多久没操作就失效（滑动续期窗口） |
 | `WB_HTTP_PROXY` | 空 | 出口代理，留空 = 全部直连 |
 
 完整清单见 [`.env.example`](.env.example)。
@@ -396,11 +524,24 @@ journalctl -u workbuddy-web | grep -A3 '初始管理员'
 
 进入「密钥」页点 **新建密钥**，按需设置：
 
+- **限定版本** —— 国内版密钥只能调国内版模型，国际版密钥只能调 `global:` 开头的
+  国际版模型，跨版本调用会被拒绝（`/v1/models` 也只返回对应版本的模型）。
+  默认跟随当前所在版本；选「不限制」则两版都能调
 - **有效期** —— 留空或 0 表示永不过期
 - **最大 IP 数** —— 限制同一密钥可使用的来源 IP 数量
 - **IP 白名单** —— 更严格，仅允许指定 IP / CIDR 调用
-- **模型白名单** —— 限制该密钥可用的模型
-- **配额** —— Token 用尽后自动拒绝
+- **模型白名单** —— 在所选版本之内再限制到具体模型
+- **Token 配额** —— Token 用尽后自动拒绝（按 prompt + completion 累计）
+- **积分配额** —— 按**真实扣费**累计的额度，用尽后同样拒绝（429）。
+
+  为什么除了 Token 还要有积分：**同样 1M Token，便宜模型与贵模型的扣费能差
+  几十倍**，拿 Token 数当预算估不出实际花了多少。数据来自上游每次响应末帧
+  `usage.credit`（真实扣费，不是估算），与「用量统计」页看到的是同一份。
+
+  两个额度**各自独立**，任一超限即拒绝，都留 0 = 不限。上游没返回该字段的调用
+  **不计入**（而不是按 0 记）：那代表「不知道扣了多少」，按 0 记等于把它当免费，
+  数字会假装准确。代价是老版本上游（2026-09-13 之前）下这个额度**不会增长**，
+  界面上用量一直是 0 —— 那种情况下请用 Token 配额。
 
 密钥明文**只在创建时展示一次**，请立即保存。
 
@@ -441,6 +582,55 @@ for chunk in resp:
 > 流式请求会自动注入 `stream_options.include_usage=true`，以便精确统计 Token 消耗。
 
 <details>
+<summary><b>OpenAI Responses API（Codex / DeepSeek Harness 等）</b></summary>
+
+本服务同时提供 Responses 协议（`/v1/responses`，SDK 的 `baseURL` 不含 `/v1`
+时也支持 `/responses`）。请求体用 `input` 而非 `messages`，`instructions` 承载
+system 文本：
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="https://wb.example.com/v1", api_key="wbk_xxxxxxxx")
+
+resp = client.responses.create(
+    model="glm-5.2",
+    instructions="你是一个简洁的助手",
+    input="你好",
+    stream=True,
+)
+for event in resp:
+    if event.type == "response.output_text.delta":
+        print(event.delta, end="")
+```
+
+工具调用同样支持：客户端发扁平形状的 `tools`（`{type:"function", name, parameters}`），
+返回的是 `function_call` 输出项与 `response.function_call_arguments.delta` 事件。
+
+> 只发 `openai-responses` 协议的客户端（如 DeepSeek Harness 的自定义提供方）
+> 把「API 协议」选成 `openai-responses` 即可；它谈的协议与
+> `openai-completions` 不是同一个，需要单独建一个提供方。
+
+</details>
+
+<details>
+<summary><b>Anthropic Messages API（Claude Code / Cursor / Cline 等）</b></summary>
+
+只认 Anthropic 协议的客户端可直接把 Base URL 指向本服务——`ANTHROPIC_BASE_URL`
+配到根路径即可（协议层面 `/v1/messages` 与官方一致）：
+
+```bash
+export ANTHROPIC_BASE_URL=https://wb.example.com
+export ANTHROPIC_AUTH_TOKEN=wbk_xxxxxxxx   # 也接受 x-api-key 头
+export ANTHROPIC_MODEL=glm-5.2
+```
+
+模型名与 OpenAI 侧**同一套**（含 `global:` 前缀的版本规则与密钥版本隔离），
+`/v1/messages/count_tokens` 亦可用。
+
+</details>
+
+<details>
 <summary><b>可用模型</b></summary>
 
 以「设置 → 可用模型」实时拉取结果为准，常见如下（上下文均为 131072）：
@@ -457,6 +647,9 @@ for chunk in resp:
 |---|---|---|---|
 | `POST` | `/v1/chat/completions` | 网关密钥 | OpenAI 兼容对话（流式 / 非流式） |
 | `POST` | `/v2/chat/completions` | 网关密钥 | 同上（v2 路径） |
+| `POST` | `/v1/responses` `/responses` | 网关密钥 | OpenAI Responses API 兼容（流式 / 非流式） |
+| `POST` | `/v1/messages` | 网关密钥 | Anthropic Messages API 兼容（Claude Code 等） |
+| `POST` | `/v1/messages/count_tokens` | 网关密钥 | 按字符数粗估输入 token |
 | `GET` | `/v1/models` | 网关密钥 | 模型列表 |
 | `GET` | `/healthz` | 无 | 存活探测（含上游连通性） |
 | `GET` | `/api/me` | 会话 | 当前登录用户 |
@@ -570,8 +763,29 @@ CI 会构建前端、打包产物、从 CHANGELOG 提取对应版本段落作为
 
 ---
 
+## 赞助与推广
+
+> 说明：以下为合作方推广信息。本项目部署需要一台能跑 Docker 的服务器，提供给有需要
+> 的用户参考；**本仓库与其没有技术依赖**，用别家服务器同样能正常部署。
+
+### 爱维云 · 免备案云服务器
+
+[![爱维云 · lovevps.cn](docs/images/lovevps.png)](https://lovevps.cn/)
+
+**长期七五折**，下单时填优惠码 **`catfk`** ｜ 官网：<https://lovevps.cn/>
+
+- **免备案、即开即用** —— 香港（5 个可用区）、美国、日本、新加坡、马来西亚、德国等
+  节点；国内另有济南、厦门、襄阳、绍兴、广州、西安、深圳等多个机房
+- **线路优化** —— CN2 / 9929 / BGP 精品线路；高防机型提供 200G 流量防御
+- **住宅 IP** —— 美国节点提供原生住宅宽带 IP
+- **弹性计费** —— 按需创建与释放，配置可随时升降
+- **资质** —— 持 IDC / ISP / CDN 经营许可（B1-20263321、苏B2-20263329）
+
+---
+
 ## 致谢
 
+- [**LINUX DO**](https://linux.do) —— 本项目的发布与交流社区
 - [**linux-do/cdk**](https://github.com/linux-do/cdk)（MIT）—— 界面设计令牌与浮动底栏组件来源，本项目 UI 视觉与其保持一致
 - [**Sliverkiss/workbuddy2api**](https://github.com/Sliverkiss/workbuddy2api) —— 底层账号池与 OpenAI 兼容代理
 - [**lbjlaq/Antigravity-Manager**](https://github.com/lbjlaq/Antigravity-Manager) —— 管理端功能形态参考

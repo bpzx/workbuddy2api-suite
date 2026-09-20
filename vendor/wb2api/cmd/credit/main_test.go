@@ -183,3 +183,30 @@ func TestCollectEmptyTokenFileSkipped(t *testing.T) {
 		t.Errorf("accounts=%+v want 0（空 token 文件被 Parse 跳过）", accounts)
 	}
 }
+// TestCollectLoadsNonHyphenAuthFile (P2-10 RED)：collect 此前私用
+// workbuddy-*.json 窄 glob，不带连字符的文件被跳过；改为 auth.LoadAuthFiles
+// 后应与网关口径一致（宽侧 workbuddy*.json）。
+func TestCollectLoadsNonHyphenAuthFile(t *testing.T) {
+	auth.SetGlobalEnabled(true)
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
+
+	dir := t.TempDir()
+	// 不带连字符的文件名（网关 LoadDir 一直加载它，credit 曾跳过）。
+	writeTestAuth(t, dir, "cnuid-00000002", "at-cn", "www.codebuddy.cn", "")
+	if err := os.Rename(
+		filepath.Join(dir, "workbuddy-cnuid-00.json"),
+		filepath.Join(dir, "workbuddy_new.json"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	up := fakeUpstreamCredit(t, func(r *http.Request) (*http.Response, error) {
+		return creditResp(`{"code":0,"data":{"Response":{"Data":{"Accounts":[]}}}}`), nil
+	})
+	accounts := collect(dir, up)
+	if len(accounts) != 1 {
+		t.Fatalf("accounts=%d want 1（不带连字符文件应被加载）", len(accounts))
+	}
+	if !accounts[0].OK {
+		t.Errorf("account ok=%v error=%s（应成功查询）", accounts[0].OK, accounts[0].Error)
+	}
+}

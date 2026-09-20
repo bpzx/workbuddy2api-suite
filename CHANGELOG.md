@@ -14,7 +14,61 @@
 
 ## [未发布]
 
+### 变更（大幅瘦身：补丁从 5 项减到 2 项）
+
+同步上游后发现本项目**大部分补丁已被上游官方能力覆盖**，因此做了大幅精简。
+
+**删除的补丁**（原先用于修正「更新」面板的文案与按钮）：
+
+| 原补丁 | 上游现在的官方方案 |
+|---|---|
+| 改「更新」面板文案 | i18n 重构：文案移入 `web/lib/i18n/locales/*.json` |
+| 移除更新按钮 | `can_update_upstream` 能力驱动：不可用时**自动禁用**并提示 |
+| 改后端提示语 | `dockerBlocked` / `dockerNote` 等 i18n 键，按能力分派 |
+| 关掉上游 commit 更新行 | 无需处理 |
+
+**删除理由**：上游一次 i18n 重构就让 8 个锚点同时失效、构建直接红。
+继续锚定硬编码文案意味着**上游每次改字都要跟着改补丁**，
+而收益仅仅是措辞更贴切 —— 维护成本远高于收益。
+
+> **教训：不要为"文案更准确"维护构建期补丁。**
+> 值得打补丁的是**功能缺失**（如代理支持），不是**措辞差异**。
+
+**保留的补丁**（上游确实没有、且经实测确认）：
+
+| # | 目标 | 内容 |
+|---|---|---|
+| 1 | manager `config.py` | 内网请求绕过 `WB_HTTP_PROXY`（否则配 SOCKS 后连不上自己的上游） |
+| 2 | wb2api `transport.go` | Transport 支持代理环境变量（上游完全不读） |
+
+补丁脚本从 **532 行减到 207 行**（-61%），CI 断言同步精简，
+并新增**反向断言**：若有人再给上游前端/更新器打补丁，CI 直接失败。
+
+### 同步的上游版本
+
+| 上游 | 分支 | Commit | 时间 |
+|---|---|---|---|
+| Sliverkiss/workbuddy2api | `master` | `b08f518` | 2026-09-19 16:44 |
+| ithtelab/workbuddy-manager | `main` | `8bc9b0d` | 2026-09-19 11:41 |
+
+- wb2api：默认提示词换 GLM5.3 适配版；期间含 WAF 403 软冷却 + 轮转退避、
+  global 域并发分档、成长任务链补全（11+ 提交 / +3387 行）
+- manager：**v1.0.35 → v1.0.57**（跨 20+ 版本 / 50+ 提交：i18n 重构、
+  `can_update_upstream` 能力驱动、Windows 原生部署、DeepSeek 多轮修复等）
+
 ### 修复
+
+- **补丁 2 锚点随上游重构而失效，fail-fast 正确拦截**。
+  上游把 Transport 构造从 `client.go` 的内联字面量抽成了
+  `transport.go` 的 `newTransport()`，旧锚点找不到，构建按设计失败并指出
+  要改哪里（而非静默失去代理能力）。已更新锚点。
+
+- **验证了一个曾担心的冲突**：上游 `newTransport()` 设了自定义 `DialContext`
+  （连接超时加固），而 Go 的 `Transport.Proxy` 直觉上可能被 dialer 绕过。
+  用假代理收包**实测证明可共存** —— 设 `Proxy` 后连接代理本身仍走
+  `DialContext`，请求确实经代理发出。故补丁只需加一个字段，无需包装 dialer。
+
+#### 历史修复（早前同步时发现）
 
 - **CI 编译失败：`pattern defaultprompt.md: no matching files found`**。
   根因是 vendoring 的经典陷阱——上游 `vendor/wb2api/.gitignore` 里的
@@ -40,21 +94,6 @@
 
   > 该校验在开发中当场抓到了真实问题（中文文件名被 git 转义导致的假阳性），
   > 已改用 NUL 分隔比较（`-z`）修正。
-
-### 修复
-
-- **面板「更新」按钮的误导性文案**（用户实测反馈）。上游文案描述的是
-  **裸机部署**："点下方按钮即可更新，账号与配置会自动保留"、"从 GitHub
-  拉取最新代码并自动重建/重启"、按钮 hint "重建容器 / 替换代码与前端"。
-  但本项目在构建期已把 `deploy/update.py` 换成替身脚本（不执行实际更新），
-  文案却不一致 —— 用户按提示点按钮，**什么都不发生**。
-
-  这是本项目的设计缺陷：替换了更新器的**行为**，却没改**界面文案**。
-
-  修法（补丁 3）：顶部提示行、面板标题与说明、三个按钮 hint、确认弹窗措辞
-  全部改为容器部署的真实说明；「固定上游版本」整块标注为容器内不可用
-  （无上游 git 仓库），并给出 `sync-upstreams.sh --ref` 的替代做法。
-  CI 增加断言：补丁必须落地，且旧的误导文案必须消失。
 
 ### 新增
 
@@ -102,33 +141,30 @@
 
 | 上游 | 分支 | Commit | 提交时间 |
 |---|---|---|---|
-| Sliverkiss/workbuddy2api | `master` | `39f3c3f` | 2026-09-15 14:17 |
-| ithtelab/workbuddy-manager | `main` | `3ed6c48` | 2026-09-15 13:47 |
+| Sliverkiss/workbuddy2api | `master` | `0adc345` | 2026-09-15 23:37 |
+| ithtelab/workbuddy-manager | `main` | `1f5ccef` | 2026-09-16 00:38 |
 
-- wb2api：`fix(scheduler): 去串行化 + sleep 换 select-ctx 可取消`
-  （含 20+ 提交：熔断与模型冷却持久化、429 冷却对齐上游重置时间、
-  tool_call 配对清理与截断检测、推理档位透出、跨平台路径修复、
-  `prompt_cache_key` 费用优化）
-- manager：`improve(update): deploy/ 差异提示说清「要不要紧」`
-  （面板显示版本 **v1.0.31**）
+- wb2api：`feat(models): /v3/config 双域并集探测——v3 为主、企业端点补缺`
+  （含模型清单**纯动态化**：删除 CN/global 静态 fallback 表）
+- manager：仓库保护规则文档（面板显示版本 **v1.0.35**；
+  含 **API 密钥限定版本**——国内版/国际版彻底分开、仪表盘按版本过滤）
 
 ### 集成层核对（同步后）
 
-- **三处补丁全部正常应用**（共 10 个替换点）。wb2api 的 `client.go` 本次
-  改动很大，但 `http.Transport` 构造处未变；manager 的 `http_client()` 与
-  `UpdatePanel.tsx` 均未变。
-- **SSRF 守卫不冲突**：manager 本次新增 SSRF 防护（`_reject_internal_host`），
-  但它只作用于用户可传 URL 的接口（Upstash 连通性测试），
-  **不在 manager 调自己上游的路径上**，与补丁 1 的内网直连不冲突。
-- **替身脚本契约未变**：新版 `deploy/update.py` 的 `--target` 与状态文件
-  约定与替身一致。
+- **补丁 3 的锚点被上游改动拦下（fail-fast 生效）**：上游把更新面板从
+  "容器/裸机"文案改为**能力驱动**（`can_update_upstream`，用 `docker info`
+  能否跑通判断）。补丁 3 的旧锚点因此失效，**构建按设计失败并指出要改哪里**，
+  而不是静默跳过留下误导文案。已按上游新结构更新锚点，并把新增的
+  后端提示语纳入补丁（现共 12 个替换点）。
+- **能力判定与本发行版实际相符**：manager 经 `docker-socket-proxy` 访问
+  docker 且关闭了 `INFO` 段（安全收紧）→ `docker info` 失败 →
+  `can_update_upstream=False` → 界面自动禁用「更新上游」并提示宿主机操作。
+  方向正确，但上游提示语提到"未挂载 `/var/run/docker.sock`"与实际情况不符
+  （我们挂了代理，只是关了 `/info`），已修正为说明真实原因。
 - **配置模板无需改**：上游 `config.example.json` 零差异。
 - **env 变量集合未变**（21 个）：compose 无需调整。
 - **Dockerfile COPY 清单未变**：无需跟改。
-
-> **Go 测试已全绿**：先前那 2 个在 Windows 上必现失败（`rate_limited_models`
-  依赖亚毫秒时钟精度）的用例，被上游本次改动顺带修掉了。现在
-  `go test ./...` 在 Windows 上也是 16/16 包全过。
+- **Go 测试保持全绿**（16/16 包）：上游先前已修掉那 2 个 Windows 时钟问题。
 
 ### 新增
 

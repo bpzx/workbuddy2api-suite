@@ -92,7 +92,17 @@ services:
       # 直接把 7864 暴露公网，否则 IP 类管控与登录锁定会失去意义。
       WB_TRUST_PROXY: "1"
       WB_TRUSTED_PROXY_HOPS: ${WB_TRUSTED_PROXY_HOPS:-1}
-      # 上游仓库（用于「检测更新」比对远端最新提交；容器内无 git，本地版本显示未知）
+      # ── 版本检测 ──
+      # WB_MANAGER_REPO：manager 拿它去 GitHub 查"最新 Release"，
+      # 与容器内的当前版本比较，在界面上显示
+      #   「管理端：v1.0.31 → v1.0.35」
+      # 这个提示的用途是**提醒你上游发新版了、该去同步快照**，
+      # 而不是说本套件镜像需要更新（本套件更新走 compose pull）。
+      #
+      # 因此**保持指向上游仓库**（默认值即 ithtelab/workbuddy-manager）：
+      # 容器内的 current_version 读的正是 vendored 快照带进来的上游版本号，
+      # 两边同源，比较才有意义。
+      # WB_MANAGER_REPO: ithtelab/workbuddy-manager   # 需要覆盖时解开
       WB_UPSTREAM_API_REPO: Sliverkiss/workbuddy2api
       # docker CLI 走 socket 代理，而不是直接挂宿主 socket
       DOCKER_HOST: tcp://dockerproxy:2375

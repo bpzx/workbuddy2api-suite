@@ -5,6 +5,8 @@ import {AnimatePresence, motion} from 'motion/react';
 import {Brain, Check, ChevronUp, Send, Sparkles, Square} from 'lucide-react';
 
 import {cn} from '@/lib/utils';
+import {t} from '@/lib/i18n';
+import {useT} from '@/lib/i18n/provider';
 
 export interface ChatModelOption {
   id: string;
@@ -13,19 +15,21 @@ export interface ChatModelOption {
   series: string;
 }
 
-/** 档位中文标注；与上游 effortRank 的取值对齐（off…max） */
-const EFFORT_LABEL: Record<string, string> = {
-  off: '关闭',
-  minimal: '最低',
-  low: '低',
-  medium: '中',
-  high: '高',
-  xhigh: '很高',
-  max: '最高',
+/** 档位 → i18n 键；取值与上游 effortRank 对齐（off…max） */
+const EFFORT_LABEL_KEYS: Record<string, string> = {
+  off: 'effort.off',
+  minimal: 'effort.minimal',
+  low: 'effort.low',
+  medium: 'effort.medium',
+  high: 'effort.high',
+  xhigh: 'effort.xhigh',
+  max: 'effort.max',
 };
 
+/** 档位显示名（非组件环境也能用：读模块级当前语言）。 */
 export function effortLabel(v: string): string {
-  return EFFORT_LABEL[v] || v;
+  const key = EFFORT_LABEL_KEYS[v];
+  return key ? t(key) : v;
 }
 
 interface Props {
@@ -66,14 +70,11 @@ export function AiChatInput({
   onModelChange,
   effort,
   onEffortChange,
-  placeholders = [
-    '问点什么，试试这个模型…',
-    '写一段快速排序',
-    '解释一下这段报错',
-    '把它改写成 TypeScript',
-    '总结这篇文章的要点',
-  ],
+  placeholders,
 }: Props) {
+  const t = useT();
+  // 占位符跟随语言：默认值必须在组件内生成，否则模块加载时就固定成一种语言
+  const hints = placeholders ?? ['chat.ph1', 'chat.ph2', 'chat.ph3', 'chat.ph4', 'chat.ph5'].map((k) => t(k));
   const [phIndex, setPhIndex] = useState(0);
   const [showPh, setShowPh] = useState(true);
   const [isActive, setIsActive] = useState(false);
@@ -87,15 +88,15 @@ export function AiChatInput({
   // 失焦且无内容时循环切换占位符
   useEffect(() => {
     if (expanded) return;
-    const t = setInterval(() => {
+    const timer = setInterval(() => {
       setShowPh(false);
       setTimeout(() => {
-        setPhIndex((p) => (p + 1) % placeholders.length);
+        setPhIndex((p) => (p + 1) % hints.length);
         setShowPh(true);
       }, 400);
     }, 3200);
-    return () => clearInterval(t);
-  }, [expanded, placeholders.length]);
+    return () => clearInterval(timer);
+  }, [expanded, hints.length]);
 
   // 点击外部收起下拉（但不收起输入框本身，避免输入到一半被切走）
   useEffect(() => {
@@ -174,7 +175,7 @@ export function AiChatInput({
                     exit={{opacity: 0, filter: 'blur(10px)', y: -6}}
                     transition={{duration: 0.28}}
                   >
-                    {placeholders[phIndex]}
+                    {hints[phIndex]}
                   </motion.span>
                 )}
               </AnimatePresence>
@@ -186,7 +187,7 @@ export function AiChatInput({
             <button
               type="button"
               onClick={onStop}
-              title="停止生成"
+              title={t('chat.stop')}
               className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-foreground text-background transition-colors hover:opacity-90"
             >
               <Square className="h-3.5 w-3.5" fill="currentColor" />
@@ -196,7 +197,7 @@ export function AiChatInput({
               type="button"
               onClick={submit}
               disabled={!canSend}
-              title="发送（Enter）"
+              title={t('chat.send')}
               className={cn(
                 'flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition-all',
                 canSend
@@ -238,7 +239,7 @@ export function AiChatInput({
                   >
                     <Sparkles className="h-3.5 w-3.5 text-muted-foreground" />
                     <span className="max-w-[160px] truncate">
-                      {current ? current.name || current.id : model || '选择模型'}
+                      {current ? current.name || current.id : model || t('chat.selectModel')}
                     </span>
                     {effort && effort !== 'off' && (
                       <span className="text-muted-foreground">· {effortLabel(effort)}</span>
@@ -260,7 +261,7 @@ export function AiChatInput({
                       >
                         {models.length === 0 && (
                           <div className="px-3 py-4 text-center text-[11px] text-muted-foreground">
-                            没有可用模型，请先在「模型中心」确认账号可用
+                            {t('chat.noModels')}
                           </div>
                         )}
                         {models.map((m) => {
@@ -295,7 +296,7 @@ export function AiChatInput({
                                 </span>
                                 <span className="mt-0.5 block truncate font-mono text-[10px] text-muted-foreground">
                                   {m.id}
-                                  {m.efforts.length > 0 && ` · 推理 ${m.efforts.join('/')}`}
+                                  {m.efforts.length > 0 && t('chat.reasoningSuffix', {efforts: m.efforts.join('/')})}
                                 </span>
                               </span>
                               {on && <Check className="mt-0.5 h-3.5 w-3.5 shrink-0" />}
@@ -312,11 +313,7 @@ export function AiChatInput({
                   <button
                     type="button"
                     disabled={supported.length === 0}
-                    title={
-                      supported.length
-                        ? '推理档位（reasoning_effort）'
-                        : '该模型未声明推理档位，上游不支持调整'
-                    }
+                    title={supported.length ? t('chat.effortTitle') : t('chat.effortUnsupported')}
                     onClick={(e) => {
                       e.stopPropagation();
                       if (!supported.length) return;
@@ -331,7 +328,7 @@ export function AiChatInput({
                     )}
                   >
                     <Brain className="h-3.5 w-3.5 text-muted-foreground" />
-                    {effort ? effortLabel(effort) : '思考强度'}
+                    {effort ? effortLabel(effort) : t('chat.effort')}
                     <ChevronUp
                       className={cn('h-3 w-3 transition-transform', effortOpen && 'rotate-180')}
                     />
@@ -358,7 +355,7 @@ export function AiChatInput({
                             !effort ? 'bg-muted' : 'hover:bg-muted/60',
                           )}
                         >
-                          不指定
+                          {t('chat.effortUnset')}
                           {!effort && <Check className="h-3 w-3" />}
                         </button>
                         {supported.map((e) => (
@@ -384,7 +381,7 @@ export function AiChatInput({
                 </div>
 
                 <span className="ml-auto hidden text-[10px] text-muted-foreground/70 sm:inline">
-                  Enter 发送 · Shift+Enter 换行
+                  {t('chat.keyboardHint')}
                 </span>
               </div>
             </motion.div>

@@ -131,8 +131,9 @@ func TestBreakerPersistFailsNotPersisted(t *testing.T) {
 	p.Flush()
 
 	// 落盘 JSON 不应含 breaker_fails（运行态，不持久化）。
+	// 注意用精确匹配：session_dead_fails 等字段已显式写出，"fails" 裸子串会误伤。
 	raw, _ := os.ReadFile(fp)
-	if strings.Contains(string(raw), "breaker_fails") || strings.Contains(string(raw), "fails") {
+	if strings.Contains(string(raw), `"breaker_fails"`) || strings.Contains(string(raw), `"fails"`) {
 		t.Errorf("fails 不应落盘:\n%s", raw)
 	}
 
@@ -184,8 +185,9 @@ func TestCreditsExpiringPersistRoundTrip(t *testing.T) {
 	}
 }
 
-// TestCreditsExpiringPersistOmitZero creditsExpiring=0 时落盘 omitempty 不写。
-func TestCreditsExpiringPersistOmitZero(t *testing.T) {
+// TestCreditsExpiringPersistWritesZero creditsExpiring=0 时也显式落盘
+// （运维口径：零值缺失会误解为"没记录"，实际是零值省略——stateAccount 去 omitempty）。
+func TestCreditsExpiringPersistWritesZero(t *testing.T) {
 	dir := t.TempDir()
 	fp := dir + "/state.json"
 	p := New(fp)
@@ -194,8 +196,8 @@ func TestCreditsExpiringPersistOmitZero(t *testing.T) {
 	p.Flush()
 
 	raw, _ := os.ReadFile(fp)
-	if strings.Contains(string(raw), "credits_expiring") {
-		t.Errorf("creditsExpiring=0 时不应落盘:\n%s", raw)
+	if !strings.Contains(string(raw), `"credits_expiring": 0`) {
+		t.Errorf("creditsExpiring=0 时也应显式写出（运维可见）:\n%s", raw)
 	}
 }
 

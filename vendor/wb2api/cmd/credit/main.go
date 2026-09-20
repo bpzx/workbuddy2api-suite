@@ -19,8 +19,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
-	"sort"
 	"time"
 
 	"workbuddy2api/internal/auth"
@@ -52,9 +50,10 @@ func main() {
 
 // collect 遍历 auths 目录并查询每个账号的积分摘要。供测试注入 fake upstream 断言
 // realm 路由（main 从 os.Args/env 取况，collect 单一来源可测）。
+// 文件清单走 auth.LoadAuthFiles（宽侧 workbuddy*.json）：与网关 LoadDir 同口径，
+// 不带连字符的文件不再被跳过（P2-10，审查发现 10）。
 func collect(authDir string, up *upstream.Client) []accountResult {
-	files, _ := filepath.Glob(filepath.Join(authDir, "workbuddy-*.json"))
-	sort.Strings(files)
+	files, _ := auth.LoadAuthFiles(authDir)
 	accounts := make([]accountResult, 0, len(files))
 	for _, f := range files {
 		raw, err := os.ReadFile(f)

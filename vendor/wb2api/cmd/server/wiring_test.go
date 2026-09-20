@@ -1,6 +1,7 @@
 package main
 
 import (
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -29,9 +30,9 @@ func TestRealmAwareAvailableForModel(t *testing.T) {
 		model string
 		want  []string
 	}{
-		{"glm-5.2", []string{"cn1"}},           // 裸名 → cn 集合
-		{"cn:glm-5.2", []string{"cn1"}},        // 显式 cn 前缀 → cn 集合
-		{"global:gpt-5.4", []string{"g1"}},     // global 前缀 → global 集合
+		{"glm-5.2", []string{"cn1"}},       // 裸名 → cn 集合
+		{"cn:glm-5.2", []string{"cn1"}},    // 显式 cn 前缀 → cn 集合
+		{"global:gpt-5.4", []string{"g1"}}, // global 前缀 → global 集合
 	}
 	for _, c := range cases {
 		if got := fn(c.model); !reflect.DeepEqual(got, c.want) {
@@ -75,9 +76,9 @@ func TestRealmAwareAvailableForModelDefaultOnCNZeroRegression(t *testing.T) {
 		model string
 		want  []string
 	}{
-		{"glm-5.2", []string{"cn1", "cn2"}},       // 裸名 → cn 集合（现状零回归）
-		{"cn:glm-5.2", []string{"cn1", "cn2"}},    // cn 前缀 → cn 集合
-		{"global:gpt-5.4", nil},                   // global 前缀 → 纯 CN 池无可用（不对 spread）
+		{"glm-5.2", []string{"cn1", "cn2"}},    // 裸名 → cn 集合（现状零回归）
+		{"cn:glm-5.2", []string{"cn1", "cn2"}}, // cn 前缀 → cn 集合
+		{"global:gpt-5.4", nil},                // global 前缀 → 纯 CN 池无可用（不对 spread）
 	}
 	for _, c := range cases {
 		want := c.want
@@ -86,6 +87,28 @@ func TestRealmAwareAvailableForModelDefaultOnCNZeroRegression(t *testing.T) {
 		}
 		if got := fn(c.model); !reflect.DeepEqual(got, want) {
 			t.Errorf("AvailableForModel(%q)=%v want %v", c.model, got, want)
+		}
+	}
+}
+
+// TestModelJSONPath model.json 路径推导（context_length 四级查找链第 3 级接线）：
+// 与 state.json 同目录同名换缀（Docker ./data volume 持久化）；空 state 路径 →
+// 空串（禁用落盘，内存 + 种子仍可用）。
+func TestModelJSONPath(t *testing.T) {
+	cases := []struct {
+		state, want string
+	}{
+		{"./data/state.json", "data/model.json"},
+		{"/app/data/state.json", "/app/data/model.json"},
+		{"state.json", "model.json"},
+		{"", ""},
+	}
+	for _, c := range cases {
+		// 归一化 got 侧：modelJSONPath 走 filepath.Join，Windows 产出反斜杠；
+		// want 本就是正斜杠字面量（跨平台规范形式），对 want 做 ToSlash 是无操作，
+		// 反斜杠会原样留在 got 里导致断言在 Windows 必然失败。
+		if got := filepath.ToSlash(modelJSONPath(c.state)); got != c.want {
+			t.Errorf("modelJSONPath(%q)=%q want %q", c.state, got, c.want)
 		}
 	}
 }

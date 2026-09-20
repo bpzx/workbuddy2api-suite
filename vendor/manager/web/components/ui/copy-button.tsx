@@ -5,6 +5,7 @@ import {Check, Copy, Loader2, Share2} from 'lucide-react';
 import {copyText} from '@/lib/format';
 import {notify} from '@/lib/toast';
 import {Button} from '@/components/ui/button';
+import {useT} from '@/lib/i18n/provider';
 import {cn} from '@/lib/utils';
 
 /**
@@ -22,7 +23,7 @@ import {cn} from '@/lib/utils';
 export function CopyButton({
   value,
   label,
-  title = '复制',
+  title,
   className,
   variant = 'ghost',
   size = 'icon',
@@ -42,6 +43,7 @@ export function CopyButton({
   showLabel?: boolean;
   disabled?: boolean;
 }) {
+  const t = useT();
   const [state, setState] = useState<'idle' | 'done' | 'busy'>('idle');
 
   async function onCopy() {
@@ -50,15 +52,15 @@ export function CopyButton({
     const ok = await copyText(value);
     if (ok) {
       setState('done');
-      notify.ok('已复制到剪贴板');
+      notify.ok(t('common.copiedToClipboard'));
       window.setTimeout(() => setState('idle'), 1500);
     } else {
       setState('idle');
-      notify.err('复制失败', '可长按选中后手动复制');
+      notify.err(t('common.copyFailed'), t('common.manualCopy'));
     }
   }
 
-  const text = label || title;
+  const text = label || title || t('common.copy');
 
   return (
     <Button
@@ -79,7 +81,7 @@ export function CopyButton({
       ) : (
         <Copy className="h-3.5 w-3.5" />
       )}
-      {showLabel && <span className="ml-1.5">{state === 'done' ? '已复制' : text}</span>}
+      {showLabel && <span className="ml-1.5">{state === 'done' ? t('common.copied') : text}</span>}
     </Button>
   );
 }
@@ -102,6 +104,7 @@ export function ShareButton({
   className?: string;
   disabled?: boolean;
 }) {
+  const t = useT();
   const [supported, setSupported] = useState(false);
   // 挂载后再判断：静态导出阶段没有 navigator，直接读会报错
   useEffect(() => {
@@ -128,7 +131,7 @@ export function ShareButton({
       }}
     >
       <Share2 className="h-3.5 w-3.5" />
-      分享
+      {t('common.share')}
     </Button>
   );
 }

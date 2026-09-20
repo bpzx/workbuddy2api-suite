@@ -21,8 +21,10 @@ import time
 from .. import db
 from . import tencent
 
-# uid -> (查询时间戳, 是否成功, 积分值, 消息)
-_cache: dict[str, tuple[float, bool, int | float | None, str]] = {}
+# uid -> (查询时间戳, 是否成功, 积分值, 消息, 到期列表)
+# 到期列表跟着积分一起缓存：两者出自同一次账单请求，分开放会出现「余额是刚查的、
+# 到期时间还是上一分钟那次查询的」这种自相矛盾的展示。
+_cache: dict[str, tuple[float, bool, int | float | None, str, list[dict]]] = {}
 TTL_SECONDS = 60
 
 # 余额快照持久化在 settings 表，重启后仍能继续比对
@@ -32,15 +34,15 @@ _SNAP_KEY = 'credits_snapshot'
 _MAX_DELTA = 1_000_000
 
 
-def cached_credits(uid: str) -> tuple[bool, int | float | None, str] | None:
+def cached_credits(uid: str) -> tuple[bool, int | float | None, str, list[dict]] | None:
     """命中未过期的缓存则返回，否则 None。"""
     item = _cache.get(uid)
     if not item:
         return None
-    ts, ok, credits, message = item
+    ts, ok, credits, message, expiries = item
     if time.time() - ts > TTL_SECONDS:
         return None
-    return ok, credits, message
+    return ok, credits, message, expiries
 
 
 def cache_age(uid: str) -> int | None:
@@ -118,24 +120,25 @@ async def get_credits(
     force: bool = False,
     nickname: str = '',
     record: bool = True,
-) -> tuple[bool, int | float | None, str, bool, int | None]:
+) -> tuple[bool, int | float | None, str, bool, int | None, list[dict]]:
     """查询积分（带 TTL 缓存）。
 
-    返回 (是否成功, 积分, 消息, 是否来自缓存, 缓存已存在秒数)。
+    返回 (是否成功, 积分, 消息, 是否来自缓存, 缓存已存在秒数, 到期列表)。
+    到期列表见 tencent.fetch_credits 的说明。
     真实查询成功且 record=True 时，顺带比对余额并记录积分变动流水。
     """
     uid = str(auth.get('uid') or '')
     if uid and not force:
         hit = cached_credits(uid)
         if hit is not None:
-            ok, credits, message = hit
-            return ok, credits, f'{message}（缓存）', True, cache_age(uid)
+            ok, credits, message, expiries = hit
+            return ok, credits, f'{message}（缓存）', True, cache_age(uid), expiries
 
-    ok, credits, message = await tencent.fetch_credits(auth)
+    ok, credits, message, expiries = await tencent.fetch_credits(auth)
     if uid:
         # 仅缓存成功结果：失败往往是临时网络问题，不该被缓存住
         if ok:
-            _cache[uid] = (time.time(), ok, credits, message)
+            _cache[uid] = (time.time(), ok, credits, message, expiries)
         else:
             _cache.pop(uid, None)
 
@@ -145,7 +148,7 @@ async def get_credits(
         except Exception:  # noqa: BLE001
             pass
 
-    return ok, credits, message, False, None
+    return ok, credits, message, False, None, expiries
 
 
 def invalidate(uid: str | None = None) -> None:

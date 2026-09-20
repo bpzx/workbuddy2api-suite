@@ -6,6 +6,8 @@ import {
   Gift,
   Zap,
   KeyRound,
+  Pause,
+  Play,
   Trash2,
   Plus,
   Users,
@@ -17,14 +19,17 @@ import {
 import {useHeartbeat} from '@/lib/use-heartbeat';
 import {notify} from '@/lib/toast';
 import {accountApi, upstreamApi, errText} from '@/lib/api';
-import type {Account, CreditsMeta, UpstreamStatus} from '@/lib/types';
+import type {Account, CreditExpiry, CreditsMeta, UpstreamStatus} from '@/lib/types';
 import {expiryBarPercent, expiryVisual, fmtAgo, fmtDateTime, fmtNumber, fmtRemain} from '@/lib/format';
+import {availabilityLabelKey, availabilityOf, isDegraded, mergePoolStatus} from '@/lib/account-status';
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {EmptyState} from '@/components/common/layout/EmptyState';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
 import {AddAccountDialog} from '@/components/common/accounts/AddAccountDialog';
+import {CreditCountdown} from '@/components/common/accounts/CreditCountdown';
 import {useAuth} from '@/lib/auth-context';
 import {realmLabel, useRealm} from '@/lib/realm-context';
+import {useT} from '@/lib/i18n/provider';
 import {Button} from '@/components/ui/button';
 import {Badge} from '@/components/ui/badge';
 import {
@@ -38,6 +43,7 @@ import {
 
 export default function AccountsPage() {
   const {realm, label: realmName} = useRealm();
+  const t = useT();
   const {isAdmin} = useAuth();
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [upstream, setUpstream] = useState<UpstreamStatus | null>(null);
@@ -112,9 +118,9 @@ export default function AccountsPage() {
       );
       setCreditsMeta(r.meta ?? {});
       if (r.failed.length === 0) {
-        notify.ok('积分已刷新', `${r.succeeded}/${r.total} 个账号`);
+        notify.ok(t('accounts.creditsRefreshed'), t('accounts.creditsRefreshedDetail', {ok: r.succeeded, total: r.total}));
       } else {
-        notify.warn('部分账号积分未取到', `${r.succeeded}/${r.total} 成功，其余见账号状态`);
+        notify.warn(t('accounts.creditsPartial'), t('accounts.creditsPartialDetail', {ok: r.succeeded, total: r.total}));
       }
     } catch (e) {
       notify.err(errText(e));
@@ -130,11 +136,14 @@ export default function AccountsPage() {
       const r = await accountApi.checkinAll();
       const failed = r.total - r.succeeded;
       if (r.total === 0) {
-        notify.info('没有可签到的账号');
+        notify.info(t('accounts.noCheckinTargets'));
       } else if (failed === 0) {
-        notify.ok(`全部签到完成`, `${r.succeeded}/${r.total} 个账号成功`);
+        notify.ok(t('accounts.checkinAllDone'), t('accounts.checkinAllDoneDetail', {ok: r.succeeded, total: r.total}));
       } else {
-        notify.warn(`签到完成，${failed} 个失败`, `${r.succeeded}/${r.total} 个账号成功，详见「任务记录」页`);
+        notify.warn(
+          t('accounts.checkinPartial', {failed}),
+          t('accounts.checkinPartialDetail', {ok: r.succeeded, total: r.total}),
+        );
       }
       await load();
     } catch (e) {
@@ -144,27 +153,14 @@ export default function AccountsPage() {
     }
   }, [load]);
 
-  /** 将本地 auths 文件与上游账号池状态按 uid 合并 */
-  const merged = useMemo(() => {
-    const pool = new Map<string, Record<string, unknown>>();
-    for (const item of upstream?.accounts ?? []) {
-      const uid = String((item as Record<string, unknown>).uid ?? (item as Record<string, unknown>).UID ?? '');
-      if (uid) pool.set(uid, item as Record<string, unknown>);
-    }
-    return accounts.map((a) => {
-      const p = pool.get(a.uid);
-      if (!p) return a;
-      return {
-        ...a,
-        healthy: typeof p.healthy === 'boolean' ? p.healthy : null,
-        disabled: typeof p.disabled === 'boolean' ? p.disabled : null,
-        disabled_reason: typeof p.disabled_reason === 'string' ? p.disabled_reason : '',
-        in_flight: typeof p.in_flight === 'number' ? p.in_flight : null,
-        cooling: typeof p.cooling === 'boolean' ? p.cooling : null,
-        last_used: typeof p.last_used === 'number' ? p.last_used : null,
-      } satisfies Account;
-    });
-  }, [accounts, upstream]);
+  /**
+   * 将本地 auths 文件与上游账号池状态按 uid 合并。
+   *
+   * 合并与分档规则都在 `lib/account-status` 里——首页的健康快照要用**同一套**
+   * 规则（此前它只看 Token 有效期，于是同一个账号首页说「在线」、这里说
+   * 「未加载」，用户看到自相矛盾的面板）。
+   */
+  const merged = useMemo(() => mergePoolStatus(accounts, upstream), [accounts, upstream]);
 
   /**
    * 按当前版本过滤。
@@ -182,11 +178,23 @@ export default function AccountsPage() {
   async function run(file: string, fn: () => Promise<unknown>, okMsg: string) {
     setBusyFile(file);
     try {
-      const res = (await fn()) as {message?: string; ok?: boolean; credits?: number | null};
+      const res = (await fn()) as {
+        message?: string;
+        ok?: boolean;
+        credits?: number | null;
+        expiries?: CreditExpiry[];
+      };
       const ok = res.ok !== false;
-      // 签到会返回刷新后的实时积分，直接就地更新，省一次请求
+      // 签到会返回刷新后的实时积分与到期时间，直接就地更新，省一次请求
       if (typeof res.credits === 'number') {
         setAccounts((prev) => prev.map((a) => (a.file === file ? {...a, credits: res.credits} : a)));
+        const uid = accounts.find((a) => a.file === file)?.uid;
+        if (uid && res.expiries) {
+          setCreditsMeta((prev) => ({
+            ...prev,
+            [uid]: {...prev[uid], cached: false, cache_age: null, expiries: res.expiries},
+          }));
+        }
       }
       (ok ? notify.ok : notify.err)(res.message || okMsg);
       await load();
@@ -204,7 +212,7 @@ export default function AccountsPage() {
     setRestarting(true);
     try {
       const res = await accountApi.restart();
-      (res.ok ? notify.ok : notify.err)(res.message || '已重启上游');
+      (res.ok ? notify.ok : notify.err)(res.message || t('accounts.restarted'));
       await load();
     } catch (e) {
       notify.err(errText(e));
@@ -213,51 +221,141 @@ export default function AccountsPage() {
     }
   }
 
-  /** 账号状态徽章（表格与移动端卡片共用） */
+  /** 账号状态徽章（表格与移动端卡片共用）。
+   *
+   *  分档顺序与文案都取自 `lib/account-status`——首页的健康快照用**同一套**
+   *  判定，两页因此不会对同一个账号给出不同说法（此前首页只看 Token 有效期，
+   *  于是同一个账号首页说「在线」、这里说「未加载」）。
+   *  这里只负责「怎么画」，不再自行判断。 */
   function renderStatus(a: Account) {
-    if (a.disabled === true) {
-      // 上游对 11140（request illegal）是**硬禁用**、到期也不自愈，必须重新登录
-      // 才能恢复；只说「已禁用」会让人干等。原因里含 11140/request illegal 时
-      // 直接提示要重新授权。
+    const tier = availabilityOf(a);
+    const label = t(availabilityLabelKey(tier, a));
+
+    if (tier === 'disabled') {
       const reason = String(a.disabled_reason || '');
-      const needRelogin = /11140|request illegal/i.test(reason);
       return (
         <Badge
           variant="destructive"
           className="rounded-full"
-          title={reason ? `禁用原因：${reason}` : undefined}
+          title={reason ? t('accounts.disabledReason', {reason}) : undefined}
         >
-          ● {needRelogin ? '已禁用（需重新登录）' : '已禁用'}
+          {label}
         </Badge>
       );
     }
-    if (a.is_expired) return <Badge variant="destructive" className="rounded-full">● 已过期</Badge>;
-    if (a.cooling) {
+    if (tier === 'disabledByPanel') {
+      // 面板主动禁用：中性灰而不是告警红——这是用户自己的选择，不是故障。
+      return (
+        <Badge
+          variant="secondary"
+          className="rounded-full text-muted-foreground"
+          title={t('accounts.badgeDisabledByPanelTitle')}
+        >
+          {label}
+        </Badge>
+      );
+    }
+    if (tier === 'expired') {
+      return <Badge variant="destructive" className="rounded-full">{label}</Badge>;
+    }
+    // 上游状态这次没取到 —— 冷却 / 禁用 / 在不在池里**全都无从判断**。
+    // 本地能确定的（令牌是否过期）已在分档里先判过，不受影响。
+    if (tier === 'unknown') {
+      return (
+        <Badge
+          variant="secondary"
+          className="rounded-full text-muted-foreground"
+          title={t('accounts.badgeUnknownTitle')}
+        >
+          {label}
+        </Badge>
+      );
+    }
+    if (tier === 'cooling') {
       // 带上「还要等多久」：只写「冷却中」的话用户不知道是几秒还是几小时，
       // 只能反复刷新碰运气。剩余时间是上游状态机给的权威值。
       const secs = a.cool_remaining_sec;
       const left = typeof secs === 'number' && secs > 0 ? fmtRemain(secs) : '';
-      const models = (a.rate_limited_models ?? []).map((m) => m.model);
+      // 按**原因**分组展示：上游两类条目的含义完全不同，混在一起会误导——
+      //   6004  → 这个模型被限流了（等一会儿就好）
+      //   11102 → 这个账号根本没有这个模型（等多久都不会好，该换模型）
+      // 上游的 reason 前缀就是判据（"6004 model rate limit" / "11102 model not available"）。
+      const limited: string[] = [];
+      const missing: string[] = [];
+      // 枚举分隔符跟随语言：中文用「、」，拉丁语系用「, 」
+      const sep = t('common.listSeparator');
+      for (const m of a.rate_limited_models ?? []) {
+        const r = m.reason ?? '';
+        (r.startsWith('11102') ? missing : limited).push(m.model);
+      }
       const tip = [
-        left ? `预计 ${left}后恢复` : '',
-        models.length ? `被限流的模型：${models.join('、')}` : '',
+        // 降权要**排在剩余时间前面**：它是「为什么在冷却」的答案，而剩余时间
+        // 只是「还要等多久」。先给原因，用户才知道该等还是该去查这个号。
+        isDegraded(a)
+          ? t('accounts.degradedReason', {n: a.consecutive_fails ?? 0})
+          : '',
+        left ? t('accounts.etaRecovery', {left}) : '',
+        limited.length ? t('accounts.limitedModels', {models: limited.join(sep)}) : '',
+        missing.length
+          ? t('accounts.missingModels', {models: missing.join(sep)})
+          : '',
       ]
         .filter(Boolean)
         .join('\n');
+      const total = limited.length + missing.length;
       return (
         <Badge
           variant="secondary"
           className="rounded-full text-amber-600 dark:text-amber-400"
           title={tip || undefined}
         >
-          ● 冷却中{left ? ` · ${left}` : ''}
-          {models.length > 1 && <span className="ml-1 opacity-70">（{models.length} 个模型）</span>}
+          {label}{left ? ` · ${left}` : ''}
+          {total > 0 && <span className="ml-1 opacity-70">{t('accounts.modelsCount', {count: total, n: total})}</span>}
+        </Badge>
+      );
+    }
+    // 「一直在失败，但状态看着正常」——上游对**未命中它那几条规则**的 4xx
+    // （例如被 WAF 拦下的 403）只「换号不罚」：不冷却、不熔断、不禁用
+    // （其 applyErrorPolicy 的 default 分支，为防雪崩而刻意如此）。于是这种
+    // 账号在面板上一直显示「正常」，实际每次请求都失败，可持续几小时
+    // （issue #14 报告的第二点）。我们能做的是**把它标出来** —— 否则用户
+    // 只看到「状态正常」却一直在报错，完全无从下手。
+    if (tier === 'neverSucceeded') {
+      const errs = typeof a.err_total === 'number' ? a.err_total : 0;
+      return (
+        <Badge
+          variant="secondary"
+          className="rounded-full text-rose-600 dark:text-rose-400"
+          title={t('accounts.badgeNeverSucceededTitle', {errs})}
+        >
+          {label}
+        </Badge>
+      );
+    }
+    // 上游没有加载这个账号 —— 它**不在账号池里，永远选不中**。
+    //
+    // 为什么必须单独标：面板读的是 auths/ 目录下的文件，上游读的才是池。
+    // 上游 `LoadDir` 对解析失败的 auth 文件静默跳过（如 accessToken 为空），
+    // 那种文件永远进不了池。此前我们会兜底显示「● 在线」——于是出现
+    // 「面板全绿、调用却报没有健康账号」的矛盾，用户完全无从下手（实测反馈）。
+    //
+    // 也可能只是「刚添加、上游还没重载」，所以文案不写成故障，
+    // 而是说明它尚未进入账号池、并给出可做的动作。
+    if (tier === 'notLoaded') {
+      const why = String(a.invalid_reason || '');
+      return (
+        <Badge
+          variant="secondary"
+          className="rounded-full text-rose-600 dark:text-rose-400"
+          title={why ? t('accounts.badgeNotLoadedWhy', {why}) : t('accounts.badgeNotLoadedTitle')}
+        >
+          {label}
         </Badge>
       );
     }
     return (
       <Badge variant="secondary" className="rounded-full text-emerald-600 dark:text-emerald-400">
-        ● 在线
+        {label}
       </Badge>
     );
   }
@@ -271,7 +369,7 @@ export default function AccountsPage() {
       return (
         <span
           className="text-xs text-muted-foreground"
-          title="上游尚未返回该账号的积分（可能是刚添加、或上游不可达）"
+          title={t('accounts.creditsNoneTitle')}
         >
           —
         </span>
@@ -286,25 +384,26 @@ export default function AccountsPage() {
           : 'text-foreground';
     return (
       <span className="inline-flex items-center gap-1.5">
-        <span className={`text-xs font-medium tabular-nums ${tone}`} title="当前可花费积分余额（所有套餐剩余额度合计）">
+        <span className={`text-xs font-medium tabular-nums ${tone}`} title={t('accounts.creditsTitle')}>
           {fmtNumber(value)}
         </span>
         {meta &&
           (meta.cached ? (
             <span
               className="rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] leading-3 text-amber-600 dark:text-amber-400"
-              title="60 秒内已查过，直接用了服务端缓存；点「刷新积分」可强制重新查询"
+              title={t('accounts.cacheTitle')}
             >
-              {meta.cache_age != null ? `缓存 ${meta.cache_age}s 前` : '缓存'}
+              {meta.cache_age != null ? t('accounts.cacheAge', {n: meta.cache_age}) : t('accounts.cache')}
             </span>
           ) : (
             <span
               className="rounded-full bg-emerald-500/15 px-1.5 py-0.5 text-[10px] leading-3 text-emerald-600 dark:text-emerald-400"
-              title="刚刚向腾讯查询的实时值"
+              title={t('accounts.liveTitle')}
             >
-              实时
+              {t('accounts.live')}
             </span>
           ))}
+        <CreditCountdown expiries={meta?.expiries} />
       </span>
     );
   }
@@ -328,9 +427,9 @@ export default function AccountsPage() {
         {issued != null && (
           <div
             className="mt-1 text-[10px] text-muted-foreground/70"
-            title={`令牌签发于 ${fmtDateTime(issued)}（刷新会换发新令牌）`}
+            title={t('accounts.issuedAt', {at: fmtDateTime(issued)})}
           >
-            最后续期 {fmtAgo(issued)}
+            {t('accounts.lastRenewed', {ago: fmtAgo(issued)})}
           </div>
         )}
       </div>
@@ -343,30 +442,56 @@ export default function AccountsPage() {
     // 国际版没有签到体系（上游对 global 账号直接过滤，不发请求）。
     // 这一行的「签到」按钮对国际版账号只会返回「已跳过」，属误导，故不显示。
     const canCheckin = (a.realm ?? 'cn') === 'cn';
+    const paused = a.disabled_by_panel === true;
     return (
       <div className="flex justify-end gap-1">
-        {canCheckin && (
-          <Button variant="ghost" size="icon" className="h-7 w-7 rounded-md" title="签到" disabled={busy}
-            onClick={() => run(a.file, () => accountApi.checkin(a.file), '操作完成')}>
+        {/* 临时禁用 / 启用（issue #21）。放在最前：它是最轻的「止血」动作——
+            某个号在拖后腿（一直失败、触发风控）时，先停用它比删掉更合适
+            （删除会丢凭证、只能重新扫码；禁用是可逆的）。
+            禁用后签到也要停掉，所以禁用时不显示其它操作。 */}
+        {!paused && canCheckin && (
+          <Button variant="ghost" size="icon" className="h-7 w-7 rounded-md" title={t('accounts.checkin')} disabled={busy}
+            onClick={() => run(a.file, () => accountApi.checkin(a.file), t('accounts.opDone'))}>
             <Gift className="h-3.5 w-3.5" />
           </Button>
         )}
-        <Button variant="ghost" size="icon" className="h-7 w-7 rounded-md" title="连通性测试" disabled={busy}
-          onClick={() => run(a.file, () => accountApi.test(a.file), '测试完成')}>
-          <Zap className="h-3.5 w-3.5" />
-        </Button>
-        <Button variant="ghost" size="icon" className="h-7 w-7 rounded-md" title="刷新 Token" disabled={busy}
-          onClick={() => run(a.file, () => accountApi.refresh(a.file), '刷新完成')}>
-          <KeyRound className="h-3.5 w-3.5" />
+        {!paused && (
+          <>
+            <Button variant="ghost" size="icon" className="h-7 w-7 rounded-md" title={t('accounts.test')} disabled={busy}
+              onClick={() => run(a.file, () => accountApi.test(a.file), t('accounts.testDone'))}>
+              <Zap className="h-3.5 w-3.5" />
+            </Button>
+            <Button variant="ghost" size="icon" className="h-7 w-7 rounded-md" title={t('accounts.refreshToken')} disabled={busy}
+              onClick={() => run(a.file, () => accountApi.refresh(a.file), t('accounts.refreshDone'))}>
+              <KeyRound className="h-3.5 w-3.5" />
+            </Button>
+          </>
+        )}
+        <Button
+          variant="ghost"
+          size="icon"
+          className={
+            'h-7 w-7 rounded-md ' +
+            (paused ? 'text-emerald-600 hover:text-emerald-600' : 'text-amber-600 hover:text-amber-600')
+          }
+          title={paused ? t('accounts.enableTitle') : t('accounts.disableTitle')}
+          disabled={busy}
+          onClick={() => run(
+            a.file,
+            () => accountApi.setDisabled(a.file, !paused),
+            paused ? t('accounts.enabled') : t('accounts.disabled'),
+          )}
+        >
+          {paused ? <Play className="h-3.5 w-3.5" /> : <Pause className="h-3.5 w-3.5" />}
         </Button>
         <ConfirmDialog
-          title={`删除账号「${a.nickname || a.uid}」？`}
-          description="将删除本地授权文件，并自动重载上游使其生效。此操作不可撤销。"
-          confirmText="删除"
+          title={t('accounts.deleteTitle', {name: a.nickname || a.uid})}
+          description={t('accounts.deleteDesc')}
+          confirmText={t('accounts.delete')}
           destructive
-          onConfirm={() => run(a.file, () => accountApi.remove(a.file), '已删除')}
+          onConfirm={() => run(a.file, () => accountApi.remove(a.file), t('accounts.deleted'))}
           trigger={
-            <Button variant="ghost" size="icon" className="h-7 w-7 rounded-md text-red-500 hover:text-red-600" title="删除">
+            <Button variant="ghost" size="icon" className="h-7 w-7 rounded-md text-red-500 hover:text-red-600" title={t('accounts.delete')}>
               <Trash2 className="h-3.5 w-3.5" />
             </Button>
           }
@@ -392,25 +517,25 @@ export default function AccountsPage() {
   return (
     <div className="flex flex-col gap-4 md:gap-6">
       <PageHeader
-        title="账号管理"
+        title={t('accounts.title')}
         description={
           realm === 'global'
-            ? '腾讯 CodeBuddy 账号池（国际版）：Token 有效期与连通性（每 30 秒自动刷新）'
-            : '腾讯 CodeBuddy 账号池：Token 有效期、签到与连通性（每 30 秒自动刷新）'
+            ? t('accounts.descGlobal')
+            : t('accounts.descCn')
         }
         actions={
           <>
             {isAdmin && (
               <ConfirmDialog
-                title="强制重启上游容器？"
-                description="通常无需手动执行：添加或删除账号后会自动重载。仅当上游状态异常、需要强制重载时才使用。重启约 0.5 秒，在途请求会正常完成。"
-                confirmText="重启"
+                title={t('accounts.restartTitle')}
+                description={t('accounts.restartDesc')}
+                confirmText={t('accounts.restartConfirm')}
                 onConfirm={restartUpstream}
                 trigger={
                   <Button variant="outline" size="sm" className="rounded-full" disabled={restarting}>
                     <Power className={restarting ? 'animate-spin' : ''} />
-                    <span className="hidden sm:inline">强制重启</span>
-                    <span className="sm:hidden">重启</span>
+                    <span className="hidden sm:inline">{t('accounts.forceRestart')}</span>
+                    <span className="sm:hidden">{t('accounts.restartShort')}</span>
                   </Button>
                 }
               />
@@ -421,11 +546,11 @@ export default function AccountsPage() {
               className="rounded-full"
               onClick={refreshCredits}
               disabled={creditsBusy || !visible.length}
-              title="直接向腾讯查询各账号当前积分（上游缓存的积分可能滞后数小时）"
+              title={t('accounts.refreshCreditsTitle')}
             >
               <Coins className={creditsBusy ? 'animate-pulse' : ''} />
-              <span className="hidden sm:inline">刷新积分</span>
-              <span className="sm:hidden">积分</span>
+              <span className="hidden sm:inline">{t('accounts.refreshCredits')}</span>
+              <span className="sm:hidden">{t('accounts.creditsShort')}</span>
             </Button>
             {/* 「全部签到」仅国内版显示：国际版**没有签到体系**（上游调度器对
                 global 账号直接过滤，不发请求）。显示一个按下去只会得到「已跳过」
@@ -439,13 +564,13 @@ export default function AccountsPage() {
                 disabled={checkinAllBusy || !visible.length}
               >
                 <CalendarCheck className={checkinAllBusy ? 'animate-pulse' : ''} />
-                全部签到
+                {t('accounts.checkinAll')}
               </Button>
             )}
             {isAdmin && (
               <Button size="sm" className="rounded-full" onClick={() => setAddOpen(true)}>
                 <Plus />
-                添加账号
+                {t('accounts.addAccount')}
               </Button>
             )}
           </>
@@ -467,7 +592,7 @@ export default function AccountsPage() {
                         'truncate text-sm font-medium ' + (a.is_expired ? 'text-muted-foreground' : '')
                       }
                     >
-                      {a.nickname || '未命名'}
+                      {a.nickname || t('accounts.unnamed')}
                     </div>
                     <div className="truncate font-mono text-[10px] text-muted-foreground">{a.uid}</div>
                   </div>
@@ -487,10 +612,10 @@ export default function AccountsPage() {
             </div>
           ))}
           {!visible.length && !loading && (
-            <div className="px-4 py-12 text-center text-xs text-muted-foreground">暂无账号</div>
+            <div className="px-4 py-12 text-center text-xs text-muted-foreground">{t('accounts.tableEmpty')}</div>
           )}
           {loading && !merged.length && (
-            <div className="px-4 py-12 text-center text-xs text-muted-foreground">加载中…</div>
+            <div className="px-4 py-12 text-center text-xs text-muted-foreground">{t('common.loading')}</div>
           )}
         </div>
 
@@ -499,12 +624,12 @@ export default function AccountsPage() {
         <Table>
           <TableHeader>
             <TableRow className="border-b border-border/60 hover:bg-transparent">
-              <TableHead className="pl-4 text-[11px] text-muted-foreground">昵称</TableHead>
+              <TableHead className="pl-4 text-[11px] text-muted-foreground">{t('accounts.colNickname')}</TableHead>
               <TableHead className="text-[11px] text-muted-foreground">UID</TableHead>
-              <TableHead className="text-[11px] text-muted-foreground">状态</TableHead>
-              <TableHead className="text-[11px] text-muted-foreground">积分余额</TableHead>
-              <TableHead className="text-[11px] text-muted-foreground">Token 有效期</TableHead>
-              {isAdmin && <TableHead className="pr-4 text-right text-[11px] text-muted-foreground">操作</TableHead>}
+              <TableHead className="text-[11px] text-muted-foreground">{t('accounts.colStatus')}</TableHead>
+              <TableHead className="text-[11px] text-muted-foreground">{t('metric.credits')}</TableHead>
+              <TableHead className="text-[11px] text-muted-foreground">{t('accounts.colExpiry')}</TableHead>
+              {isAdmin && <TableHead className="pr-4 text-right text-[11px] text-muted-foreground">{t('accounts.colActions')}</TableHead>}
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -514,7 +639,7 @@ export default function AccountsPage() {
                   <div className="flex items-center gap-2.5">
                     {renderAvatar(a)}
                     <span className={'truncate text-sm font-medium ' + (a.is_expired ? 'text-muted-foreground' : '')}>
-                      {a.nickname || '未命名'}
+                      {a.nickname || t('accounts.unnamed')}
                     </span>
                     <Badge
                       variant="secondary"
@@ -543,28 +668,28 @@ export default function AccountsPage() {
         {!visible.length && !loading && (
           <EmptyState
             icon={Users}
-            title="暂无账号"
-            description={isAdmin ? '点击右上角「添加账号」扫码授权' : '请联系管理员添加账号'}
+            title={t('accounts.emptyTitle')}
+            description={isAdmin ? t('accounts.emptyDescAdmin') : t('accounts.emptyDescViewer')}
             className="flex flex-col items-center justify-center py-16 text-center"
           >
             {isAdmin && (
               <Button className="mt-4 rounded-full" onClick={() => setAddOpen(true)}>
                 <Plus />
-                添加账号
+                {t('accounts.addAccount')}
               </Button>
             )}
           </EmptyState>
         )}
         {loading && !merged.length && (
-          <div className="py-16 text-center text-xs text-muted-foreground">加载中…</div>
+          <div className="py-16 text-center text-xs text-muted-foreground">{t('common.loading')}</div>
         )}
       </section>
 
       {/* 签到与任务记录已独立成页（账号一多，堆在本页会越滑越长） */}
       <div className="flex flex-wrap items-center gap-2 px-1 text-[11px] text-muted-foreground">
-        <span>签到结果与上游自动任务记录已移至</span>
+        <span>{t('accounts.movedTo')}</span>
         <Link href="/tasks" className="inline-flex items-center gap-1 rounded-full bg-muted px-2.5 py-1 font-medium text-foreground transition-colors hover:bg-muted/70">
-          任务记录
+          {t('nav.tasks')}
           <ChevronRight className="h-3 w-3" />
         </Link>
       </div>

@@ -3,6 +3,7 @@ package upstream
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -33,12 +34,15 @@ func globalAcct() *auth.Auth {
 	return &auth.Auth{AccessToken: "at", RefreshToken: "rt", UID: "g1", Domain: "www.workbuddy.ai"}
 }
 
-// TestGlobalChatUsesConsolePathAndBase 断言 global 账号的 chat 打到 ChatBaseGlobal + /console/chat/completions，
+// TestGlobalChatUsesV2PathAndBase 断言 global 账号的 chat 打到 ChatBaseGlobal + /v2/chat/completions
+// （#119：/console 挂腾讯云 WAF body 内容规则，固定 /v2 单路径），
 // 且首条消息非 system 时自动补兜底 system（ensureConsoleSystem）。
-func TestGlobalChatUsesConsolePathAndBase(t *testing.T) {
+func TestGlobalChatUsesV2PathAndBase(t *testing.T) {
 	var gotPath, gotOrigin, gotModel string
+	var calls []string
 	var gotMsgs []map[string]any
 	chatSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.URL.Path)
 		gotPath = r.URL.Path
 		gotOrigin = r.Header.Get("Origin")
 		raw, _ := io.ReadAll(r.Body)
@@ -72,8 +76,12 @@ func TestGlobalChatUsesConsolePathAndBase(t *testing.T) {
 	}
 	rc.Close()
 
-	if gotPath != "/console/chat/completions" {
-		t.Errorf("global chat path=%q want /console/chat/completions", gotPath)
+	if gotPath != "/v2/chat/completions" {
+		t.Errorf("global chat path=%q want /v2/chat/completions", gotPath)
+	}
+	// 单路径：出站只打一次，不存在 fallback 二次请求。
+	if len(calls) != 1 {
+		t.Errorf("global chat calls=%v want exactly 1 outbound request (/v2 single path)", calls)
 	}
 	if gotOrigin != "https://www.workbuddy.ai" {
 		t.Errorf("global chat Origin=%q want https://www.workbuddy.ai", gotOrigin)
@@ -87,20 +95,15 @@ func TestGlobalChatUsesConsolePathAndBase(t *testing.T) {
 	}
 }
 
-// TestGlobalChatFallsBackToV2Path 断言 /console 404 时 fallback /v2/chat/completions（同一 base 二次请求）。
-func TestGlobalChatFallsBackToV2Path(t *testing.T) {
+// TestGlobalChatNoFallbackOn404 断言 /v2 单路径下 404 时不再发起第二次请求
+// （#119：global chat 固定 /v2，旧 [console→v2] fallback 链已移除）。
+func TestGlobalChatNoFallbackOn404(t *testing.T) {
 	var calls []string
 	chatSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls = append(calls, r.URL.Path)
-		if r.URL.Path == "/console/chat/completions" {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(404)
-			_, _ = w.Write([]byte(`{"code":404,"msg":"nope"}`))
-			return
-		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(200)
-		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(404)
+		_, _ = w.Write([]byte(`{"code":404,"msg":"nope"}`))
 	}))
 	defer chatSrv.Close()
 	billSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -110,13 +113,13 @@ func TestGlobalChatFallsBackToV2Path(t *testing.T) {
 	defer billSrv.Close()
 
 	c := globalTestClient(t, chatSrv, billSrv)
-	rc, status, _, err := c.ChatStream(globalAcct(), []byte(`{"model":"gpt-5.4","messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"}]}`), "", ChatMeta{})
-	if err != nil || status != 200 {
-		t.Fatalf("chat fallback: status=%d err=%v", status, err)
+	_, status, _, err := c.ChatStream(globalAcct(), []byte(`{"model":"gpt-5.4","messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"}]}`), "", ChatMeta{})
+	var ue *Error
+	if !errors.As(err, &ue) || ue.Kind != ErrNotFound || status != 404 {
+		t.Fatalf("chat 404: want status=404 + *Error{not_found}, got status=%d err=%v", status, err)
 	}
-	rc.Close()
-	if len(calls) != 2 || calls[0] != "/console/chat/completions" || calls[1] != "/v2/chat/completions" {
-		t.Errorf("chat fallback calls=%v want [console, v2]", calls)
+	if len(calls) != 1 || calls[0] != "/v2/chat/completions" {
+		t.Errorf("chat 404 calls=%v want exactly [/v2/chat/completions] (no fallback retry)", calls)
 	}
 }
 
@@ -214,7 +217,8 @@ func TestCNChatPathUnchanged(t *testing.T) {
 	}
 }
 
-// TestGlobalChatServerFallbackErrorCode 断言 fallback 只在 404/405 时发生；500 不发起第二次请求。
+// TestGlobalChatServerFallbackErrorCode 断言 500 时直接返回错误、不发起第二次请求
+// （#119 后 global 单路径，语义与旧「fallback 只在 404/405」收窄为「无 fallback」）。
 func TestGlobalChatServerFallbackErrorCode(t *testing.T) {
 	var calls []string
 	chatSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -232,14 +236,17 @@ func TestGlobalChatServerFallbackErrorCode(t *testing.T) {
 
 	c := globalTestClient(t, chatSrv, billSrv)
 	_, status, _, err := c.ChatStream(globalAcct(), []byte(`{"model":"gpt-5.4","messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"}]}`), "", ChatMeta{})
-	if err != nil {
-		t.Fatalf("chat 500: %v", err)
+	// 5xx 错误路径现在返回**已分类的** *Error（Kind=ErrServer，见 ChatStreamContext
+	// 注释）：err 非 nil 是新契约，传输层错误（非 *Error）仍按抖动处理。
+	var ue *Error
+	if !errors.As(err, &ue) || ue.Kind != ErrServer {
+		t.Fatalf("chat 500: want classified *Error{server}, got %v", err)
 	}
 	if status != 500 {
 		t.Errorf("status=%d want 500", status)
 	}
-	if len(calls) != 1 {
-		t.Errorf("500 should NOT retry /v2, calls=%v", calls)
+	if len(calls) != 1 || calls[0] != "/v2/chat/completions" {
+		t.Errorf("500 calls=%v want exactly [/v2/chat/completions] (no retry)", calls)
 	}
 }
 // TestEffortsKeyedByRealm efforts 缓存按 realm 隔离：CN 探测写入的 supportedEfforts
@@ -259,13 +266,15 @@ func TestEffortsKeyedByRealm(t *testing.T) {
 			_, _ = w.Write([]byte(`{"code":0,"data":{"models":[
 				{"id":"glm-5.2","name":"GLM-5.2","maxInputTokens":131072,"maxOutputTokens":8192,"reasoning":{"effort":"medium","supportedEfforts":["low","medium"]}}
 			],"agents":[{"name":"cli","models":["glm-5.2"]}]}}`))
-		case strings.HasSuffix(r.URL.Path, "/console/chat/completions"):
-			globalBody, _ = io.ReadAll(r.Body)
-			w.Header().Set("Content-Type", "text/event-stream")
-			w.WriteHeader(200)
-			_, _ = w.Write([]byte("data: [DONE]\n\n"))
 		case strings.HasSuffix(r.URL.Path, "/v2/chat/completions"):
-			cnBody, _ = io.ReadAll(r.Body)
+			// #119 后 global/cn chat 均打 /v2：global 先到（RealmAcct）——按 Bearer 区分
+			// 归属桶（globalAcct/cn 共用同一 chat base 指向本 srv）。
+			switch r.Header.Get("Authorization") {
+			case "Bearer at-global":
+				globalBody, _ = io.ReadAll(r.Body)
+			default:
+				cnBody, _ = io.ReadAll(r.Body)
+			}
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(200)
 			_, _ = w.Write([]byte("data: [DONE]\n\n"))
@@ -293,7 +302,9 @@ func TestEffortsKeyedByRealm(t *testing.T) {
 	}
 
 	// step 2：global 账号同模型名请求 → 不应命中 CN 探测的 supportedEfforts，原样透传 high。
-	rc, status, _, err := c.ChatStream(globalAcct(), []byte(`{"model":"glm-5.2","reasoning_effort":"high","messages":[{"role":"system","content":"s"}]}`), "", ChatMeta{})
+	glb := globalAcct()
+	glb.AccessToken = "at-global"
+	rc, status, _, err := c.ChatStream(glb, []byte(`{"model":"glm-5.2","reasoning_effort":"high","messages":[{"role":"system","content":"s"}]}`), "", ChatMeta{})
 	if err != nil || status != 200 {
 		t.Fatalf("global chat: status=%d err=%v", status, err)
 	}

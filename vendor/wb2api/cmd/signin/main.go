@@ -8,10 +8,10 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/logfmt"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -30,12 +30,13 @@ func main() {
 	if len(os.Args) > 1 {
 		dir = os.Args[1]
 	}
-	files, err := filepath.Glob(filepath.Join(dir, "workbuddy-*.json"))
+	// 文件清单走 auth.LoadAuthFiles（宽侧 workbuddy*.json）：与网关 LoadDir 同口径，
+	// 不带连字符的文件不再被跳过（P2-10，审查发现 10）。
+	files, err := auth.LoadAuthFiles(dir)
 	if err != nil || len(files) == 0 {
 		fmt.Fprintf(os.Stderr, "no auth files in %s\n", dir)
 		os.Exit(1)
 	}
-	sort.Strings(files)
 	up := upstream.New()
 	// 允许按 realm 路由：global 账号的签到/余额会打到 global base（workbuddy.ai），
 	// 由幂等码兜底为「未开启/不适用」，而不是误打到 CN base 产生签到成功的假象。
@@ -66,11 +67,7 @@ func main() {
 		// refresh 过期 token
 		if a.NeedsRefresh(2 * 3600) {
 			if err := up.RefreshToken(a); err != nil {
-				if ue, ok := err.(*upstream.Error); ok && ue.Kind == upstream.ErrSessionDead {
-					r.status = "AUTH_INVALID"
-				} else {
-					r.status = "FAIL"
-				}
+				r.status = refreshStatusOf(err)
 				r.detail = "refresh: " + short(err.Error())
 				rows = append(rows, r)
 				failN++
@@ -112,7 +109,7 @@ func main() {
 			remain = fmt.Sprintf("%d", r.remain)
 		}
 		fmt.Printf("%-36s | %-11s | %-12s | %-6s | %s\n",
-			trunc(r.uid, 36), trunc(r.nick, 11), r.status, remain, r.detail)
+			logfmt.Truncate(r.uid, 36), logfmt.Truncate(r.nick, 11), r.status, remain, r.detail)
 	}
 	fmt.Printf("\ntotal=%d ok=%d already=%d fail=%d\n", len(rows), okN, alreadyN, failN)
 }
@@ -211,6 +208,17 @@ func idempotentMatch(msg string) bool {
 	return false
 }
 
+// refreshStatusOf RefreshToken 失败的归一化状态（纯函数，供 main 循环与测试直接断言）：
+// session 失效（401 12153 离线）→ AUTH_INVALID（需人工重登，区别于普通失败）；
+// 其余一律 FAIL。
+func refreshStatusOf(err error) string {
+	var ue *upstream.Error
+	if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+		return "AUTH_INVALID"
+	}
+	return "FAIL"
+}
+
 // checkinStatusOf DailyCheckin 结果的归一化状态（纯函数，供 main 循环与测试直接断言）：
 // 成功 → OK；幂等码（已签到/不适用）→ ALREADY；其余一律 FAIL。
 func checkinStatusOf(err error) string {
@@ -221,13 +229,6 @@ func checkinStatusOf(err error) string {
 		return "ALREADY"
 	}
 	return "FAIL"
-}
-
-func trunc(s string, n int) string {
-	if len(s) > n {
-		return s[:n]
-	}
-	return s
 }
 
 func short(s string) string {

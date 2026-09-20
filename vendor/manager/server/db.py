@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -9,6 +10,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from . import config
+
+logger = logging.getLogger('workbuddy.db')
 
 _lock = threading.RLock()
 _conn: sqlite3.Connection | None = None
@@ -31,8 +34,43 @@ def day_sql(column: str = 'ts') -> str:
 
     注意 SQLite 的 date(ts,'unixepoch') 是 UTC，不能直接用它——那正是
     之前造成口径不一致的原因。这里用 'unixepoch','localtime' 两个修饰符。
+
+    **当心索引失效**：这个表达式把 `ts` 包在函数里，SQLite 无法再走 `ts` 上的
+    索引（查询计划会退化成 SCAN，即全表扫描）。实测 5 万行时一次过滤要 13.8ms，
+    而改成范围条件只要 6.0ms，且数据越多差距越大。
+
+    所以：**只按天过滤**（`day >= X` / `day = X`）的场景请改用
+    `day_start_ts()` 把它换算成时间戳范围（见那里的说明）；只有确实要**按天
+    分组聚合**（GROUP BY 日期）时才用它——那种场景没法避免表达式。
     """
     return f"strftime('%Y-%m-%d', {column}, 'unixepoch', 'localtime')"
+
+
+def day_start_ts(day: str | None = None) -> int:
+    """某一天（本地时区）的**零点时间戳**；day 为 None 时取今天。
+
+    为什么需要它：`day_sql(ts) >= '2026-09-15'` 这种写法会把 `ts` 包在函数里，
+    导致 `ts` 上的索引失效、退化成全表扫描。而「本地日期 >= X」与
+    「ts >= X 当地零点」在语义上**完全等价**（两者都是「本地日期不早于 X」），
+    换成后者就能走索引。
+
+    ## 等价性的边界（已逐行验证，不要凭直觉改）
+
+    两种写法都只有**下界**、没有上界 —— 也就是说未来的时间戳两边都算进来。
+    `day_sql` 的写法看起来像「日期字符串比较」，但因为它同样没有上界，所以
+    「本地日期 == 明天」的行在两种口径下都被包含。这一点用边界样本
+    （当天零点前后一秒、次日零点）逐行比对过，结果完全一致。
+
+    ## 时区
+
+    用 `time.mktime(time.strptime(...))` 按**本地时区**解释 —— 与 `day_sql` 的
+    `'localtime'` 修饰符同口径。两者都跟随本机时区，所以部署到不同时区的机器上
+    仍然一致（这也是当初统一到本地时区的原因，见 `day_of` 的说明）。
+    """
+    if day is None:
+        day = day_of()
+    return int(time.mktime(time.strptime(day, '%Y-%m-%d')))
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS api_keys (
@@ -45,8 +83,17 @@ CREATE TABLE IF NOT EXISTS api_keys (
   max_ips       INTEGER NOT NULL DEFAULT 0,
   ip_allowlist  TEXT    NOT NULL DEFAULT '[]',
   models        TEXT    NOT NULL DEFAULT '[]',
+  -- 版本归属（cn / global / 空 = 不限制）：这把密钥只能调用该版本的模型。
+  -- 空值是**历史密钥**的存量形态（本列引入前创建的），保持其原有行为不变，
+  -- 界面上单独标注以便管理员补填。新建密钥一律要选一个版本。
+  realm         TEXT    NOT NULL DEFAULT '',
   quota         INTEGER NOT NULL DEFAULT 0,
   used_tokens   INTEGER NOT NULL DEFAULT 0,
+  -- 积分额度与已用量（issue #27）：与 token 限额**各自独立**，0 = 不限。
+  -- 两者可以同时设，任一超限即拒绝；用 REAL 是因为上游 credit 是小数
+  -- （如 0.05 表示一次调用的倍率扣费）。
+  quota_credit  REAL    NOT NULL DEFAULT 0,
+  used_credit   REAL    NOT NULL DEFAULT 0,
   created_at    INTEGER NOT NULL,
   last_used_at  INTEGER
 );
@@ -79,7 +126,11 @@ CREATE TABLE IF NOT EXISTS request_logs (
   error             TEXT,
   stream            INTEGER DEFAULT 0,
   -- 本次调用的真实扣费（来自上游 usage.credit）；NULL = 上游未返回，不等于 0
-  credit            REAL
+  credit            REAL,
+  -- 版本（cn / global）：由请求的模型名前缀判定（上游的路由协议）。
+  -- 为什么必须存：界面按版本切换时，日志与统计要跟着切；不存就无法回溯过滤。
+  -- NULL = 该字段上线前的历史记录（或模型名无前缀）——按 cn 归类，见 realm_of_model。
+  realm             TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_logs_ts ON request_logs(ts);
 
@@ -92,7 +143,9 @@ CREATE TABLE IF NOT EXISTS usage_daily (
   completion_tokens INTEGER NOT NULL DEFAULT 0,
   -- 当日实际扣费合计（来自上游 usage.credit；上游未返回时不计入）
   credit            REAL    NOT NULL DEFAULT 0,
-  PRIMARY KEY (day, key_id, model)
+  -- 版本（cn / global）；NULL 归 cn。主键含它，使两个版本的同名模型分开累计。
+  realm             TEXT    NOT NULL DEFAULT 'cn',
+  PRIMARY KEY (day, key_id, model, realm)
 );
 
 -- 管理端审计日志：登录、改密码、增删用户、改安全配置等敏感操作留痕。
@@ -188,16 +241,71 @@ def _restrict_db_permissions() -> None:
             pass
 
 
+def _explain_db_open_failure(exc: Exception) -> str:
+    """把 `unable to open database file` 翻译成「该怎么做」。
+
+    这个报错的原始信息**完全无法定位**（issue #30）：它既不说哪个路径，
+    也不说为什么。实测最常见的原因是**目录/文件的属主不对** ——
+    容器以 uid 10001 运行，而 bind mount（`./data:/app/data`）的属主由宿主机
+    决定：docker 首次自动创建 `./data` 时归 root，容器内的 10001 就写不进去。
+
+    上游自己的 compose 对 `./data` 写了 chown 提示，我们的漏了 —— 于是同样的坑
+    在管理端这边表现为一条 sqlite 报错，用户完全猜不到是权限。
+    """
+    import os as _os
+
+    path = config.DB_PATH
+    parent = path.parent
+    lines = [f'无法打开数据库文件：{path}']
+    reasons: list[str] = []
+
+    try:
+        if not parent.exists():
+            reasons.append(f'目录不存在：{parent}')
+        elif not _os.access(str(parent), _os.W_OK):
+            reasons.append(f'目录不可写：{parent}')
+        elif path.exists() and not _os.access(str(path), _os.W_OK):
+            reasons.append(f'数据库文件不可写：{path}')
+    except OSError:
+        pass
+
+    if reasons:
+        lines.append('  原因：' + '；'.join(reasons))
+    lines.append(f'  原始错误：{exc}')
+    lines.append(
+        '  最常见的成因是**目录属主不对**：容器以 uid 10001 运行，而 bind mount\n'
+        '  （compose 里的 `./data:/app/data`）属主由宿主机决定 —— docker 首次自动\n'
+        '  创建该目录时归 root，容器内的 10001 写不进去。宿主机执行一次即可：\n'
+        '    chown -R 10001:10001 ./data\n'
+        '  （在 docker-compose.yml 所在目录执行；10001 是镜像内 app 用户的 uid）\n'
+        '  若目录是网络文件系统（NFS/SMB）且不支持属主修改，改用命名卷：\n'
+        '    volumes:\n      - wb-manager-data:/app/data\n'
+        '  volumes:\n    wb-manager-data:'
+    )
+    return '\n'.join(lines)
+
+
 def connect() -> sqlite3.Connection:
     global _conn
     if _conn is None:
         config.ensure_dirs()
-        _conn = sqlite3.connect(str(config.DB_PATH), check_same_thread=False)
-        _conn.row_factory = sqlite3.Row
-        _conn.execute('PRAGMA journal_mode=WAL')
-        _conn.execute('PRAGMA synchronous=NORMAL')
-        _conn.executescript(SCHEMA)
-        _migrate(_conn)
+        try:
+            _conn = sqlite3.connect(str(config.DB_PATH), check_same_thread=False)
+            _conn.row_factory = sqlite3.Row
+            _conn.execute('PRAGMA journal_mode=WAL')
+            _conn.execute('PRAGMA synchronous=NORMAL')
+            _conn.executescript(SCHEMA)
+            _migrate(_conn)
+        except sqlite3.OperationalError as exc:
+            # 失败时不要留下半开的连接：否则后续调用会拿到一个不能用的 _conn，
+            # 报出更莫名的错误（例如「attempt to write a readonly database」）
+            if _conn is not None:
+                try:
+                    _conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                _conn = None
+            raise RuntimeError(_explain_db_open_failure(exc)) from exc
         _conn.commit()
         # 建表之后再收紧权限：库文件此刻才确定存在，WAL 伴生文件也在初始化后出现
         _restrict_db_permissions()
@@ -212,6 +320,34 @@ _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ('usage_daily', 'credit', 'REAL NOT NULL DEFAULT 0'),
     # 首字延迟：可空（历史记录与非流式请求为 NULL）
     ('request_logs', 'first_token_ms', 'INTEGER'),
+    # 版本（cn / global）：界面按版本切换时日志与统计要跟着切。
+    # 历史记录为 NULL —— 读的时候按 cn 归类（见 realm_of_model 的注释）。
+    ('request_logs', 'realm', 'TEXT'),
+    # usage_daily 的 realm 列。注意：**光加列不够**——写入侧用的是四列 UPSERT，
+    # 而旧库主键仍是三列，会直接抛 ON CONFLICT 不匹配（issue #9：统计静默停摆）。
+    # 主键的迁移由 _rebuild_usage_daily_pk 重建表完成（SQLite 不能 ALTER 主键）。
+    ('usage_daily', 'realm', "TEXT NOT NULL DEFAULT 'cn'"),
+    # API 密钥的版本归属（cn / global / 空 = 不限制）。
+    # 存量密钥一律为空——即保持它们原本「两版都能调」的行为，不因为升级就把
+    # 人家正在用的密钥悄悄限死（那会让线上调用突然 403）。管理员在界面上
+    # 看到「未限定」标记后可按需补填。
+    ('api_keys', 'realm', "TEXT NOT NULL DEFAULT ''"),
+    # 积分额度与已用量（issue #27）。存量密钥为 0/0 = **不限积分**，行为不变。
+    #
+    # 为什么要在 token 之外单独记一笔：两者**不成比例** —— 同样 1M token，
+    # 便宜模型与贵模型的实际扣费能差几十倍，按 token 限额估不出花了多少积分
+    # （提需求的人遇到的正是这个问题）。上游从 2026-09-13 起在末帧 usage 里
+    # 带回真实 credit，我们已按请求存进 request_logs.credit，所以这里算得准。
+    ('api_keys', 'quota_credit', 'REAL NOT NULL DEFAULT 0'),
+    ('api_keys', 'used_credit', 'REAL NOT NULL DEFAULT 0'),
+    # 入站请求被拦的**原因**（issue #33）。
+    #
+    # 此前这张表只有一个 blocked 布尔：界面显示「已拦截」，但看不出是「没带
+    # 密钥」「密钥不认识」还是「IP 规则拦的」。三者的处置方式完全不同（改客户端
+    # 配置 / 重新发密钥 / 改 IP 规则），只报「已拦截」等于把排查成本全推给用户
+    # ——实测有用户发了 issue 也说不清是哪一种。
+    # 存量记录为 NULL（那时没记原因），界面按「未记录」展示。
+    ('ip_access_logs', 'reason', 'TEXT'),
 )
 
 
@@ -228,6 +364,100 @@ def _migrate(conn: sqlite3.Connection) -> None:
         except sqlite3.Error:
             # 并发启动时可能已被另一进程加过，忽略即可
             pass
+    _rebuild_usage_daily_pk(conn)
+
+
+def _rebuild_usage_daily_pk(conn: sqlite3.Connection) -> bool:
+    """把存量库的 usage_daily 主键从三列迁到四列（含 realm）。返回是否迁移了。
+
+    为什么必须重建表：SQLite 不能改主键，`ALTER TABLE` 只加得上列。而写入侧
+    用的是四列 UPSERT（`ON CONFLICT(day, key_id, model, realm)`），在旧库上会
+    直接抛 `OperationalError: ON CONFLICT clause does not match any PRIMARY KEY
+    or UNIQUE constraint`。**这个异常在网关里被兜住只记 warning**（旁路统计
+    不该影响转发），于是表现为彻底静默：统计数字冻结在升级前、每笔请求刷一条
+    日志，而页面看不出任何异常（issue #9 的现象）。
+
+    上一版这里只做了 ADD COLUMN，注释里写「接受旧库在这一维度上的精度损失」
+    —— 判断错了：精度损失指的是「两个版本的同名模型合并累计」，而实际后果是
+    **一行都写不进去**，比精度损失严重得多。
+
+    迁移要点：
+      * 用 `INSERT OR REPLACE` 而非普通 INSERT：旧库合并累计的行在四列主键下
+        不会冲突，但万一有重复（(day,key_id,model) 不同而 realm 相同的脏数据），
+        替换比让整个迁移失败好——迁移失败会让服务起不来。
+      * 先建新表、数据搬运、再 DROP 旧表、最后改名：**旧表在新表数据就位之前
+        一直存在**，所以任何一步失败都不会丢数据。
+      * 开头先 `DROP TABLE IF EXISTS usage_daily_new`：SQLite **不回滚 DDL**，
+        迁移失败一次就会把那张半成品表留下，导致下次启动因重名再失败——形成
+        永远修不好的死循环（实测确认，见 test_usage_daily_migration）。
+      * realm 不需要 COALESCE 兜底：旧库该列是迁移时 `ADD COLUMN ... NOT NULL
+        DEFAULT 'cn'` 建的，NULL 不存在于该列（实测写不进去）。
+    """
+    try:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='usage_daily'"
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    if not row or not row[0]:
+        return False  # 表不存在（全新库由 SCHEMA 建好，就是四列主键）
+    ddl = row[0]
+    # 已经是四列主键（新库）→ 无需处理。判据取 "realm" 是否出现在主键括号里，
+    # 而不是简单看 DDL 里有没有 realm 字样——旧库也有 realm 列（ALTER 加的）。
+    pk_part = ddl[ddl.upper().find('PRIMARY KEY'):] if 'PRIMARY KEY' in ddl.upper() else ''
+    if 'realm' in pk_part.lower():
+        return False
+
+    try:
+        # 先清掉可能残留的临时表。**这一步是必须的**（实测确认）：SQLite 的
+        # 事务**不回滚 DDL** —— 在事务里 CREATE TABLE 之后即使抛异常回滚，
+        # 那张表依然留在库里。于是只要迁移失败过一次，下次的 CREATE TABLE
+        # 就会因重名失败，形成「每次启动都失败、统计永远修不好」的死循环。
+        # 幂等的前提是能重来，所以先把上次的残骸清掉。
+        conn.execute('DROP TABLE IF EXISTS usage_daily_new')
+    except sqlite3.Error:
+        pass
+
+    try:
+        with conn:  # 事务：任一步失败自动回滚
+            conn.execute('''
+                CREATE TABLE usage_daily_new (
+                  day               TEXT    NOT NULL,
+                  key_id            INTEGER NOT NULL,
+                  model             TEXT    NOT NULL,
+                  requests          INTEGER NOT NULL DEFAULT 0,
+                  prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+                  completion_tokens INTEGER NOT NULL DEFAULT 0,
+                  credit            REAL    NOT NULL DEFAULT 0,
+                  realm             TEXT    NOT NULL DEFAULT 'cn',
+                  PRIMARY KEY (day, key_id, model, realm)
+                )
+            ''')
+            conn.execute('''
+                INSERT OR REPLACE INTO usage_daily_new
+                  (day, key_id, model, requests, prompt_tokens, completion_tokens, credit, realm)
+                SELECT day, key_id, model, requests, prompt_tokens, completion_tokens,
+                       credit, realm
+                FROM usage_daily
+            ''')
+            conn.execute('DROP TABLE usage_daily')
+            conn.execute('ALTER TABLE usage_daily_new RENAME TO usage_daily')
+        logger.info('usage_daily 主键已迁移为四列（含 realm），历史数据已保留')
+        return True
+    except sqlite3.Error as exc:
+        # 迁移失败不阻断启动（服务照常跑，统计在下次启动重试）——起不来比统计
+        # 不准严重得多。但**必须留下 error 级日志**：这个缺陷当初之所以拖了
+        # 好几个版本才被发现，正是因为它的表现是静默的（统计冻结、页面看不出
+        # 异常）。迁移再失败一次不能还是没人知道。
+        logger.error(
+            'usage_daily 主键迁移失败，用量统计将无法累计（历史数据未受影响，'
+            '重启会重试）：%s', exc,
+        )
+        try:
+            conn.execute('DROP TABLE IF EXISTS usage_daily_new')
+        except sqlite3.Error:
+            pass
+        return False
 
 
 def query(sql: str, args: Iterable[Any] = ()) -> list[sqlite3.Row]:
@@ -281,19 +511,40 @@ def bump_usage(
     prompt_tokens: int,
     completion_tokens: int,
     credit: float | None = None,
+    realm: str | None = None,
 ) -> None:
-    """累计当日用量。credit 为本次真实扣费，缺省不计入（不按 0 记）。"""
+    """累计当日用量。credit 为本次真实扣费，缺省不计入（不按 0 记）。
+
+    realm（cn / global）由调用方按模型名前缀判定后传入；缺省归 cn
+    （与 realm_of_model 的口径一致：无前缀即国内版）。
+    """
     day = day_of()
+    r = realm if realm in ('cn', 'global') else realm_of_model(model)
     execute(
-        'INSERT INTO usage_daily(day, key_id, model, requests, prompt_tokens, completion_tokens, credit) '
-        'VALUES(?, ?, ?, 1, ?, ?, ?) '
-        'ON CONFLICT(day, key_id, model) DO UPDATE SET '
+        'INSERT INTO usage_daily(day, key_id, model, requests, prompt_tokens, completion_tokens, credit, realm) '
+        'VALUES(?, ?, ?, 1, ?, ?, ?, ?) '
+        'ON CONFLICT(day, key_id, model, realm) DO UPDATE SET '
         '  requests = requests + 1, '
         '  prompt_tokens = prompt_tokens + excluded.prompt_tokens, '
         '  completion_tokens = completion_tokens + excluded.completion_tokens, '
         '  credit = credit + excluded.credit',
-        (day, key_id, model, prompt_tokens, completion_tokens, float(credit or 0)),
+        (day, key_id, model, prompt_tokens, completion_tokens, float(credit or 0), r),
     )
+
+
+def realm_of_model(model: str | None) -> str:
+    """从模型名判定版本：上游的路由协议是 `cn:` / `global:` 前缀。
+
+    为什么以模型名为准：网关把模型名原样转发给上游，由上游按前缀选择账号池
+    ——所以「这次调用走的是哪个版本」完全由前缀决定，与调用方用哪个密钥无关。
+
+    无前缀 → cn：存量客户端与历史数据都是这个形态（升级前只有一个版本），
+    归到 cn 才能让它们落在原来的那一侧，不凭空改变历史归属。
+    """
+    m = str(model or '').strip().lower()
+    if m.startswith('global:'):
+        return 'global'
+    return 'cn'
 
 
 # ── 签到 / 保活记录 ──────────────────────────────────────
@@ -447,6 +698,126 @@ def list_audit_logs(limit: int = 200, offset: int = 0) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+# 入站访问日志（ip_access_logs）保留的最大行数。
+#
+# 为什么必须有上限：这张表的写入点在网关鉴权**之前**（缺 token / token 无效
+# 都会记一行），也就是**未鉴权可达**。此前它既无清洗也无上限、更没有清理机制，
+# 于是任何匿名者都能用「无效 key + 超长 UA」反复写库把磁盘灌满，进而拖垮
+# 管理端与上游（实测：2KB UA 每条约 1.3KB，百万请求约 2GB）。
+#
+# 取 2 万行：按每次拒绝一行估算足够回溯近期攻击，占用约几 MB；超出后按最旧丢弃
+# （滚动窗口），写入成本是常数级的。
+_IP_ACCESS_LOG_MAX = 20000
+
+# 清理的触发间隔：不必每次写入都查一次 COUNT（那是一趟全表扫描）。
+# 每 500 次写入检查一次，超限时一次删到上限以下，均摊成本可忽略。
+_IP_ACCESS_LOG_CHECK_EVERY = 500
+_ip_log_writes = 0
+
+
+# 请求日志（request_logs）的保留期（天）。
+#
+# 为什么需要：这张表**每笔请求都写一行**（无条件，区别于用量汇总），线上实测
+# 每天 1400+ 行。此前没有任何清理机制——`ip_access_logs` 有行数上限，它没有。
+# 按当前速率一年约 50 万行、上百 MB，`/api/logs` 的查询与页面都会越来越慢。
+#
+# 取 90 天：统计页最长的展示窗口是 30 天（`_DAYS_MAX` 之外的实际用法），
+# 「修复统计 / 重建统计」也只需覆盖到用量表还有意义的时段；再久的明细对用户
+# 没有用途，而按月归档属于另一件事（真要长期留存应导出，不是留在大表里）。
+#
+# 注意与 `rebuild_usage_from_logs` 的关系：重建以 request_logs 为唯一依据，
+# 删掉 90 天前的日志后，那段时期的用量统计**不能再重建**（现有数据不受影响，
+# 只是无法重算）。这是刻意的：90 天前的用量早已定稿，不值得为它永久保留明细。
+_REQUEST_LOG_RETAIN_DAYS = 90
+
+# 清理间隔：按行数触发（每 2000 次写入检查一次），与 ip 日志同款思路——
+# 不必每次写入都查一次。检查本身用索引列 ts，成本可忽略。
+_REQUEST_LOG_CHECK_EVERY = 2000
+_request_log_writes = 0
+
+
+def _prune_request_logs() -> None:
+    """按保留期清理请求日志（滚动删除最旧的）。
+
+    旁路操作：任何失败都不能影响写入本身（更不能影响转发）。
+    """
+    cutoff = int(time.time()) - _REQUEST_LOG_RETAIN_DAYS * 86400
+    try:
+        execute('DELETE FROM request_logs WHERE ts < ?', (cutoff,))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def add_request_log(**fields: object) -> None:
+    """写一条请求日志，并按保留期做滚动清理。
+
+    参数用 kwargs（调用方能按名字传，列多时不易错位），但**传给 SQLite 时必须
+    展开成位置元组**：`execute()` 内部做 `tuple(args)`，直接塞 dict 会把它当成
+    单个参数，于是键名被当值写进库（实测：`credit` 列存进了字符串 `'credit'`，
+    `rebuild` 随即因 `NOT NULL constraint failed` 崩掉）。这里显式按列序展开。
+    """
+    global _request_log_writes
+    execute(
+        'INSERT INTO request_logs(ts, key_id, ip, model, mapped_model, status, '
+        'prompt_tokens, completion_tokens, latency_ms, first_token_ms, ua, error, '
+        'stream, credit, realm) '
+        'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        (fields.get('ts'), fields.get('key_id'), fields.get('ip'),
+         fields.get('model'), fields.get('mapped_model'), fields.get('status'),
+         fields.get('prompt_tokens'), fields.get('completion_tokens'),
+         fields.get('latency_ms'), fields.get('first_token_ms'), fields.get('ua'),
+         fields.get('error'), fields.get('stream'), fields.get('credit'),
+         fields.get('realm')),
+    )
+    _request_log_writes += 1
+    if _request_log_writes >= _REQUEST_LOG_CHECK_EVERY:
+        _request_log_writes = 0
+        _prune_request_logs()
+
+
+def add_ip_access_log(ip: object, path: object, blocked: bool, ua: object,
+                      reason: object = None) -> None:
+    """写入一条入站访问日志：清洗 + 截断 + 行数上限。
+
+    清洗与截断是**硬要求**（不只是节省空间）：`ua` / `path` / `reason` 来自
+    外部输入，含换行就能在日志界面上伪造出额外行，污染事后排查。审计表一直
+    这么做（见 `add_audit_log`），但网关这张表此前漏了 —— 文档里「日志写入前
+    统一 `_clean()`」的说法与实际不符，这里补齐。
+
+    reason 是**被拦的原因**（issue #33）：只有 blocked 布尔时，界面上的
+    「已拦截」无法区分「没带密钥」「密钥不认识」「IP 规则拦的」——三者的处置
+    方式完全不同，用户只能靠猜或来提 issue。
+    """
+    global _ip_log_writes
+    # 空原因存 NULL 而不是空串：读的那一侧要区分「没记原因」（升级前的历史
+    # 记录 / 放行）与「记了一个空字符串」，两者在库里的语义不同。
+    cleaned_reason = _clean(reason, 200) or None
+    execute(
+        'INSERT INTO ip_access_logs(ts, ip, path, blocked, ua, reason) '
+        'VALUES(?, ?, ?, ?, ?, ?)',
+        (int(time.time()), _clean(ip, 64), _clean(path, 256),
+         1 if blocked else 0, _clean(ua, 512), cleaned_reason),
+    )
+    _ip_log_writes += 1
+    if _ip_log_writes < _IP_ACCESS_LOG_CHECK_EVERY:
+        return
+    _ip_log_writes = 0
+    try:
+        row = query_one('SELECT COUNT(*) AS n FROM ip_access_logs')
+        n = int(row['n']) if row else 0
+        if n > _IP_ACCESS_LOG_MAX:
+            # 删掉最旧的一批，留出余量（避免下一次写入又立刻触发清理）
+            execute(
+                'DELETE FROM ip_access_logs WHERE id IN ('
+                '  SELECT id FROM ip_access_logs ORDER BY id LIMIT ?'
+                ')',
+                (n - _IP_ACCESS_LOG_MAX + _IP_ACCESS_LOG_MAX // 10,),
+            )
+    except Exception:  # noqa: BLE001
+        # 清理是旁路，失败不能影响写入本身（更不能影响转发）
+        pass
+
+
 def count_audit_logs() -> int:
     row = query_one('SELECT COUNT(*) AS n FROM audit_logs')
     return int(row['n']) if row else 0
@@ -555,23 +926,32 @@ def backfill_usage_from_logs() -> dict:
     """
     # 应有用量（按天 × 密钥 × 模型）
     # 必须与 bump_usage 用同一时区口径（本地），否则凌晨的调用会被算成两天
+    #
+    # 归一化表达式同样要**同时**用在 SELECT 与 GROUP BY，且空串也要折成默认值
+    # （原因见 rebuild_usage_from_logs 里的说明：GROUP BY 复用别名会绑定到源列；
+    #   SQL 的 COALESCE 不处理空串、Python 的 `or` 会 —— 两边规则必须一致）。
+    model_expr = "COALESCE(NULLIF(model,''),'')"
+    realm_expr = "COALESCE(NULLIF(realm,''),'cn')"
+    day_expr = day_sql('ts')
     expected = query(
-        f"SELECT {day_sql('ts')} AS day, key_id, COALESCE(model,'') AS model, "
+        f"SELECT {day_expr} AS day, key_id, {model_expr} AS model, {realm_expr} AS realm, "
         "COUNT(*) AS requests, COALESCE(SUM(prompt_tokens),0) AS pt, "
         "COALESCE(SUM(completion_tokens),0) AS ct, COALESCE(SUM(credit),0) AS cr "
-        "FROM request_logs WHERE key_id IS NOT NULL GROUP BY day, key_id, model"
+        f"FROM request_logs WHERE key_id IS NOT NULL "
+        f"GROUP BY {day_expr}, key_id, {model_expr}, {realm_expr}"
     )
+    # 键含 realm：两个版本的同名模型是不同行，否则回填会把它们并成一条
     current = {
-        (r['day'], r['key_id'], r['model']): r
+        (r['day'], r['key_id'], r['model'], r['realm'] or 'cn'): r
         for r in query(
-            'SELECT day, key_id, model, requests, prompt_tokens, completion_tokens, credit FROM usage_daily'
+            'SELECT day, key_id, model, realm, requests, prompt_tokens, completion_tokens, credit FROM usage_daily'
         )
     }
 
     fixed = 0
     added_requests = added_tokens = 0
     for row in expected:
-        key = (row['day'], row['key_id'], row['model'])
+        key = (row['day'], row['key_id'], row['model'], row['realm'] or 'cn')
         cur = current.get(key)
         cur_req = int(cur['requests']) if cur else 0
         cur_pt = int(cur['prompt_tokens']) if cur else 0
@@ -583,15 +963,16 @@ def backfill_usage_from_logs() -> dict:
         if d_req <= 0 and d_pt <= 0 and d_ct <= 0:
             continue
         execute(
-            'INSERT INTO usage_daily(day, key_id, model, requests, prompt_tokens, completion_tokens, credit) '
-            'VALUES(?, ?, ?, ?, ?, ?, ?) '
-            'ON CONFLICT(day, key_id, model) DO UPDATE SET '
+            'INSERT INTO usage_daily(day, key_id, model, requests, prompt_tokens, completion_tokens, credit, realm) '
+            'VALUES(?, ?, ?, ?, ?, ?, ?, ?) '
+            'ON CONFLICT(day, key_id, model, realm) DO UPDATE SET '
             '  requests = MAX(requests, excluded.requests), '
             '  prompt_tokens = MAX(prompt_tokens, excluded.prompt_tokens), '
             '  completion_tokens = MAX(completion_tokens, excluded.completion_tokens), '
             '  credit = MAX(credit, excluded.credit)',
             (row['day'], row['key_id'], row['model'], int(row['requests']),
-             int(row['pt']), int(row['ct']), float(row['cr'] or 0)),
+             int(row['pt']), int(row['ct']), float(row['cr'] or 0),
+             str(row['realm'] or 'cn')),
         )
         fixed += 1
         added_requests += max(0, d_req)
@@ -614,22 +995,55 @@ def rebuild_usage_from_logs() -> dict:
     注意：本操作以 request_logs 为唯一依据。若请求日志曾被清空，
     那部分历史汇总会随之丢失（接口上已明确标注）。
     """
+    # 归一化表达式必须**同时**用在 SELECT 与 GROUP BY 上，不能只在 SELECT 里写
+    # 别名、GROUP BY 里复用别名。
+    #
+    # 原因（线上 bug）：SQLite 解析 `GROUP BY realm` 时，因为 FROM 的表里**也有**
+    # 名为 realm 的列，该名字绑定到**源列**而不是输出别名 `COALESCE(realm,'cn')`。
+    # 于是 `realm IS NULL` 与 `realm='cn'` 被分成两组，但两组的输出值都是 'cn' ——
+    # 随后 INSERT 就撞上 usage_daily 的主键 (day,key_id,model,realm)，
+    # 报 `UNIQUE constraint failed`，接口 500（界面上是「Internal Server Error」）。
+    # model 列同理（`COALESCE(model,'')` vs 源列 model）。
+    #
+    # 历史日志里 realm 为 NULL 是常态（该列是后加的），所以这不是理论风险。
+    #
+    # 第二处必须对齐：**空串也要归一**。SQL 的 COALESCE 只处理 NULL，而 Python 的
+    # `x or 'cn'` 连空串一起兜住 —— 两边规则不同就会出现「SQL 分成两组、写库时
+    # 都变成 cn」的第二次撞键。所以 SQL 侧用 NULLIF 把空串也折成 NULL，
+    # 与 Python 的 `or 'cn'` 完全一致。
+    model_expr = "COALESCE(NULLIF(model,''),'')"
+    realm_expr = "COALESCE(NULLIF(realm,''),'cn')"
+    day_expr = day_sql('ts')
     expected = query(
-        f"SELECT {day_sql('ts')} AS day, key_id, COALESCE(model,'') AS model, "
+        f"SELECT {day_expr} AS day, key_id, {model_expr} AS model, {realm_expr} AS realm, "
         "COUNT(*) AS requests, COALESCE(SUM(prompt_tokens),0) AS pt, "
         "COALESCE(SUM(completion_tokens),0) AS ct, COALESCE(SUM(credit),0) AS cr "
-        "FROM request_logs WHERE key_id IS NOT NULL GROUP BY day, key_id, model"
+        f"FROM request_logs WHERE key_id IS NOT NULL "
+        f"GROUP BY {day_expr}, key_id, {model_expr}, {realm_expr}"
     )
     before = query_one('SELECT COUNT(*) AS c, COALESCE(SUM(requests),0) AS r, '
                        'COALESCE(SUM(prompt_tokens+completion_tokens),0) AS t FROM usage_daily')
-    execute('DELETE FROM usage_daily')
-    for row in expected:
-        execute(
-            'INSERT INTO usage_daily(day, key_id, model, requests, prompt_tokens, completion_tokens, credit) '
-            'VALUES(?, ?, ?, ?, ?, ?, ?)',
-            (row['day'], row['key_id'], row['model'], int(row['requests']),
-             int(row['pt']), int(row['ct']), float(row['cr'] or 0)),
-        )
+    # 删除与重建必须在**同一个事务**里。此前是「先 DELETE（已提交）再逐条 INSERT」，
+    # 一旦插入中途失败（就是上面那个归一化 bug），统计表已经被清空、只剩半份数据，
+    # 而 request_logs 完好 —— 用户看到的就是「今天有 N 次调用、统计却是 0」，
+    # 且**每次点重建都在继续破坏数据**。原子化之后，失败就整体回滚，
+    # 原有的统计原样保留（宁可暂时不准，也不能把仅有的数据弄丢）。
+    conn = connect()
+    with _lock:
+        try:
+            conn.execute('BEGIN')
+            conn.execute('DELETE FROM usage_daily')
+            conn.executemany(
+                'INSERT INTO usage_daily(day, key_id, model, requests, prompt_tokens, '
+                'completion_tokens, credit, realm) VALUES(?, ?, ?, ?, ?, ?, ?, ?)',
+                [(row['day'], row['key_id'], row['model'], int(row['requests']),
+                  int(row['pt']), int(row['ct']), float(row['cr'] or 0),
+                  str(row['realm'] or 'cn')) for row in expected],
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
     after = query_one('SELECT COUNT(*) AS c, COALESCE(SUM(requests),0) AS r, '
                       'COALESCE(SUM(prompt_tokens+completion_tokens),0) AS t FROM usage_daily')
     return {

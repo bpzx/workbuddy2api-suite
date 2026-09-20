@@ -4,6 +4,7 @@ import {motion} from 'motion/react';
 import {CircleCheck, CircleX, Info, TriangleAlert, X} from 'lucide-react';
 import {toast} from 'sonner';
 import {cn} from '@/lib/utils';
+import {t} from '@/lib/i18n';
 
 /**
  * 统一提示：自定义渲染的卡片式通知。
@@ -70,7 +71,7 @@ function ToastCard({
       {/* 关闭按钮：悬停浮现，不干扰阅读 */}
       <button
         type="button"
-        aria-label="关闭"
+        aria-label={t('common.close')}
         onClick={() => toast.dismiss(id)}
         className="-mr-1 -mt-0.5 grid size-6 shrink-0 place-items-center rounded-full text-muted-foreground opacity-0 transition-all hover:bg-muted hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
       >

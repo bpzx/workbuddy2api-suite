@@ -2,6 +2,9 @@
 
 import {createContext, useCallback, useContext, useEffect, useMemo, useState} from 'react';
 
+import {t as translate} from './i18n';
+import {useI18n} from './i18n/provider';
+
 /**
  * 版本（realm）切换。
  *
@@ -30,6 +33,7 @@ const Ctx = createContext<RealmCtx | null>(null);
 
 export function RealmProvider({children}: {children: React.ReactNode}) {
   const [realm, setRealmState] = useState<Realm>('cn');
+  const {t} = useI18n();
 
   // 首屏后读 localStorage：直接读会让服务端渲染与客户端不一致
   useEffect(() => {
@@ -51,8 +55,8 @@ export function RealmProvider({children}: {children: React.ReactNode}) {
   }, []);
 
   const value = useMemo<RealmCtx>(
-    () => ({realm, setRealm, label: realm === 'global' ? '国际版' : '国内版'}),
-    [realm, setRealm],
+    () => ({realm, setRealm, label: realm === 'global' ? t('realm.global') : t('realm.cn')}),
+    [realm, setRealm, t],
   );
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
@@ -64,7 +68,11 @@ export function useRealm(): RealmCtx {
   return v;
 }
 
-/** realm 的中文名（给不带 hook 的地方用，如表格标签） */
+/**
+ * realm 的显示名（给不带 hook 的地方用，如表格标签）。
+ * 读模块级当前语言（由 I18nProvider 同步）；调用它的组件在切换语言时
+ * 会随父级重渲染，因此这里不必是 Hook。
+ */
 export function realmLabel(r: string | null | undefined): string {
-  return r === 'global' ? '国际版' : '国内版';
+  return r === 'global' ? translate('realm.global') : translate('realm.cn');
 }

@@ -264,3 +264,45 @@ func TestLoadDirDuplicateUIDWarning(t *testing.T) {
 		t.Errorf("expected WARN with both paths, got output: %s", string(raw))
 	}
 }
+
+// TestAuthFileGlobUnification (P2-10, 发现 10)：网关 LoadDir 与 cmd 运维工具
+// （signin/credit/trial）此前用两套 glob——workbuddy*.json vs workbuddy-*.json，
+// 不带连字符的文件（如 workbuddy_new.json）被网关加载却被运维工具跳过。
+// 统一导出宽侧模式 AuthFileGlob + 文件清单函数 LoadAuthFiles，cmd 工具复用。
+func TestAuthFileGlobUnification(t *testing.T) {
+	if AuthFileGlob != "workbuddy*.json" {
+		t.Errorf("AuthFileGlob=%q want workbuddy*.json（宽侧为准）", AuthFileGlob)
+	}
+	dir := t.TempDir()
+	doc := `{"auth":{"accessToken":"at","refreshToken":"r","expiresAt":1,"domain":""},"account":{"uid":"u1"}}`
+	os.WriteFile(filepath.Join(dir, "workbuddy-cn1.json"), []byte(doc), 0o600)
+	os.WriteFile(filepath.Join(dir, "workbuddy_new.json"), []byte(doc), 0o600)
+
+	files, err := LoadAuthFiles(dir)
+	if err != nil {
+		t.Fatalf("LoadAuthFiles: %v", err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("files=%v want 2（含不带连字符的 workbuddy_new.json）", files)
+	}
+	// 排序稳定性：与 cmd 工具原 sort.Strings 口径一致。
+	if filepath.Base(files[0]) != "workbuddy-cn1.json" || filepath.Base(files[1]) != "workbuddy_new.json" {
+		t.Errorf("files not sorted: %v", files)
+	}
+}
+
+// TestLoadDirLoadsNonHyphenFile 网关侧零回归锚点：不带连字符文件本就
+// 被宽侧 glob 加载，此测试锁死该行为不被"统一"改窄。
+func TestLoadDirLoadsNonHyphenFile(t *testing.T) {
+	dir := t.TempDir()
+	doc := `{"auth":{"accessToken":"at1","refreshToken":"r","expiresAt":1,"domain":""},"account":{"uid":"u1"}}`
+	os.WriteFile(filepath.Join(dir, "workbuddy_new.json"), []byte(doc), 0o600)
+
+	list, err := LoadDir(dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(list) != 1 || list[0].UID != "u1" {
+		t.Fatalf("list=%+v want 1 account (uid=u1)", list)
+	}
+}

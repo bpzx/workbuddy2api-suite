@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -162,6 +163,123 @@ class LoadChangelogTest(unittest.TestCase):
                 data = changelog.load_changelog()
             self.assertEqual(data['versions'][0]['version'], '8.8.8')
             self.assertFalse(data['path'].endswith(str(Path('server') / 'CHANGELOG.md')))
+
+
+class ChangelogIsUserFacingTest(unittest.TestCase):
+    """更新日志必须**面向用户**，不能写内部实现细节。
+
+    这份文件不只是给仓库看的：Release 页面的正文与应用内「更新日志」页展示的都是
+    它的原文，读者是使用者而不是维护者。
+
+    为什么要有这条守卫：维护者（尤其是我）很容易把它写成排障笔记 —— 函数名、模块
+    路径、测试名、「我错在哪」「反向验证」这类叙事，对用户毫无意义，还会把「升级后
+    我要做什么」这个真正有用的信息淹掉。这事已经发生多次（1.0.42 ~ 1.0.49 全线
+    存在），靠自觉不可靠，所以用测试钉住。
+
+    允许的例外：**界面上真实出现过的报错原文**要照抄（用户就是拿它来搜的），因此按
+    「该词是否出现在用户可见的提示文本里」放行，而不是一刀切禁词。
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.text = (Path(__file__).resolve().parents[2] / 'CHANGELOG.md').read_text(encoding='utf-8')
+
+    def _sections(self) -> list[tuple[str, str]]:
+        """按版本切段，返回 [(版本号, 正文)]。"""
+        out: list[tuple[str, str]] = []
+        cur_ver, buf = '', []
+        for line in self.text.splitlines():
+            m = re.match(r'^##\s*\[([^\]]+)\]', line)
+            if m:
+                if cur_ver:
+                    out.append((cur_ver, '\n'.join(buf)))
+                cur_ver, buf = m.group(1), []
+            elif cur_ver:
+                buf.append(line)
+        if cur_ver:
+            out.append((cur_ver, '\n'.join(buf)))
+        return out
+
+    @staticmethod
+    def _user_visible_strings() -> set[str]:
+        """扫服务端源码里**会被回显给用户**的中文短句（用于例外判定）。"""
+        root = Path(__file__).resolve().parents[1]
+        visible: set[str] = set()
+        for path in root.rglob('*.py'):
+            if 'tests' in path.parts:
+                continue
+            try:
+                src = path.read_text(encoding='utf-8')
+            except OSError:
+                continue
+            for lit in re.findall(r"'([^'\n]{6,160})'", src) + re.findall(r'"([^"\n]{6,160})"', src):
+                if re.search(r'[\u4e00-\u9fff]', lit):
+                    visible.add(lit)
+        return visible
+
+    def test_sections_parsed(self) -> None:
+        """先确认切段有效，否则下面几条会在空集合上「通过」。"""
+        secs = self._sections()
+        self.assertGreater(len(secs), 10, '没切出版本段落，守卫会空转')
+        self.assertIn('1.0.49', [v for v, _ in secs])
+
+    def test_no_internal_identifiers(self) -> None:
+        """不得出现函数名、模块路径、下划线开头的内部名。"""
+        bad = re.compile(
+            r'`(?:[a-z_][a-z0-9_]*\(\)'                                # 函数调用
+            r'|[a-z_][a-z0-9_]*/[a-z_][a-z0-9_]*\.(?:py|go|ts|tsx)'    # 文件路径
+            r'|_[a-z][a-z0-9_]*)'                                      # 内部名
+            r'`'
+        )
+        offenders = [f'{ver}: {m.group(0)}'
+                     for ver, body in self._sections() for m in bad.finditer(body)]
+        self.assertEqual(offenders, [],
+                         '更新日志里有内部标识符（用户看不懂）：' + '; '.join(offenders[:8]))
+
+    def test_no_debugging_narrative(self) -> None:
+        """不得出现排障过程式叙事 —— 那是开发笔记，不是变更说明。"""
+        bad = re.compile(
+            r'我错在哪|我当时|我写的那条|我图省事|差点装成|自审发现|自审时|'
+            r'反向验证|测试没抓住|用例变红|断言以|patch 目标|'
+            r'根因是[^，。]{0,10}我|回归测试|单测|测试用例'
+        )
+        offenders = [f'{ver}: {m.group(0)}'
+                     for ver, body in self._sections() for m in bad.finditer(body)]
+        self.assertEqual(offenders, [],
+                         '更新日志里有排障叙事（应改成面向用户的描述）：'
+                         + '; '.join(offenders[:8]))
+
+    def test_encoder_terms_only_when_quoting_a_visible_error(self) -> None:
+        """并发 / 框架术语只在「引用用户看到的报错」时才允许出现。"""
+        visible = self._user_visible_strings()
+        terms = ['事件循环', '线程池', 'asyncio', 'to_thread', 'create_task',
+                 'get_running_loop']
+        offenders = []
+        for ver, body in self._sections():
+            for term in terms:
+                if term in body and not any(term in s for s in visible):
+                    offenders.append(f'{ver}: {term}')
+        self.assertEqual(offenders, [],
+                         '这些术语只该用于引用界面报错原文：' + '; '.join(offenders[:8]))
+
+    def test_guard_patterns_are_not_vacuous(self) -> None:
+        """确认两条正则真的能匹配 —— 免得写错了却一直「通过」。"""
+        ident = re.compile(r'`(?:[a-z_][a-z0-9_]*\(\)|_[a-z][a-z0-9_]*)`')
+        self.assertTrue(ident.search('修了 `_prepare()` 与 `a/b.py`'),
+                        '内部标识符正则失配')
+        self.assertTrue(re.search(r'反向验证', '已做反向验证'), '排障叙事正则失配')
+
+    def test_user_visible_scan_found_something(self) -> None:
+        """例外判定依赖「扫到用户可见文案」，扫不到就说明它失效了。"""
+        self.assertGreater(len(self._user_visible_strings()), 50,
+                           '没扫到用户可见的中文提示，例外判定会误伤')
+
+    def test_released_versions_have_sections(self) -> None:
+        """每个已发布段落都要有分类标题（否则页面渲染成一片裸文本）。"""
+        blocks = re.split(r'^## \[[\d.]+\] - \d{4}-\d{2}-\d{2}$', self.text, flags=re.M)[1:]
+        self.assertGreater(len(blocks), 10, '没切出版本段落')
+        for i, block in enumerate(blocks):
+            self.assertIn('###', block, f'第 {i + 1} 个版本段落没有分类标题')
 
 
 if __name__ == '__main__':

@@ -209,7 +209,9 @@ func (f *fakeUpstream) server() *httptest.Server {
 			f.checkinCalls.Add(1)
 			w.Write([]byte(`{"code":0,"msg":"ok","data":{}}`))
 		case strings.HasSuffix(r.URL.Path, "/get-user-resource"):
-			w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[{"CycleCapacitySize":100,"CycleCapacityRemain":` +
+			// remain 需 <= size（upstream 取数钳 [0,size]：脏数据 remain>size 会被钳到
+			// size——上游真实数据恒一致，R-C 实测 Cycle{17,482,500}）。
+			w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[{"CycleCapacitySize":1000,"CycleCapacityRemain":` +
 				jsonI64(f.resourceRemain) + `,"CycleCapacityUsed":0}]}}}}`))
 		case strings.HasSuffix(r.URL.Path, "/token/refresh"):
 			f.refreshCalls.Add(1)
@@ -402,7 +404,8 @@ func (s *checkinStub) server() *httptest.Server {
 			}
 			w.Write([]byte(s.checkinBody))
 		case strings.HasSuffix(r.URL.Path, "/get-user-resource"):
-			w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[{"CycleCapacitySize":100,"CycleCapacityRemain":` +
+			// remain 需 <= size（upstream 取数钳 [0,size]，见 fakeUpstream 同名注释）。
+			w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[{"CycleCapacitySize":1000,"CycleCapacityRemain":` +
 				jsonI64(s.resourceRemain) + `,"CycleCapacityUsed":0}]}}}}`))
 		case strings.HasSuffix(r.URL.Path, "/token/refresh"):
 			s.refreshCalls.Add(1)
@@ -721,5 +724,29 @@ func TestRunKeepaliveBackfillsRealm(t *testing.T) {
 				t.Errorf("realm=%q want %q after idempotent run", b2.RealmStored(), c.wantRealm)
 			}
 		})
+	}
+}
+
+// TestCheckinPathIncludesManualDisabled 手动停用号必须仍参与签到（issue #138
+// 用户硬约束：停用只是对话流量摘除，签到/保活照常）。scheduler 判据只看
+// st.Disabled——本锚防未来有人把判据改成「 Disabled || ManualDisabled 」时
+// 无声破坏停用号的积分与 token 活性（审查改造点 4 的 scheduler 回归锚）。
+func TestCheckinPathIncludesManualDisabled(t *testing.T) {
+	stub := &checkinStub{checkinBody: `{"code":0,"msg":"ok","data":{}}`, resourceRemain: 500}
+	s, p := newCheckinS(t, stub)
+	p.SetManualDisabled("u1", true, "观察几天")
+
+	out, err := s.CheckinAll()
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if len(out) != 1 || out[0].Status != CheckinOK {
+		t.Fatalf("手动停用号应照常签到, out=%+v", out)
+	}
+	if stub.refreshCalls.Load() != 0 {
+		t.Errorf("token 未到期不应触发预刷新, calls=%d", stub.refreshCalls.Load())
+	}
+	if st, _ := p.Status("u1"); !st.ManualDisabled || st.Credits != 500 {
+		t.Fatalf("签到后应保留手动位且回填余额: %+v", st)
 	}
 }

@@ -50,24 +50,29 @@ jobs:
         run: |
           rm -rf /tmp/patched && mkdir -p /tmp/patched
           cp -r vendor/wb2api vendor/manager /tmp/patched/
+          # 补丁脚本自带 fail-fast 断言（锚点找不到即非零退出），失败会中断本步
           python docker/patches/apply.py /tmp/patched
+
           # 补丁必须真的落到文件里，不能只"没报错"
-          grep -q "Proxy:               http.ProxyFromEnvironment" \
-            /tmp/patched/wb2api/internal/upstream/client.go \
-            || { echo "::error::补丁 2 未生效（client.go 缺少 Proxy 字段）"; exit 1; }
+          grep -q "Proxy: http.ProxyFromEnvironment" \
+            /tmp/patched/wb2api/internal/upstream/transport.go \
+            || { echo "::error::补丁 2 未生效（transport.go 缺少 Proxy 字段）"; exit 1; }
           grep -q "_internal_direct_mounts" \
             /tmp/patched/manager/server/config.py \
             || { echo "::error::补丁 1 未生效（config.py 缺少 mounts 逻辑）"; exit 1; }
-          grep -q "docker compose pull" \
-            /tmp/patched/manager/web/components/common/settings/UpdatePanel.tsx \
-            || { echo "::error::补丁 3 未生效（更新面板仍显示裸机文案）"; exit 1; }
-          # 旧的误导文案必须消失，否则用户会以为点按钮就能更新
-          if grep -q "点下方按钮即可更新" \
-            /tmp/patched/manager/web/components/common/settings/UpdatePanel.tsx; then
-            echo "::error::更新面板仍残留裸机误导文案"
+
+          # 反向断言：这两处补丁**只应**改动代理相关代码。
+          # 若上游前端/更新器被本脚本改动，说明有人又加了脆弱的文案补丁 ——
+          # 那类补丁每次上游改字都会失效，且收益仅是措辞更贴切（见 UPSTREAMS.md）。
+          if grep -q "集成补丁" /tmp/patched/manager/web/components/common/settings/UpdatePanel.tsx; then
+            echo "::error::前端被打了补丁 —— 本发行版不对上游前端做任何改动"
             exit 1
           fi
-          echo "补丁校验通过"
+          if grep -q "集成补丁" /tmp/patched/manager/server/services/updater.py; then
+            echo "::error::更新器被打了补丁 —— 应改用上游的 can_update_upstream 能力驱动"
+            exit 1
+          fi
+          echo "补丁校验通过（2 处，均在代理相关代码）"
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -162,6 +167,26 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
+      # 套件版本：写入镜像的 OCI 标签（org.opencontainers.image.version），
+      # 便于 `docker inspect` 确认"跑的是哪个构建"。
+      #
+      # ⚠️ 它**不参与**面板的版本检测 —— 面板显示的是上游 manager 的版本号
+      # 变化（如 v1.0.31 → v1.0.35），用作"该同步上游快照了"的提醒。
+      # 早期曾试图把面板版本改成套件版本，结果是用户看不到上游版本变化，
+      # 已回退（见 CHANGELOG 与 UPSTREAMS.md）。
+      #
+      # 优先用 git tag（vX.Y.Z）；没有 tag 时用 sha-<short>。
+      - name: Compute suite version
+        id: suite
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            V="${GITHUB_REF#refs/tags/}"
+          else
+            V="sha-${GITHUB_SHA::7}"
+          fi
+          echo "version=${V}" >> "$GITHUB_OUTPUT"
+          echo "套件版本（仅作镜像标签）: ${V}"
+
       - name: Build & push multi-arch
         uses: docker/build-push-action@v6
         with:
@@ -175,7 +200,7 @@ jobs:
             GITHUB_REPOSITORY=${{ github.repository }}
             WB2API_COMMIT=${{ steps.pins.outputs.wb2api }}
             MANAGER_COMMIT=${{ steps.pins.outputs.manager }}
-            SUITE_VERSION=${{ github.ref_name }}
+            SUITE_VERSION=${{ steps.suite.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

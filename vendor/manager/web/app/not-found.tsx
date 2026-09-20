@@ -3,8 +3,16 @@ import {motion} from 'motion/react';
 import {Button} from '@/components/ui/button';
 import {Home} from 'lucide-react';
 import Link from 'next/link';
+import {isCjkLocale} from '@/lib/i18n';
+import {useI18n} from '@/lib/i18n/provider';
 
 export default function NotFound() {
+  const {t, locale} = useI18n();
+  // 逐字入场动画对中文/日文成立；拉丁文字按字符拆会变成 P-a-g-e，改为按词拆
+  const split = (text: string) => (isCjkLocale(locale) ? text.split('') : text.split(' '));
+  const lead = t('notFound.line1');
+  const tail = t('notFound.line2');
+
   return (
     <div className="fixed inset-0 flex items-center justify-center dark:bg-black bg-white">
       <div className="mx-auto max-w-7xl px-4 text-center sm:px-6 md:px-8 lg:px-12">
@@ -14,7 +22,7 @@ export default function NotFound() {
           transition={{duration: 0.6, delay: 0.2}}
         >
           <p className="font-bold text-xl md:text-4xl dark:text-white text-black">
-            {'页面'.split('').map((word, idx) => (
+            {split(lead).map((word, idx) => (
               <motion.span
                 key={idx}
                 className="inline-block"
@@ -26,7 +34,7 @@ export default function NotFound() {
               </motion.span>
             ))}
             <span className="text-neutral-400">
-              {'未找到'.split('').map((word, idx) => (
+              {split(tail).map((word, idx) => (
                 <motion.span
                   key={idx}
                   className="inline-block"
@@ -47,7 +55,7 @@ export default function NotFound() {
           transition={{duration: 0.6, delay: 0.6}}
         >
           <p className="text-sm md:text-lg text-neutral-500 mx-auto max-w-2xl py-4">
-            抱歉，您访问的页面不存在或已被永久移动。
+            {t('notFound.desc')}
           </p>
         </motion.div>
 
@@ -60,7 +68,7 @@ export default function NotFound() {
           <Link href="/dashboard">
             <Button size="lg" className="rounded-full">
               <Home className="mr-2 h-4 w-4" />
-              返回首页
+              {t('notFound.back')}
             </Button>
           </Link>
         </motion.div>

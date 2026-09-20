@@ -20,6 +20,7 @@ import {AiChatInput, type ChatModelOption} from '@/components/ui/ai-chat-input';
 import {CopyButton} from '@/components/ui/copy-button';
 import {playgroundApi, errText} from '@/lib/api';
 import {notify} from '@/lib/toast';
+import {useT} from '@/lib/i18n/provider';
 import {fmtCredit} from '@/lib/format';
 import {cn} from '@/lib/utils';
 import {useAuth} from '@/lib/auth-context';
@@ -37,6 +38,7 @@ interface Msg {
 }
 
 export default function PlaygroundPage() {
+  const t = useT();
   const {isAdmin} = useAuth();
   const {realm, label: realmName} = useRealm();
   const [models, setModels] = useState<ChatModelOption[]>([]);
@@ -130,7 +132,7 @@ export default function PlaygroundPage() {
       }
 
       const reader = res.body?.getReader();
-      if (!reader) throw new Error('响应不可读');
+      if (!reader) throw new Error(t('playground.unreadable'));
       const decoder = new TextDecoder();
       let buf = '';
       let answer = '';
@@ -174,7 +176,7 @@ export default function PlaygroundPage() {
         const copy = [...cur];
         copy[copy.length - 1] = {
           role: 'assistant',
-          content: answer || '（模型没有返回内容）',
+          content: answer || t('playground.emptyAnswer'),
           credit,
           tokens,
           done: true,
@@ -187,7 +189,7 @@ export default function PlaygroundPage() {
         setMsgs((cur) => {
           const copy = [...cur];
           const last = copy[copy.length - 1];
-          copy[copy.length - 1] = {...last, done: true, content: last.content || '（已停止）'};
+          copy[copy.length - 1] = {...last, done: true, content: last.content || t('playground.stopped')};
           return copy;
         });
       } else {
@@ -225,8 +227,8 @@ export default function PlaygroundPage() {
     // 任何视口高度都不会重叠。
     <div className="flex min-h-0 flex-1 flex-col gap-4 md:gap-6">
       <PageHeader
-        title="聊天测试台"
-        description={`${realmName}账号试调模型，不需要先创建 API 密钥；真实消耗积分，仅管理员可用`}
+        title={t('playground.title')}
+        description={t('playground.description', {realm: realmName})}
         actions={
           <>
             <Button
@@ -235,11 +237,11 @@ export default function PlaygroundPage() {
               className="rounded-full"
               onClick={() => {
                 loadModels();
-                notify.info('已刷新模型列表');
+                notify.info(t('playground.modelsRefreshed'));
               }}
             >
               <RefreshCw />
-              刷新模型
+              {t('playground.refreshModels')}
             </Button>
             <Button
               variant="outline"
@@ -249,7 +251,7 @@ export default function PlaygroundPage() {
               onClick={clear}
             >
               <Eraser />
-              清空对话
+              {t('playground.clearChat')}
             </Button>
           </>
         }
@@ -259,10 +261,9 @@ export default function PlaygroundPage() {
         <div className="flex items-start gap-2.5 rounded-[20px] border border-amber-500/30 bg-amber-500/10 p-4 text-xs">
           <Info className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
           <div className="space-y-1">
-            <div className="font-medium">需要管理员权限</div>
+            <div className="font-medium">{t('playground.adminRequired')}</div>
             <div className="text-muted-foreground">
-              测试台会真实消耗账号积分，因此只对管理员开放。请让管理员在「设置 → 管理用户」把你的角色调整为
-              admin。
+              {t('playground.adminRequiredDesc')}
             </div>
           </div>
         </div>
@@ -276,16 +277,16 @@ export default function PlaygroundPage() {
                 <div className="flex h-full items-center justify-center">
                   <div className="max-w-md space-y-2 text-center">
                     <Bot className="mx-auto h-7 w-7 text-muted-foreground/60" />
-                    <div className="text-sm font-medium">开始一次试调</div>
+                    <div className="text-sm font-medium">{t('playground.startTitle')}</div>
                     <p className="text-[11px] leading-5 text-muted-foreground">
-                      在下方输入内容并回车即可。请求会经本管理端转发到上游，
-                      与下游调用走同一套账号池；回答支持流式输出，
-                      每条回答的实际消耗积分会标在气泡下方。
+                      {t('playground.startDesc')}
                     </p>
                     {currentModel && (
                       <p className="text-[10px] text-muted-foreground/70">
-                        当前模型 <span className="font-mono">{currentModel.id}</span>
-                        {currentModel.efforts.length > 0 && `，支持推理档位 ${currentModel.efforts.join(' / ')}`}
+                        {t('playground.currentModel')}{' '}
+                        <span className="font-mono">{currentModel.id}</span>
+                        {currentModel.efforts.length > 0 &&
+                          t('playground.supportsEfforts', {efforts: currentModel.efforts.join(' / ')})}
                       </p>
                     )}
                   </div>
@@ -327,29 +328,31 @@ export default function PlaygroundPage() {
                             <CopyButton
                               value={m.content}
                               label=""
-                              title="复制回答"
+                              title={t('playground.copyAnswer')}
                               className="h-6 w-6"
                             />
                             <button
                               type="button"
-                              title="回答不错"
+                              title={t('playground.goodAnswer')}
                               className="transition-colors hover:text-foreground"
-                              onClick={() => notify.ok('已记录反馈')}
+                              onClick={() => notify.ok(t('playground.feedbackRecorded'))}
                             >
                               <ThumbsUp className="h-3 w-3" />
                             </button>
                             <button
                               type="button"
-                              title="回答有问题"
+                              title={t('playground.badAnswer')}
                               className="transition-colors hover:text-foreground"
-                              onClick={() => notify.info('已记录反馈', '可到设置页的反馈入口提交详情')}
+                              onClick={() =>
+                                notify.info(t('playground.feedbackRecorded'), t('playground.feedbackDetail'))
+                              }
                             >
                               <ThumbsDown className="h-3 w-3" />
                             </button>
                             {typeof m.credit === 'number' && (
                               <span
                                 className="inline-flex items-center gap-1 text-[10px] tabular-nums"
-                                title="本次调用的实际扣费（上游 usage.credit）"
+                                title={t('playground.creditTitle')}
                               >
                                 <Coins className="h-3 w-3" />
                                 {fmtCredit(m.credit)}
@@ -394,17 +397,17 @@ export default function PlaygroundPage() {
                 <div className="mt-1.5 flex items-center justify-between gap-2 px-1">
                   <span className="truncate text-[11px] text-muted-foreground">
                     {models.length > 0
-                      ? `共 ${models.length} 个可用模型`
-                      : '未取到模型，请检查「模型中心」'}
+                      ? t('playground.modelsAvailable', {count: models.length, n: models.length})
+                      : t('playground.noModels')}
                   </span>
                   {/* 实时消耗：本次会话累计 */}
                   <Badge
                     variant="secondary"
                     className="shrink-0 rounded-full text-[10px] tabular-nums"
-                    title="本次会话累计消耗的积分（每条回答来自上游 usage.credit）"
+                    title={t('playground.sessionCreditTitle')}
                   >
                     <Coins className="mr-1 h-3 w-3" />
-                    本次消耗 {fmtCredit(sessionCredit)}
+                    {t('playground.sessionCredit', {v: fmtCredit(sessionCredit)})}
                   </Badge>
                 </div>
               </div>
@@ -418,11 +421,11 @@ export default function PlaygroundPage() {
             字号 11px / 行高 20px：中文在这个组合下不挤，也不至于淡到看不清。
           */}
           <p className="mx-auto max-w-lg shrink-0 text-center text-[11px] leading-5 text-muted-foreground">
-            测试台仅用于调试（走管理端登录态，不经密钥与 IP 管控）
+            {t('playground.footnote1')}
             <span className="mx-1.5 text-muted-foreground/40">·</span>
-            正式接入请用「API 密钥」页签发的 wbk_ 密钥
+            {t('playground.footnote2')}
             <span className="mx-1.5 text-muted-foreground/40">·</span>
-            不支持的推理档位上游会自动降级
+            {t('playground.footnote3')}
           </p>
         </>
       )}

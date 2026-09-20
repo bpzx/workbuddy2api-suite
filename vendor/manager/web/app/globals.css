@@ -289,3 +289,48 @@ button {
   /* bg-gray-700 */
   color: var(--sidebar-primary-foreground);
 }
+
+/*
+ * 按钮内图标的尺寸与清晰度。
+ *
+ * 症状：按钮里的图标又大又「发虚」——灰蒙蒙一圈，与旁边实心的文字反差明显。
+ *
+ * 根因（实测确认，探针见 dev/icon-probe.mjs）：
+ *   1. **尺寸没生效**：按钮上的 `[&_svg:not([class*=\'size-\'])]:size-4` 因转义
+ *      单引号编成了 `svg:not([class*="'size-'"])`，属性值多了两个引号，永远匹配不上，
+ *      图标一直按 lucide 默认的 24px 渲染（按钮才 32px 高）。
+ *   2. **比例失配**：图标按 24px 渲染后，特征尺寸大而描边只有 2px，
+ *      相邻 14px 的中文笔画又密又重，于是图标显得又大又「虚」。
+ *
+ * 处理：**只把尺寸改回设计意图的 16px（1rem）**，描边与渲染方式一律保持 lucide 默认。
+ * 这样按钮图标与**底部工具栏图标参数完全一致**（16px + 描边 2 + 默认平滑渲染）——
+ * 底栏那套是用户认可的清晰度基准。
+ *
+ * ⚠️ 走过的弯路（务必别重蹈）：曾为了让「实心黑 / 中间灰像素比」这个自造指标变好，
+ * 加了 `stroke-width: 3` 与 `shape-rendering: crispEdges`。指标从 1.2 升到 4.6，
+ * 但**观感明显更差**——crispEdges 会关掉弧形描边的抗锯齿，`hand-coins` 这类
+ * 小尺寸曲线图标直接糊成色块、里面的「1」被填死。指标之所以被骗，是因为它奖励
+ * 「灰像素少」，而抗锯齿消失恰好让灰像素归零。
+ *
+ * 结论两条：
+ *   · 小尺寸曲线图标**必须保留抗锯齿**，不要用 crispEdges / 加粗描边去「锐化」；
+ *   · 判断清晰度要看**真机截图**（dev/icon-ab.mjs 在真实页面上并排渲染多组参数），
+ *     不要只看像素统计——统计指标很容易被自己的改动带偏。
+ *
+ *   Tailwind 的 utilities 层排在 components 之后，所以显式写的
+ *   `h-3.5 w-3.5` / `size-5` 会自然覆盖这里的默认值，不需要 `:not()` 守卫。
+ *
+ * 选择器为什么要带 `-trigger`：`<ConfirmDialog trigger={<Button/>}>` 这类组合里，
+ * Radix 的 `asChild` 会把 Button 上的 `data-slot="button"` 覆盖成
+ * `alert-dialog-trigger`（实测如此），只写 `[data-slot='button']` 会漏掉
+ * 「删除账号 / 重启 / 清空日志」这些危险操作按钮。用 `[data-slot$='-trigger']`
+ * 一并覆盖，顺带修好 Select / Tabs 触发器里同样偏大的图标。
+ *
+ * 只作用于按钮与触发器：底栏、图表、插图里的大图标保持原有平滑渲染，避免弧线出现锯齿。
+ */
+@layer components {
+  :is([data-slot='button'], [data-slot$='-trigger']) svg.lucide {
+    width: 1rem;
+    height: 1rem;
+  }
+}

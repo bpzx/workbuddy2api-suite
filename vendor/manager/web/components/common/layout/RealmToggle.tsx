@@ -4,12 +4,9 @@ import {Globe, House} from 'lucide-react';
 import {motion} from 'motion/react';
 
 import {useRealm, type Realm} from '@/lib/realm-context';
+import {useT} from '@/lib/i18n/provider';
+import {RichText} from '@/lib/i18n/rich-text';
 import {cn} from '@/lib/utils';
-
-const OPTIONS: {id: Realm; label: string; icon: typeof House}[] = [
-  {id: 'cn', label: '国内版', icon: House},
-  {id: 'global', label: '国际版', icon: Globe},
-];
 
 /**
  * 版本切换（国内版 / 国际版）。
@@ -21,14 +18,19 @@ const OPTIONS: {id: Realm; label: string; icon: typeof House}[] = [
  */
 export function RealmToggle({compact = false}: {compact?: boolean}) {
   const {realm, setRealm} = useRealm();
+  const t = useT();
+  const options: {id: Realm; label: string; title: string; icon: typeof House}[] = [
+    {id: 'cn', label: t('realm.cn'), title: t('realm.cnTitle'), icon: House},
+    {id: 'global', label: t('realm.global'), title: t('realm.globalTitle'), icon: Globe},
+  ];
 
   return (
     <div
       className="inline-flex items-center gap-0.5 rounded-full border border-border/60 bg-muted/60 p-0.5"
       role="tablist"
-      aria-label="版本切换"
+      aria-label={t('realm.switch')}
     >
-      {OPTIONS.map(({id, label, icon: Icon}) => {
+      {options.map(({id, label, title, icon: Icon}) => {
         const active = realm === id;
         return (
           <button
@@ -36,7 +38,7 @@ export function RealmToggle({compact = false}: {compact?: boolean}) {
             type="button"
             role="tab"
             aria-selected={active}
-            title={id === 'global' ? '国际版（workbuddy.ai）' : '国内版（codebuddy.cn）'}
+            title={title}
             onClick={() => setRealm(id)}
             className={cn(
               'relative flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-medium transition-colors',
@@ -63,6 +65,7 @@ export function RealmToggle({compact = false}: {compact?: boolean}) {
 /** 页面内的版本提示条：说明当前版本会影响哪些内容 */
 export function RealmNote({className}: {className?: string}) {
   const {realm} = useRealm();
+  const t = useT();
   if (realm === 'cn') return null;
   return (
     <div
@@ -72,11 +75,8 @@ export function RealmNote({className}: {className?: string}) {
       )}
     >
       <Globe className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-      <span>
-        当前为<b>国际版</b>视图（workbuddy.ai）。国际版<b>没有签到 / 猫猫旅行 /
-        开学季 / 夜猫任务</b>（积分只来自一次性 trial），保活与活跃上报照常执行，
-        因此任务类页面记录较少属正常，不是数据丢失。
-      </span>
+      {/* 加粗位置由译文自己决定：各语言语序不同，拆成多个 JSX 片段必然错位 */}
+      <RichText text={t('realm.note')} />
     </div>
   );
 }

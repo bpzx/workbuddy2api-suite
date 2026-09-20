@@ -203,16 +203,21 @@ docker compose pull && docker compose up -d   # 更新到最新镜像
 
 镜像构建在 GitHub Actions 上完成并推送到 ghcr.io。
 
-**容器内不提供「一键更新」**（没有 git、systemd，镜像层只读）。
-面板上「更新」按钮**不会改动任何代码**——点击后它只会在日志里打印下面的
-命令，供你复制到宿主机执行：
+**本发行版用预构建镜像，容器内不做代码更新。** 面板上的「更新」按钮由上游的
+能力判定自动处理：本发行版经 socket 代理访问 docker 且关闭了 `/info` 端点，
+因此界面会**自动禁用**更新按钮并提示到宿主机操作。
 
 ```bash
 docker compose pull && docker compose up -d
 ```
 
 > 面板会提示 "管理端 vX → vY" 这类新版本信息，那个检测本身有效
-> （它查 GitHub 上的版本号），只是**更新动作必须在宿主机做**。
+> （它查上游 GitHub 上的 Release 版本号），**用途是提醒"上游发新版了、
+> 该去同步快照"**，不是"本镜像该更新了"。同步流程见下节。
+
+若"仅更新管理端"按钮可点（目标为 manager，不受 docker 能力限制），
+点击后也会得到同样提示 —— 因为容器内替换的代码会被下次 `pull` 的镜像层覆盖，
+结果是"版本号变了、代码还是旧的"，比不更新更难排查。
 > 界面上相关文案已改为容器部署的真实说明。
 >
 > 同样地，「固定上游版本」输入框在容器里不可用（没有上游 git 仓库，
@@ -269,10 +274,11 @@ git pull
 |---|---|
 | 上游更新需人工同步 | 快照不会自动跟随；用 `sync-upstreams.sh` + 漂移检测 issue 兜住 |
 | 单镜像体积偏大 | 同时含 Go 二进制、Python 运行时与前端产物，换来版本一致与单产物发布 |
-| 面板「上游本地版本」显示未知 | 容器内没有上游 git 仓库；以 `upstreams.json` 与镜像标签为准 |
+| 面板「上游本地版本」显示未知 | 面板的版本行比较的是上游 Release 与代码里的版本号；commit 级信息在容器内取不到（无上游 git 仓库），已由上游能力判定自然隐藏 |
 | socket 代理仍有权限 | 它允许容器重启与读日志，等于把这两项能力交给 manager 容器；已通过禁用 exec/build/volumes 与私有网络收敛，但非零风险 |
 | 容器入口以 root 启动 | 仅为 chown 数据目录后立刻 gosu 降权到 uid 10001；服务进程本身非 root。这是宿主目录挂载的必然代价（命名卷无此问题） |
-| 代理能力靠构建期补丁注入 | 上游的 httpx 内网绕过、Go transport 代理支持均以补丁实现（`docker/patches/apply.py`）。上游若重构对应代码，**构建会失败**并指出要改哪里——这是刻意设计，避免静默失效 |
+| 代理能力靠构建期补丁注入 | 仅两处：httpx 内网绕过、Go transport 代理支持（`docker/patches/apply.py`，207 行）。上游若重构对应代码，**构建会失败**并指出要改哪里——这是刻意设计，避免静默失效。其余集成需求一律采用上游官方行为 |
+| 面板更新按钮不可用 | 本发行版经 socket 代理访问 docker 且关闭 `/info` 端点，`can_update_upstream` 为 False，故更新按钮自动禁用并提示宿主机操作。这是上游的能力驱动设计，非缺陷 |
 | 网关不认 `ALL_PROXY` | Go 标准库只读 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`；代理只配在 `ALL_PROXY` 时网关不走代理 |
 | Python 测试在 Windows 有 2 个失败 | `test_first_token` 的临时目录清理在 Windows 上抛 `NotADirectoryError`（上游 `tearDown` 只捕获 `PermissionError`）；Linux / CI 通过 |
 

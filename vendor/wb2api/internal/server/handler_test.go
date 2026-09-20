@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,8 +24,14 @@ import (
 
 // TestMain 默认关闭聊天表格日志（chatLogEnabled=false），消除 go test 期间的 stdout 噪音。
 // 断言表格行输出的测试（logging_test.go 中的 ChatLogs/LogChatRow 系列）用 withChatLog 临时开启。
+// 同时把轮转退避基数置 0（backoff.go：测试不等退避；退避界断言测试临时恢复）。
+// 另：/v1/models 四级查找链（upstream.model_catalog/modelsdev）是包级单例——
+// 复位入口与 dynamicModelsCache 同理，避免跨测试缓存污染与测试末尾异步 goroutine
+// 对 models.dev 发起真实网络请求。
 func TestMain(m *testing.M) {
 	chatLogEnabled = false
+	rotateBackoffBase = 0
+	upstream.ResetLookupChainForTest()
 	os.Exit(m.Run())
 }
 
@@ -120,6 +127,11 @@ func testPoolWith(auths ...*auth.Auth) *pool.Pool {
 	return p
 }
 
+// errReader 固定返回 err 的 io.Reader：模拟客户端发送 body 中途断流。
+type errReader struct{ err error }
+
+func (r errReader) Read([]byte) (int, error) { return 0, r.err }
+
 // assertJSONErrorCode 断言响应体是 OpenAI 风格 error 信封且 code 精确等于 want。
 func assertJSONErrorCode(t *testing.T, body, want string) bool {
 	t.Helper()
@@ -139,86 +151,56 @@ func assertJSONErrorCode(t *testing.T, body, want string) bool {
 	return true
 }
 
-// TestChatBodyLimitExactAllowed 恰好等于上限的请求体正常放行到上游（不被 413 误伤）。
-func TestChatBodyLimitExactAllowed(t *testing.T) {
+// TestChatLargeBodyProceeds 无请求体大小上限（max_body_mb 已移除）：任意大 body 完整
+// 读入并正常进入后续处理（打到上游），网关侧不再 413 预拦截。超限类问题交由上游
+// 自然返回错误（错误响应经既有分类链路透出，信息量更大），网关不挡上游真实行为。
+func TestChatLargeBodyProceeds(t *testing.T) {
 	var calls int
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		calls++
 		return 200, sseOK, true
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up, MaxBodyBytes: 100})
-	const prefix = `{"model":"glm-5.2","messages":[],"pad":"`
-	const suffix = `"}`
-	pad := strings.Repeat("a", 100-len(prefix)-len(suffix)) // 恰好 100 字节
-	if body := prefix + pad + suffix; len(body) != 100 {
-		t.Fatalf("fixture len=%d want 100", len(body))
-	}
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	// 远超旧 8MB 默认上限的合法 JSON body（50MB+）：必须完整读入、照常进上游。
+	pad := strings.Repeat("a", 50<<20)
+	var b bytes.Buffer
+	b.WriteString(`{"model":"glm-5.2","messages":[],"pad":"`)
+	b.WriteString(pad)
+	b.WriteString(`"}`)
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(prefix+pad+suffix)))
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(b.Bytes())))
 	if rec.Code != 200 {
-		t.Fatalf("code=%d body=%s (exactly-at-limit body must proceed)", rec.Code, rec.Body)
+		t.Fatalf("code=%d body=%s (oversized body must proceed to upstream, no 413)", rec.Code, rec.Body)
 	}
 	if calls != 1 {
-		t.Errorf("upstream calls=%d want 1", calls)
-	}
-}
-
-// TestChatOversizedBodyReturns413 请求体超过上限 → 直接 413 request_body_too_large：
-// 不打上游（calls=0）、不罚账号（无冷却/无熔断计数/无禁用）、不轮转。
-func TestChatOversizedBodyReturns413(t *testing.T) {
-	var calls int
-	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
-		calls++
-		return 200, sseOK, true
-	})
-	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up, MaxBodyBytes: 100})
-	const prefix = `{"model":"glm-5.2","messages":[],"pad":"`
-	const suffix = `"}`
-	// 101 字节 > 100 上限。
-	pad := strings.Repeat("a", 100-len(prefix)-len(suffix)+1)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(prefix+pad+suffix)))
-	if rec.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("code=%d body=%s want 413", rec.Code, rec.Body)
-	}
-	body := rec.Body.String()
-	if !strings.Contains(body, "request_body_too_large") {
-		t.Errorf("body should carry request_body_too_large: %s", body)
-	}
-	if !strings.Contains(body, "server.max_body_mb") {
-		t.Errorf("413 message should name config key server.max_body_mb: %s", body)
-	}
-	if calls != 0 {
-		t.Errorf("upstream must not be called on 413, got %d", calls)
+		t.Errorf("upstream calls=%d want 1 (large body must reach upstream)", calls)
 	}
 	st, _ := p.Status("u1")
 	if st.Cooling || st.Disabled || st.ErrTotal != 0 {
-		t.Errorf("413 must not penalize account: %+v", st)
+		t.Errorf("large body must not penalize account: %+v", st)
 	}
 }
 
-// TestChatOversizedBodyDefaultLimitHeader 未显式设置 MaxBodyBytes 时兜底 8MB：
-// 8MB+1 的请求体必须 413（不再静默截断喂给上游，issue #41 根因）。
-func TestChatOversizedBodyDefaultLimit(t *testing.T) {
+// TestChatReadBodyErrorReturns400 客户端断流（读 body 出错）→ 400 invalid_request：
+// 这是 #41 截断防御语义的保留形态——移除预拦截后，截断只可能来自客户端自己断流，
+// 读错误在网关侧就地 400，不把半截 JSON 喂上游 unmarshal 报 unexpected EOF 罚号。
+func TestChatReadBodyErrorReturns400(t *testing.T) {
 	var calls int
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		calls++
 		return 200, sseOK, true
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up}) // 不注入 MaxBodyBytes → 默认 8MB
-
-	body := make([]byte, 8<<20+1) // 8MB+1
-	copy(body, `{"model":"glm-5.2","messages":[]}`)
+	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body)))
-	if rec.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("code=%d want 413 (8MB+1 must be rejected)", rec.Code)
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", errReader{errors.New("client reset")}))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d want 400 (read error)", rec.Code)
 	}
+	assertJSONErrorCode(t, rec.Body.String(), "invalid_request")
 	if calls != 0 {
-		t.Errorf("upstream must not be called, got %d", calls)
+		t.Errorf("upstream must not be called on read error, got %d", calls)
 	}
 }
 
@@ -261,7 +243,7 @@ func TestChatBadParamsRotatesWithoutPenalty(t *testing.T) {
 // 现状即透传 lastErr.Error()（含上游 body），本测试把它锁定为回归。
 func TestChatAllBadParams503CarriesUpstreamBody(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
-		return 400, `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF"}`, false
+		return 400, `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF","requestId":"req-xyz-777"}`, false
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(Config{Pool: p, Upstream: up})
@@ -273,6 +255,84 @@ func TestChatAllBadParams503CarriesUpstreamBody(t *testing.T) {
 	body := rec.Body.String()
 	if !strings.Contains(body, "11101") || !strings.Contains(body, "Unmarshal chat params failed") {
 		t.Errorf("503 message should carry upstream 11101 info: %s", body)
+	}
+	if !strings.Contains(body, "req-xyz-777") {
+		t.Errorf("503 message should carry upstream requestId: %s", body)
+	}
+}
+
+// TestChatPassesThroughUpstreamErrorWithCodeMsgRequestID 验收（error-passthrough）：
+// 构造上游错误响应（含 code/msg/requestId，非 429 状态码）经 handler 后，客户端可见的
+// error.message 必须等于上游 body 原文（code/msg/requestId 原样保留），而非网关固定文案
+// （任务书验收 2：透视可见真实上游错误）。
+func TestChatPassesThroughUpstreamErrorWithCodeMsgRequestID(t *testing.T) {
+	const raw = `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF","requestId":"req-xyz-777"}`
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 400, raw, false
+	})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != 503 {
+		t.Fatalf("code=%d body=%s (want 503)", rec.Code, rec.Body)
+	}
+	var e struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
+		t.Fatalf("resp not json: %v body=%s", err, rec.Body)
+	}
+	// error.message 必须等于上游原文（原样，非固定文案/非重建 JSON）。
+	if e.Error.Message != raw {
+		t.Errorf("message=%q want raw upstream body passthrough %q", e.Error.Message, raw)
+	}
+	if !strings.Contains(e.Error.Message, "11101") ||
+		!strings.Contains(e.Error.Message, "Unmarshal chat params failed") ||
+		!strings.Contains(e.Error.Message, "req-xyz-777") {
+		t.Errorf("message must preserve code/msg/requestId: %s", e.Error.Message)
+	}
+	if strings.Contains(e.Error.Message, "no_healthy_account") || strings.Contains(e.Error.Message, "all accounts are temporarily unavailable") {
+		t.Errorf("message must NOT be the fixed local scheduling text: %s", e.Error.Message)
+	}
+}
+
+// TestChatLocalNoAccountKeepsOwnMessage 验收（本地调度类错误）：池中无可用账号（本地
+// 调度失败，非上游返回）时，错误保留网关自有文案 no_healthy_account（任务书：内部调度
+// 类错误保留自有文案——本地没有上游原文可透传，不编造）。
+func TestChatLocalNoAccountKeepsOwnMessage(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		t.Fatal("no upstream call expected for empty pool")
+		return 200, "", false
+	})
+	// 空池：Pick 返回 nil → 本地调度失败，无上游错误可透传。
+	h := NewHandler(Config{Pool: testPoolWith(), Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != 503 {
+		t.Fatalf("code=%d want 503", rec.Code)
+	}
+	var e struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
+		t.Fatalf("resp not json: %v body=%s", err, rec.Body)
+	}
+	if e.Error.Code != "no_healthy_account" {
+		t.Errorf("code=%q want no_healthy_account (local scheduling error)", e.Error.Code)
+	}
+	if !strings.Contains(e.Error.Message, "all accounts are temporarily unavailable") {
+		t.Errorf("message=%q want fixed local scheduling message (no upstream to passthrough)", e.Error.Message)
 	}
 }
 
@@ -534,7 +594,7 @@ func TestApplyErrorPolicyAccountFaultSplit(t *testing.T) {
 		p.Add(&auth.Auth{UID: "u1"})
 		h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
 
-		h.applyErrorPolicy("u1", upstream.ErrAccountFault, `{"error":{"data":{"code":11140,"msg":"request illegal"}}}`, "glm-5.2")
+		h.applyErrorPolicy("u1", upstream.ErrAccountFault, `{"error":{"data":{"code":11140,"msg":"request illegal"}}}`, "glm-5.2", nil)
 		st, _ := p.Status("u1")
 		if !st.Disabled {
 			t.Fatalf("11140 应硬禁用: %+v", st)
@@ -552,7 +612,7 @@ func TestApplyErrorPolicyAccountFaultSplit(t *testing.T) {
 		p.Add(&auth.Auth{UID: "u1"})
 		h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
 
-		h.applyErrorPolicy("u1", upstream.ErrAccountFault, `{"error":{"data":{"code":14017,"msg":"The trial version is not yet activated"}}}`, "glm-5.2")
+		h.applyErrorPolicy("u1", upstream.ErrAccountFault, `{"error":{"data":{"code":14017,"msg":"The trial version is not yet activated"}}}`, "glm-5.2", nil)
 		st, _ := p.Status("u1")
 		if st.Disabled {
 			t.Fatalf("14017 不应禁用: %+v", st)
@@ -576,7 +636,7 @@ func TestApplyErrorPolicySoftRateNoDoubleWhenCooling(t *testing.T) {
 	h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
 
 	// 第 1 次：进入冷却，streak=1，600s（固定基数，无重置时间）。
-	h.applyErrorPolicy("u1", upstream.ErrSoftRate, "", "")
+	h.applyErrorPolicy("u1", upstream.ErrSoftRate, "", "", nil)
 	st, _ := p.Status("u1")
 	if !st.Cooling || st.CoolKind != "soft_rate" {
 		t.Fatalf("call 1: 应为 soft_rate 冷却: %+v", st)
@@ -591,7 +651,7 @@ func TestApplyErrorPolicySoftRateNoDoubleWhenCooling(t *testing.T) {
 	// 冷却中重复触发（兜底探测）→ 不翻倍、不推进 streak。
 	before := st.CoolRemaining
 	for n := 0; n < 3; n++ {
-		h.applyErrorPolicy("u1", upstream.ErrSoftRate, "", "")
+		h.applyErrorPolicy("u1", upstream.ErrSoftRate, "", "", nil)
 	}
 	st, _ = p.Status("u1")
 	if st.SoftStreak != 1 {
@@ -616,7 +676,7 @@ func TestApplyErrorPolicySoftRateResetTime11140(t *testing.T) {
 	ts := reset.In(upstream.SoftRateResetLoc()).Format("2006-01-02 15:04:05")
 	body := `{"code":11140,"msg":"The model provider is rate-limiting requests. 将在 ` + ts + ` UTC+8 重置"}`
 
-	h.applyErrorPolicy("u1", upstream.ErrSoftRate, body, "glm-5.3")
+	h.applyErrorPolicy("u1", upstream.ErrSoftRate, body, "glm-5.3", nil)
 	st, ok := p.Status("u1")
 	if !ok {
 		t.Fatal("u1 missing")
@@ -648,7 +708,7 @@ func TestApplyErrorPolicyNotFoundUsesFixedBase(t *testing.T) {
 
 	notFoundSec := int64(notFoundCooldown / time.Second)
 	for i := 0; i < 3; i++ {
-		h.applyErrorPolicy("u1", upstream.ErrNotFound, "", "")
+		h.applyErrorPolicy("u1", upstream.ErrNotFound, "", "", nil)
 		st, _ := p.Status("u1")
 		if !st.Cooling || st.CoolKind != "soft_rate" {
 			t.Fatalf("call %d: 应为 soft 冷却: %+v", i+1, st)
@@ -772,7 +832,7 @@ func TestChatStickyFullFallsBackToRotation(t *testing.T) {
 		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
 		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
 	)
-	// bad 占满唯一在途名额：PickByUID 将返回 nil（healthy 但 inFlight 满）→ 解绑 + 回落轮换。
+	// bad 占满唯一在途名额：粘性命中校验将返回 nil（healthy 但 inFlight 满）→ 解绑 + 回落轮换。
 	p.SetMaxInFlight(1)
 	p.Acquire("bad")
 
@@ -1028,6 +1088,7 @@ func TestChatHTTP4xxClientDoesNotPenalize(t *testing.T) {
 	}
 }
 
+// TestModelsEndpoint 纯动态：无健康上游（Upstream 指向不可达 base）→ 空列表 + 200。
 func TestModelsEndpoint(t *testing.T) {
 	resetModelsCache()
 	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: upstream.New()})
@@ -1043,17 +1104,8 @@ func TestModelsEndpoint(t *testing.T) {
 		t.Errorf("object=%v", resp["object"])
 	}
 	data := resp["data"].([]any)
-	if len(data) < 5 {
-		t.Errorf("models count=%d", len(data))
-	}
-	found := false
-	for _, m := range data {
-		if m.(map[string]any)["id"] == "cn:glm-5.2" {
-			found = true
-		}
-	}
-	if !found {
-		t.Error("cn:glm-5.2 missing (static models prefixed)")
+	if len(data) != 0 {
+		t.Errorf("models count=%d want 0 (pure dynamic, fetch failed)", len(data))
 	}
 }
 
@@ -1120,7 +1172,8 @@ func TestModelsDynamic(t *testing.T) {
 	}
 }
 
-func TestModelsDynamicFallsBackToStatic(t *testing.T) {
+// TestModelsDynamicFetchFailEmpty 纯动态：上游 500 → 空列表（无静态回退）。
+func TestModelsDynamicFetchFailEmpty(t *testing.T) {
 	// 清缓存
 	dynamicModelsCache.Lock()
 	dynamicModelsCache.ids = nil
@@ -1142,13 +1195,17 @@ func TestModelsDynamicFallsBackToStatic(t *testing.T) {
 	var resp map[string]any
 	json.Unmarshal(rec.Body.Bytes(), &resp)
 	data := resp["data"].([]any)
-	// 回退静态表（≥5 个）
-	if len(data) < 5 {
-		t.Errorf("static fallback failed: %d", len(data))
+	// 纯动态：失败 → 空
+	if len(data) != 0 {
+		t.Errorf("fetch failure should yield empty list (no static fallback): %d", len(data))
 	}
 }
 
-func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
+// TestModelsFetchFailureDoesNotPenalizeAccount models 拉取失败与 chat 熔断解耦
+// （P1-6/发现 6）：/v1/models 的动态拉取失败（Billing/Models 端点网络抖动）不喂
+// NoteError——该熔断器保护的是 chat 选号，models 拉取失败 ≠ 账号 chat 不可用，
+// 跨界惩罚会让上游 models 端点偶发 5xx 把好号提前打进熔断。失败只进 5min 负缓存。
+func TestModelsFetchFailureDoesNotPenalizeAccount(t *testing.T) {
 	// 清缓存
 	dynamicModelsCache.Lock()
 	dynamicModelsCache.ids = nil
@@ -1157,7 +1214,7 @@ func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
 	dynamicModelsCache.Unlock()
 
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	p.SetBreaker(1, time.Hour, time.Hour) // 熔断阈值 1：一次 fetch 失败即熔断
+	p.SetBreaker(1, time.Hour, time.Hour) // 熔断阈值 1：若误喂 NoteError 一次即熔断
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 500, `boom`, false
 	})
@@ -1165,11 +1222,26 @@ func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
 	if rec.Code != 200 {
-		t.Fatalf("code=%d (static fallback)", rec.Code)
+		t.Fatalf("code=%d (empty list on failure)", rec.Code)
 	}
 	st, _ := p.Status("u1")
-	if !st.Cooling {
-		t.Fatalf("fetch failure should trip breaker with threshold=1: %+v", st)
+	// 熔断器零观测：不喂 fails（breaker_fails=0）、不熔断（Cooling=false）、
+	// 不记 last_err/err_total。负缓存是唯一的失败退避（另测）。
+	if st.BreakerFails != 0 {
+		t.Errorf("models fetch failure should not feed breaker: breaker_fails=%d", st.BreakerFails)
+	}
+	if st.Cooling {
+		t.Errorf("models fetch failure should not trip breaker with threshold=1: %+v", st)
+	}
+	if st.ErrTotal != 0 {
+		t.Errorf("models fetch failure should not record err_total: %d", st.ErrTotal)
+	}
+	// 负缓存仍然生效：拉取失败进 lastFail（5min 冷却）。
+	dynamicModelsCache.RLock()
+	failTs := dynamicModelsCache.lastFail
+	dynamicModelsCache.RUnlock()
+	if failTs.IsZero() {
+		t.Error("negative cache (lastFail) should be set on fetch failure")
 	}
 }
 
@@ -1181,16 +1253,20 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 	dynamicModelsCache.lastFail = time.Time{}
 	dynamicModelsCache.Unlock()
 
+	// v3-config-merge：单次 fetch 并发打企业端点 + /v3/config，计数须并发安全。
+	var mu sync.Mutex
 	var calls int
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		mu.Lock()
 		calls++
+		mu.Unlock()
 		return 500, `boom`, false
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(Config{Pool: p, Upstream: up})
 
 	// 连续 3 次请求，上游持续 500 → 只应触发 1 次 fetch（负缓存生效），
-	// 其余走静态 fallback（仍返回 200）。
+	// 其余直接空列表（纯动态，仍返回 200）。
 	for i := 0; i < 3; i++ {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
@@ -1198,8 +1274,9 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 			t.Fatalf("req %d: code=%d body=%s", i, rec.Code, rec.Body)
 		}
 	}
-	if calls != 1 {
-		t.Errorf("want 1 fetch, got %d", calls)
+	if calls != 2 {
+		// v3-config-merge：单次 fetch 并发打企业端点 + /v3/config 两路 = 2 个上游请求。
+		t.Errorf("want 2 upstream calls (single fetch, enterprise + v3), got %d", calls)
 	}
 
 	// 冷却期结束（把失败时间戳拨回 10 分钟前）→ 应重新 fetch。
@@ -1211,13 +1288,15 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("after cooldown: code=%d", rec.Code)
 	}
-	if calls != 2 {
-		t.Errorf("want 2 fetch after cooldown, got %d", calls)
+	if calls != 4 {
+		// 第二次 fetch 同样两路并发：累计 4 个上游请求。
+		t.Errorf("want 4 upstream calls after cooldown (2nd fetch, enterprise + v3), got %d", calls)
 	}
 }
 
-// TestModelsDynamicZeroContextFallback 动态模型缺 maxInputTokens → context_length 兜底 131072，
-// 其余真实值不得被覆盖（issue 提醒：不能全表统一 131072 抹平真实 ContextLength）。
+// TestModelsDynamicZeroContextFallback 动态模型缺 maxInputTokens → context_length 走
+// 知识表/1M 兜底（context_catalog 三级查找），其余真实值不得被覆盖
+// （issue 提醒：不能全表统一抹平真实 ContextLength）。
 func TestModelsDynamicZeroContextFallback(t *testing.T) {
 	resetModelsCache()
 
@@ -1250,9 +1329,10 @@ func TestModelsDynamicZeroContextFallback(t *testing.T) {
 			real = m
 		}
 	}
-	// 缺 maxInputTokens → 兜底 131072（其余字段保持真实）。
-	if zc, _ := zero["context_length"].(float64); zc != 131072 {
-		t.Errorf("zero-ctx context_length=%v want 131072 fallback", zc)
+	// 缺 maxInputTokens → 知识表/1M 兜底（其余字段保持真实）。
+	// dyn-zero-ctx 不在知识表 → 1M；绝不再透出假 131072。
+	if zc, _ := zero["context_length"].(float64); zc != 1000000 {
+		t.Errorf("zero-ctx context_length=%v want 1000000 (unknown → 1M fallback)", zc)
 	}
 	if zo, _ := zero["max_output_tokens"].(float64); zo != 4096 {
 		t.Errorf("zero-ctx max_output_tokens=%v want 4096 (real value preserved)", zo)
@@ -1266,9 +1346,9 @@ func TestModelsDynamicZeroContextFallback(t *testing.T) {
 	}
 }
 
-// TestModelsDynamicUnderscoresStaticAndPreservesBodies 动态成功时优先动态结果（连 headers
-// 字段一并保留原样），失败才回退静态表——两条路径都产出 valid models 响应。
-func TestModelsDynamicUnderscoresStaticAndPreservesBodies(t *testing.T) {
+// TestModelsDynamicPreservesBodies 动态成功时产出全字段条目（连 headers 字段一并保留原样）；
+// 失败路径产出空列表（由 TestModelsDynamicFetchFailEmpty 覆盖）。
+func TestModelsDynamicPreservesBodies(t *testing.T) {
 	resetModelsCache()
 
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -1304,10 +1384,6 @@ func TestModelsDynamicUnderscoresStaticAndPreservesBodies(t *testing.T) {
 		t.Errorf("/v1/models must include cn:dyn-only when dynamic fetch succeeds: %v", resp.Data)
 	}
 
-	// 失败路径仍 return 静态表（既有行为由 TestModelsDynamicFallsBackToStatic 覆盖）。
-	if len(resp.Data) == 0 {
-		t.Fatal("static fallback produced empty list")
-	}
 }
 
 func TestAPIKeyAuth(t *testing.T) {
@@ -1338,6 +1414,42 @@ func TestAPIKeyAuth(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != 200 {
 		t.Errorf("right key: code=%d", rec.Code)
+	}
+}
+
+// TestAPIKeyAuthConstantTime Bearer 比较的边界回归（P2-8，发现 7）：
+// 正确 key 通过；错误/空/前缀相同但长度不同一律 401。
+// 常量时间属性（subtle.ConstantTimeCompare）本身无法用单元测试观测，
+// 此处锁的是行为等价——换实现前后四条断言必须同样成立。
+func TestAPIKeyAuthConstantTime(t *testing.T) {
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
+		Upstream: upstream.New(),
+		APIKey:   "secret",
+	})
+	cases := []struct {
+		name string
+		bear string // 完整 Authorization 头（不含 "Bearer " 前缀则按原样发）
+		want int
+	}{
+		{"correct key", "secret", 200},
+		{"wrong key", "wrong", 401},
+		{"empty key", "", 401},
+		{"same prefix longer", "secret-extra", 401},
+		{"same prefix shorter", "sec", 401},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/v1/models", nil)
+			req.Header.Set("Authorization", "Bearer "+c.bear)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			// 正确 key 会继续打到上游（GET /v1/models 走静态表 → 200）；
+			// 其余必须被 401 挡在鉴权层。
+			if rec.Code != c.want {
+				t.Errorf("Bearer %q: code=%d want %d", c.bear, rec.Code, c.want)
+			}
+		})
 	}
 }
 
@@ -1526,13 +1638,13 @@ func TestStatusRateLimitedModelsLedger(t *testing.T) {
 	// 未命中测试账号（u2 也被限流）也会带台账——但只断言 u1（被选中的号）即验证端到端。
 }
 
-// TestChatAllRateLimitedNormalizes429 端到端回归本次重构根因症状：全部账号都命中上游
-// 限流（200/400 + 速限文案，非 429 状态码）时，末端错误必须是规范化的 OpenAI 风格
-// 429 rate_limit_exceeded，而不是 503 + 原样透传上游原文
-// "The model provider is rate-limiting requests..."（不应泄露账号/上游内部措辞，也不应
-// 误报 503 让客户端以为网关挂了，错误应为"限流→等待重试"语义）。
-func TestChatAllRateLimitedNormalizes429(t *testing.T) {
-	const raw = `{"code":11140,"msg":"The model provider is rate-limiting requests. Please wait a moment and try again."}`
+// TestChatAllRateLimitedPassesThroughUpstream 端到端（error-passthrough）：全部账号都命中
+// 上游限流（400 + 速限文案，非 429 状态码）时，末端错误映射为 OpenAI 风格
+// 429 rate_limit_exceeded（限流语义保持），但 error.message **透传上游 body 原文**——
+// code/msg/requestId 原样保留，客户端必须能看到真实上游错误以便排查，不再规范化成
+// 固定文案（任务书：上游错误码/账号语义允许泄露给客户端）。
+func TestChatAllRateLimitedPassesThroughUpstream(t *testing.T) {
+	const raw = `{"code":11140,"msg":"The model provider is rate-limiting requests. Please wait a moment and try again.","requestId":"req-abc-123"}`
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 400, raw, false
 	})
@@ -1559,8 +1671,12 @@ func TestChatAllRateLimitedNormalizes429(t *testing.T) {
 	if e.Error.Code != "rate_limit_exceeded" {
 		t.Errorf("code=%q want rate_limit_exceeded", e.Error.Code)
 	}
-	if strings.Contains(rec.Body.String(), "rate-limiting requests") || strings.Contains(rec.Body.String(), "11140") {
-		t.Errorf("normalized error must not leak upstream raw body: %s", rec.Body)
+	// error.message 必须等于上游原文（含 code/msg/requestId），非固定文案。
+	if e.Error.Message != raw {
+		t.Errorf("message=%q want passthrough of upstream raw body %q", e.Error.Message, raw)
+	}
+	if !strings.Contains(e.Error.Message, "req-abc-123") {
+		t.Errorf("requestId must be preserved in message: %s", e.Error.Message)
 	}
 	// 两个号都被限流冷却（换号过程完整跑完仍无健康号）。
 	for _, uid := range []string{"u1", "u2"} {
@@ -1847,13 +1963,9 @@ func TestContentBlockedCustomModeDoesNotDegrade(t *testing.T) {
 	if !strings.Contains(body, `"code":"content_blocked"`) {
 		t.Errorf("want content_blocked code: %s", body)
 	}
-	if !strings.Contains(body, "触发网站风控违禁词") || !strings.Contains(body, "规则[违禁词]") {
-		t.Errorf("want firewall message with keyword, not error code: %s", body)
-	}
-	for _, leak := range []string{"11128", "account", "accounts", "账号", "upstream", "cooling", "no_healthy"} {
-		if strings.Contains(strings.ToLower(body), leak) {
-			t.Errorf("must not leak %q: %s", leak, body)
-		}
+	// error-passthrough：message 透传上游 body 原文（code/msg/requestId 原样），非网关固定文案。
+	if !strings.Contains(body, "blocked by security policy") || !strings.Contains(body, "11128") {
+		t.Errorf("want upstream raw body passthrough in message: %s", body)
 	}
 	if h.degrade.Active() {
 		t.Error("degrade should NOT be active in custom mode")
@@ -1861,7 +1973,8 @@ func TestContentBlockedCustomModeDoesNotDegrade(t *testing.T) {
 }
 
 // TestContentBlockedDoesNotPenalizeAccount ErrContentBlocked 不罚账号（无冷却/熔断/NoteError），
-// 且 passthrough 降级重试后第二次仍拦 → 立即 400 content_blocked（不轮转、不泄露上游错误码）。
+// 且 passthrough 降级重试后第二次仍拦 → 立即 400 content_blocked（不轮转），
+// message 透传上游 code/msg 原文（error-passthrough）。
 func TestContentBlockedDoesNotPenalizeAccount(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 400, `{"code":11128,"msg":"blocked by security policy"}`, false
@@ -1925,7 +2038,12 @@ func TestContentBlockedSecondHitReturns400(t *testing.T) {
 	if !assertJSONErrorCode(t, body, "content_blocked") {
 		return
 	}
-	for _, leak := range []string{"11128", "account", "accounts", "账号", "upstream", "cooling", "disabled", "no_healthy"} {
+	// error-passthrough：message 透传上游 body 原文（含 code 11128），任务书授权
+	// 上游错误码对客户端可见。仍不泄露账号 UID/冷却/本地调度身份。
+	if !strings.Contains(body, "11128") || !strings.Contains(body, "blocked by security policy") {
+		t.Errorf("want upstream raw body in message (11128 + policy text): %s", body)
+	}
+	for _, leak := range []string{"account", "accounts", "账号", "upstream", "cooling", "disabled", "no_healthy", "u1", "u2"} {
 		if strings.Contains(strings.ToLower(body), leak) {
 			t.Errorf("must not leak %q: %s", leak, body)
 		}
@@ -1940,7 +2058,8 @@ func TestContentBlockedSecondHitReturns400(t *testing.T) {
 }
 
 // TestContentBlockedReturnsFirewallMessage 内容拦截最终失败时回 400 content_blocked，
-// 文案为网关防火墙口径（含分类关键词），不含账号/冷却/upstream/错误码前缀。
+// message 透传上游 body 原文（含 code 11128 与审核文案），不含账号/冷却/本地前缀
+// （error-passthrough：上游错误码允许可见，账号 UID 与本地调度信息仍不暴露）。
 func TestContentBlockedReturnsFirewallMessage(t *testing.T) {
 	calls := 0
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -1977,11 +2096,13 @@ func TestContentBlockedReturnsFirewallMessage(t *testing.T) {
 	if envelope.Error.Code != "content_blocked" {
 		t.Errorf("code=%q want content_blocked", envelope.Error.Code)
 	}
-	want := "触发网站风控违禁词，无法调用模型：内容命中网关内容防火墙规则[nsfw]，已被拦截。请修改内容后重试。"
-	if envelope.Error.Message != want {
-		t.Errorf("message=%q want %q", envelope.Error.Message, want)
+	// message 为上游 body 原文（非网关固定文案）：含 code 11128 与审核原文。
+	if !strings.Contains(envelope.Error.Message, "11128") ||
+		!strings.Contains(envelope.Error.Message, "blocked by security policy") ||
+		!strings.Contains(envelope.Error.Message, "NSFW material") {
+		t.Errorf("message=%q 应为上游 body 原文（含 11128 与审核文案）", envelope.Error.Message)
 	}
-	for _, leak := range []string{"account", "accounts", "账号", "upstream", "cooling", "disabled", "no_healthy", "11128"} {
+	for _, leak := range []string{"account", "accounts", "账号", "upstream", "cooling", "disabled", "no_healthy", "u1", "u2"} {
 		if strings.Contains(strings.ToLower(rec.Body.String()), leak) {
 			t.Errorf("must not leak %q: %s", leak, rec.Body)
 		}
@@ -2269,5 +2390,282 @@ func TestContentBlockedCustomIgnoresActiveDegrade(t *testing.T) {
 	}
 	if strings.Contains(out, prompt.Degraded) {
 		t.Errorf("custom request must NOT use Degraded prompt even in degrade period: %s", out)
+	}
+}
+
+// TestStaleSnapshotBoundedByPickGate 粘性快照陈旧被 Pick 闸兜底的契约锚
+//（pr134-watchlist-analysis.md #10）：
+// session.ResolveForModel 在取任何锁之前拿 pool 可用性快照——若快照后、Pick 前
+// 粘性号 A 被冷却（快照陈旧判 available），Session 层仍会返回 A 作为建议 uid；
+// 但真正的可用性权威闸是 handler 的 Pool.PickByUIDForModel（锁内新鲜判定
+// healthyForModel）——A 冷却后返回 nil → unbindSticky 回落普通轮换。
+// 本测试锁死该兜底契约：Available 闭包返回含 A 的固定快照（永远陈旧），
+// A 预冷却，断言请求 200 落到 good、绑定收敛 good、A 从未被出站选中。
+// 若未来有人把 Pick 闸挪走（粘性 uid 不再经锁内校验直取），本测试立刻红。
+func TestStaleSnapshotBoundedByPickGate(t *testing.T) {
+	st := newBindStore()
+	sess := session.New(session.Config{
+		TTL:   time.Minute,
+		Store: st,
+		// 固定快照：永远包含 stale——模拟 ResolveForModel 取快照后 A 才被冷却的
+		// 陈旧窗口（此后无论如何查都返回同一份「A 可用」的旧快照）。
+		Available: func() []string { return []string{"stale", "good"} },
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "stale", AccessToken: "at-stale", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	// Pick 前冷却 A：pool 锁内新鲜状态 A 不可用，但 session 快照仍说可用。
+	p.Cooldown("stale", pool.CoolHard, time.Hour, "余额不足")
+
+	var sawStale atomic.Bool
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		if authz == "Bearer at-stale" {
+			sawStale.Store(true)
+		}
+		return 200, sseOK, true
+	})
+	h := NewHandler(Config{
+		Pool:         p,
+		Upstream:     up,
+		Session:      sess,
+		SoftCooldown: time.Minute,
+	})
+	sess.Bind("conv-1", "stale")
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s（陈旧快照必须被 Pick 闸兜底，请求成功落到 good）", rec.Code, rec.Body)
+	}
+	if sawStale.Load() {
+		t.Fatal("stale 号已冷却，不得被出站选中（PickByUIDForModel 闸失效）")
+	}
+	if uid, ok := st.lastUID("conv-1"); !ok || uid != "good" {
+		t.Fatalf("绑定应收敛到 good（stale 被 Pick 闸拒绝后解绑回落），got %s ok=%v", uid, ok)
+	}
+}
+
+// ---- prompt.mode=append 端到端（issue #129 C 组） ----
+
+// newBodyCaptureUpstream 返回捕获每次出站请求体的 fake 上游（behavior 按
+// 第几次调用返回响应；最后一次之后的调用沿用末次行为）。
+func newBodyCaptureUpstream(t *testing.T, bodies *[][]byte, behavior func(call int, body string) (int, string, bool)) *upstream.Client {
+	t.Helper()
+	return &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			raw, _ := io.ReadAll(r.Body)
+			*bodies = append(*bodies, raw)
+			status, respBody, isStream := behavior(len(*bodies), string(raw))
+			ct := "application/json"
+			if isStream {
+				ct = "text/event-stream"
+			}
+			return &http.Response{
+				StatusCode: status,
+				Header:     http.Header{"Content-Type": []string{ct}},
+				Body:       io.NopCloser(strings.NewReader(respBody)),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+}
+
+// TestHandlerAppendEndToEnd C1：mode=append → 上游收到：开头块原样 + GW 紧跟其后 + user 不动。
+func TestHandlerAppendEndToEnd(t *testing.T) {
+	var bodies [][]byte
+	up := newBodyCaptureUpstream(t, &bodies, func(call int, body string) (int, string, bool) {
+		return 200, sseOK, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "append", PromptText: "网关人格"})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[
+			{"role":"system","content":"项目规范"},
+			{"role":"developer","content":"工具约定"},
+			{"role":"user","content":"你好"}]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("want 1 upstream call, got %d", len(bodies))
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(bodies[0], &obj); err != nil {
+		t.Fatalf("unmarshal: %v body=%s", err, bodies[0])
+	}
+	msgs := obj["messages"].([]any)
+	if len(msgs) != 4 {
+		t.Fatalf("messages len=%d want 4: %s", len(msgs), bodies[0])
+	}
+	// 原始 system/developer 逐字在场。
+	if msgs[0].(map[string]any)["content"] != "项目规范" {
+		t.Errorf("original system missing: %s", bodies[0])
+	}
+	if msgs[1].(map[string]any)["content"] != "工具约定" {
+		t.Errorf("original developer missing: %s", bodies[0])
+	}
+	// GW 紧跟开头块。
+	gw := msgs[2].(map[string]any)
+	if gw["role"] != "system" || gw["content"] != "网关人格" {
+		t.Errorf("GW msg wrong: %v", gw)
+	}
+	// user 不动。
+	if msgs[3].(map[string]any)["content"] != "你好" {
+		t.Errorf("user content changed: %s", bodies[0])
+	}
+}
+
+// TestHandlerAppendDegradedActiveReplaces C2：降级期 append 退化为 replace(Degraded)——
+// 原始 system 不在场、Degraded 在场（降级矩阵第三行）。
+func TestHandlerAppendDegradedActiveReplaces(t *testing.T) {
+	var bodies [][]byte
+	up := newBodyCaptureUpstream(t, &bodies, func(call int, body string) (int, string, bool) {
+		return 200, sseOK, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "append", PromptText: "网关人格"})
+	h.degrade.Trigger() // 预置降级期（模拟 append 首遇后进入降级窗口）
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[
+			{"role":"system","content":"原始指纹"},
+			{"role":"user","content":"hi"}]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("want 1 upstream call (direct to Degraded), got %d", len(bodies))
+	}
+	out := string(bodies[0])
+	if !strings.Contains(out, prompt.Degraded) {
+		t.Errorf("body should contain Degraded: %s", out)
+	}
+	if strings.Contains(out, "原始指纹") {
+		t.Errorf("original system must be REMOVED in degraded append (replace fallback): %s", out)
+	}
+	if strings.Contains(out, "网关人格") {
+		t.Errorf("append PromptText should NOT be used in degraded window: %s", out)
+	}
+}
+
+// TestHandlerAppendContentBlockedTriggersDegrade C3：首遇 400 content-blocked
+// → Trigger + 同请求以 Degraded-replace 重试成功；degradeGate.Active()。
+func TestHandlerAppendContentBlockedTriggersDegrade(t *testing.T) {
+	var bodies [][]byte
+	up := newBodyCaptureUpstream(t, &bodies, func(call int, body string) (int, string, bool) {
+		if call == 1 {
+			return 400, `{"code":11128,"msg":"blocked by security policy"}`, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "append", PromptText: "网关人格"})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[
+			{"role":"system","content":"原始指纹"},
+			{"role":"user","content":"hi"}]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s (want 200 after degraded retry)", rec.Code, rec.Body)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("want 2 upstream calls, got %d", len(bodies))
+	}
+	// 首次出站是 append 语义（原始 system 在场 + GW 在场）。
+	if !strings.Contains(string(bodies[0]), "原始指纹") || !strings.Contains(string(bodies[0]), "网关人格") {
+		t.Errorf("first body should be append semantics: %s", bodies[0])
+	}
+	// 重试出站是 replace(Degraded)（原始 system 移除）。
+	if !strings.Contains(string(bodies[1]), prompt.Degraded) {
+		t.Errorf("retry body should contain Degraded: %s", bodies[1])
+	}
+	if strings.Contains(string(bodies[1]), "原始指纹") {
+		t.Errorf("retry body should not contain original system: %s", bodies[1])
+	}
+	if !h.degrade.Active() {
+		t.Error("degrade should be active after content-blocked trigger in append mode")
+	}
+}
+
+// TestHandlerAppendContentBlockedSecondFailPassthrough C4：两次 content-blocked
+// → 客户端收 400 + 上游原文（既有透传路径复用）。
+func TestHandlerAppendContentBlockedSecondFailPassthrough(t *testing.T) {
+	var bodies [][]byte
+	up := newBodyCaptureUpstream(t, &bodies, func(call int, body string) (int, string, bool) {
+		return 400, `{"code":11128,"msg":"blocked by security policy"}`, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "append", PromptText: "网关人格"})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[
+			{"role":"system","content":"x"},
+			{"role":"user","content":"hi"}]}`)))
+	if rec.Code != 400 {
+		t.Fatalf("code=%d want 400 (second content-blocked passthrough)", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"code":"content_blocked"`) {
+		t.Errorf("want content_blocked code: %s", body)
+	}
+	// error-passthrough：上游 code/msg 原文在场。
+	if !strings.Contains(body, "blocked by security policy") || !strings.Contains(body, "11128") {
+		t.Errorf("want upstream raw body passthrough: %s", body)
+	}
+	if len(bodies) != 2 {
+		t.Errorf("want 2 upstream calls (first + one degraded retry), got %d", len(bodies))
+	}
+}
+
+// TestHandlerAppendTurnKeyStable C7：append 改写不得影响轮级聚合键——
+// handler 在改写前提取 turnKey（§3.4 槽位纪律），出站 X-Conversation-Request-ID
+// 应等于按**原始 body**（改写前）派生的 TurnRequestID(TurnKey(原))，而非按
+// append 后 body 派生的（TurnKey 键含最后一条 user 的下标，插 system 会移位）。
+func TestHandlerAppendTurnKeyStable(t *testing.T) {
+	var reqIDs []string
+	var bodies [][]byte
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			raw, _ := io.ReadAll(r.Body)
+			bodies = append(bodies, raw)
+			reqIDs = append(reqIDs, r.Header.Get("X-Conversation-Request-ID"))
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "append", PromptText: "网关人格"})
+
+	original := `{"model":"glm-5.2","messages":[
+		{"role":"system","content":"项目规范"},
+		{"role":"user","content":"你好"}]}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(original)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	// 出站 body 确为 append 语义（插了 GW）。
+	if !strings.Contains(string(bodies[0]), "网关人格") {
+		t.Fatalf("outbound body should be append-rewritten: %s", bodies[0])
+	}
+	// 聚合键按原始 body 派生（改写前提取）。
+	want := session.TurnRequestID(session.TurnKey([]byte(original)))
+	if want == "" {
+		t.Fatal("want non-empty TurnRequestID for original body")
+	}
+	if len(reqIDs) != 1 || reqIDs[0] != want {
+		t.Errorf("X-Conversation-Request-ID=%v want %q (derived from pre-rewrite body)", reqIDs, want)
 	}
 }

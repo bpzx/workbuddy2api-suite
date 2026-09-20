@@ -169,24 +169,77 @@ def _unsign(token: str, secret: str) -> dict | None:
         return None
 
 
-def issue_token(username: str, role: str) -> str:
-    """签发会话 cookie。
+def issue_token(username: str, role: str, *, orig: int | None = None) -> str:
+    """签发会话 cookie（登录与**续期**共用）。
 
     载荷里带 `sv`（session version）：该用户当前的会话版本号。改密码 / 改角色 /
     「吊销会话」都会递增它，于是**已签发的 cookie 立即失效**——否则被盗会话
-    即使改了密码也还能继续用到 7 天过期。role 仍写进载荷仅作展示参考，
+    即使改了密码也还能继续用。role 仍写进载荷仅作展示参考，
     鉴权一律以用户表为准（见 current_user）。
+
+    两个时间基准，别混：
+      · `iat`  本次签发/续期时刻 —— **滑动的基准**（多久没活动就失效）；
+      · `orig` 首次登录时刻 —— **绝对上限的基准**，续期**不延长**它。
+    分开的理由：只有 `iat` 的话，被盗会话只要定期发一个请求就能无限续命；
+    只有 `orig` 的话，天天用的人也要按点重登（惩罚常用者、放过闲置者，正好反了）。
+    两者叠加才是「常用不打扰、闲置会过期、且总寿命有硬上限」。
     """
+    now = int(time.time())
+    started = int(orig or now)
     cfg = load_users()
     sv = session_version(cfg, username)
     payload = json.dumps(
         {'username': username, 'role': role, 'sv': sv,
-         'exp': int(time.time()) + config.SESSION_DAYS * 86400}
+         'iat': now, 'orig': started,
+         'exp': started + config.SESSION_DAYS * 86400}
     )
     return _sign(payload, cfg['secret'])
 
 
+def idle_expired(obj: dict) -> bool:
+    """会话是否因**闲置**超时而失效。
+
+    关闭空闲判定时（`SESSION_IDLE_HOURS` = 0）**不看 `iat`**：此时会话寿命完全
+    由载荷里的 `exp`（总时长）决定，缺 `iat` 不构成风险，再拒绝一次就是白踢用户
+    ——而且升级前签发的旧 cookie 本来就都没有 `iat`，那种部署一升级会被立刻
+    全部登出，与「我特意关掉了空闲判定」的意图相反。
+
+    开启时空缺 `iat` 一律判失效：那时确实无法判断它「多久没活动」，不能假设刚活动过
+    （fail-open）。代价是一次性重新登录，已在 CHANGELOG 说明。
+    """
+    if config.SESSION_IDLE_HOURS <= 0:
+        return False
+    iat = obj.get('iat')
+    if not isinstance(iat, int) or iat <= 0:
+        return True
+    return (time.time() - iat) > config.SESSION_IDLE_HOURS * 3600
+
+
+def needs_renewal(obj: dict) -> bool:
+    """是否该给这个会话**续期**（滑动窗口）。
+
+    只在走过 1/3 空闲窗口时才续：每次请求都重签会让 cookie 频繁变化，
+    也没有额外收益（真正的约束是「多久没活动」，不是「签了几次」）。
+    空闲判定关闭时（0）自然也不续期。
+    """
+    iat = obj.get('iat')
+    if not isinstance(iat, int) or iat <= 0:
+        return False
+    hours = config.SESSION_IDLE_HOURS
+    if hours <= 0:
+        return False
+    return (time.time() - iat) > (hours * 3600) / 3
+
+
 def cookie_secure(request: Request) -> bool:
+    """会话 cookie 是否带 `Secure` 标志。`WB_SECURE_COOKIE` = auto | true | false。
+
+    `auto` 的判据是 `X-Forwarded-Proto`（反代终止 TLS 时由它告知原始协议）。
+    **这里有个隐蔽的失效形态**：反代没传该头时（1Panel / nginx 默认配置就未必传），
+    后端只看到明文 HTTP，于是 `auto` 静默地不加 `Secure` —— 而用户访问的确实是
+    HTTPS，他以为自己受保护。这类「以为安全其实没有」比明确的报错更危险，
+    所以下面加了 `insecure_cookie_warning()`，在日志里明确点出来。
+    """
     setting = config.SECURE_COOKIE.lower()
     if setting in ('true', '1'):
         return True
@@ -194,6 +247,33 @@ def cookie_secure(request: Request) -> bool:
         return False
     proto = request.headers.get('x-forwarded-proto', request.url.scheme)
     return proto == 'https'
+
+
+def insecure_cookie_warning(request: Request) -> str:
+    """返回「cookie 没带 Secure 但很可能该带」的告警文案；否则空串。
+
+    判定用的信号都是**反代存在**的旁证，任一成立就提示：
+      · `X-Forwarded-For` / `X-Real-IP` 存在 —— 请求经过了反代；
+      · `X-Forwarded-Proto` 缺失或非 https —— 正是「少了这一句」的场景。
+    两个都没有（直连本机 HTTP）时不提示：那是本地调试的正常形态。
+    """
+    if cookie_secure(request):
+        return ''
+    setting = config.SECURE_COOKIE.lower()
+    if setting in ('false', '0'):
+        return ''          # 用户显式关掉了，尊重其选择，不再唠叨
+    behind_proxy = bool(request.headers.get('x-forwarded-for')
+                        or request.headers.get('x-real-ip')
+                        or request.headers.get('x-forwarded-host'))
+    if not behind_proxy:
+        return ''
+    return (
+        '会话 Cookie 未带 Secure 标志，但请求经过了反向代理。'
+        '若外部访问是 HTTPS，说明反代没有透传 X-Forwarded-Proto —— '
+        '请在反代配置里加 `proxy_set_header X-Forwarded-Proto $scheme;`，'
+        '或直接设 WB_SECURE_COOKIE=true 固定开启。'
+        '（未带 Secure 时，浏览器可能在明文 HTTP 下也发送该 Cookie。）'
+    )
 
 
 # ── 登录防爆破 ───────────────────────────────────────────
@@ -361,7 +441,17 @@ def current_user(request: Request) -> dict:
     if int(obj.get('sv') or 0) != session_version(cfg, username):
         # 改密码 / 改角色 / 手动吊销之后，旧 token 作废
         raise HTTPException(status_code=401, detail='登录状态已失效，请重新登录')
-    return {'username': username, 'role': row.get('role', 'viewer')}
+    if idle_expired(obj):
+        # 闲置超时（滑动窗口）：常用的人会不断续期，放着不用的到点失效。
+        # 与上面那条分开报，是为了让用户知道「不是我密码/权限变了，是太久没用」。
+        raise HTTPException(status_code=401, detail='登录已超时（长时间未操作），请重新登录')
+    user = {'username': username, 'role': row.get('role', 'viewer')}
+    # 续期请求交给中间件写 cookie（这里**不产生副作用**：current_user 只解析身份，
+    # 被 FastAPI 依赖注入在任意接口上调用，若在这里写响应会耦合不必要的层）。
+    # 记录在 request.state 上，由 main.py 的中间件统一处理。
+    if needs_renewal(obj):
+        request.state.session_renew = True
+    return user
 
 
 def require_admin(user: dict = Depends(current_user)) -> dict:

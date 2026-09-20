@@ -14,10 +14,10 @@ import logging
 from . import config, db, security
 from .iputil import client_ip
 from .routers import (
-    accounts, auth, gateway, keys, logs, models, playground,
-    security as security_router, settings, stats, system,
+    accounts, anthropic, auth, gateway, keys, logs, models, playground,
+    responses, security as security_router, settings, stats, system,
 )
-from .services import tasklog
+from .services import tasklog, taskrun
 
 logger = logging.getLogger(__name__)
 
@@ -31,10 +31,14 @@ async def lifespan(app: FastAPI):
     # 后台采集上游自动任务日志（旅行/活跃/签到/保活），容器日志会被重建清掉，
     # 这里解析后落库长期保留，界面才能看到「这趟旅行领了多少积分」
     tasklog.start_collector()
+    # 定时领奖（成长任务里幂等的那一半）：只把已完成任务的奖励领回来，不伪造
+    # 任何活跃上报，因此可以安全地到点自动跑。点亮那半只允许手动（见 taskrun）
+    taskrun.start_scheduler()
     try:
         yield
     finally:
         tasklog.stop_collector()
+        taskrun.stop_scheduler()
 
 
 def _warn_if_exposed() -> None:
@@ -56,7 +60,7 @@ def _warn_if_exposed() -> None:
 
 app = FastAPI(
     title='WorkBuddy Manager',
-    version='1.0.31',
+    version='1.0.57',
     lifespan=lifespan,
     # 生产环境默认关闭交互式文档与 OpenAPI 描述：
     # 它们会把管理接口全貌（路径、参数、结构）暴露给任何未认证访问者，
@@ -67,6 +71,16 @@ app = FastAPI(
 )
 
 if config.CORS_ORIGINS:
+    # 只允许**明确列出的**来源。绝不要把 WB_CORS_ORIGINS 设成 `*`：
+    # 本应用用 Cookie 认证管理端，而 Starlette 在 allow_credentials=True 时
+    # 会把 `*` 回显成请求方 Origin（不是字面 `*`），于是**任意网站**都能带着
+    # 管理员的 Cookie 调 /api/* 并读到响应 —— 等于把控制台交给任何网页。
+    # 留空（默认）即同源部署，安全。
+    if any(o.strip() == '*' for o in config.CORS_ORIGINS):
+        logging.getLogger('workbuddy').error(
+            'WB_CORS_ORIGINS 含 `*` 且已启用凭据：任意网站都能冒用管理员身份读取 '
+            '/api/*。请改为列出具体来源，或留空（同源部署）。'
+        )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=config.CORS_ORIGINS,
@@ -74,6 +88,34 @@ if config.CORS_ORIGINS:
         allow_methods=['*'],
         allow_headers=['*'],
     )
+
+# 管理端请求体上限。网关那条路有自己的逐块校验（gateway._read_json_body），
+# 但 `/api/*` 此前**没有任何上限** —— 未鉴权的 `/api/login` 就能用大 body
+# 把内存占住（实测：12MB 请求体被完整缓冲并解析，没有 413）。这里统一兜住。
+# 取得比网关默认（8MB）宽松些：管理端有「保存上游配置」这类正常的大请求。
+MAX_API_BODY_BYTES = 16 * 1024 * 1024
+
+
+@app.middleware('http')
+async def limit_api_body(request: Request, call_next):
+    """给 `/api/*` 的请求体加上限。
+
+    只看 `Content-Length`：本中间件拦的是「声明了超大长度」这条最容易发起、
+    也最容易自动化的路径（无鉴权即可打 /api/login）。ASGI 在中间件之前不会把
+    body 读进内存，所以先声明后读没有意义；不带该头的分块请求由 uvicorn 自身的
+    缓冲与并发限制兜底。
+    """
+    if request.url.path.startswith('/api/'):
+        try:
+            declared = int(request.headers.get('content-length') or 0)
+        except ValueError:
+            declared = 0
+        if declared > MAX_API_BODY_BYTES:
+            return JSONResponse(
+                {'detail': f'请求体过大（上限 {MAX_API_BODY_BYTES // 1024 // 1024} MB）'},
+                status_code=413,
+            )
+    return await call_next(request)
 
 # ── 路由注册顺序很重要：先 API / 网关，最后挂静态文件 ──
 app.include_router(auth.router)
@@ -87,6 +129,11 @@ app.include_router(system.router)
 app.include_router(models.router)
 app.include_router(playground.router)
 app.include_router(gateway.router)
+# Anthropic Messages API 兼容层（/v1/messages）——给只认该协议的客户端用
+app.include_router(anthropic.router)
+# OpenAI Responses API 兼容层（/v1/responses、/responses）——给 Codex /
+# DeepSeek Harness 的 openai-responses 协议用
+app.include_router(responses.router)
 
 
 @app.middleware('http')
@@ -105,6 +152,31 @@ async def cache_headers(request: Request, call_next):
       限制外联目标，降低 XSS 得手后的影响面
     """
     response = await call_next(request)
+
+    # 会话滑动续期：current_user 判定「该续了」时在这里重签 cookie。
+    #
+    # 为什么放中间件而不是 current_user 里：那个函数是 FastAPI 依赖，只负责
+    # **解析身份**，在它里面写响应会耦合出不必要的层，而且它被大量接口调用、
+    # 有的还是只读的。中间件是唯一能看到「响应对象 + 请求状态」的地方。
+    if getattr(request.state, 'session_renew', False):
+        try:
+            token = request.cookies.get(config.COOKIE_NAME) or ''
+            cfg = security.load_users()
+            obj = security._unsign(token, cfg['secret']) or {}
+            username = str(obj.get('username') or '')
+            if username:
+                # orig 原样延续 —— 续期只推后**空闲截止**，不延长**总寿命**。
+                # role 传空：鉴权一律以用户表为准（载荷里的 role 仅作展示参考）。
+                fresh = security.issue_token(username, '', orig=int(obj.get('orig') or 0) or None)
+                response.set_cookie(
+                    config.COOKIE_NAME, fresh,
+                    max_age=config.SESSION_DAYS * 86400, httponly=True,
+                    samesite='lax', secure=security.cookie_secure(request), path='/',
+                )
+        except Exception as exc:  # noqa: BLE001
+            # 续期失败不能让请求失败 —— 用户这次照常，只是下次要重登
+            logger.warning('会话续期失败（不影响本次请求）: %s', exc)
+
     path = request.url.path
     if path.startswith('/_next/static/'):
         # 文件名含内容哈希，内容变了文件名就变，可长期强缓存

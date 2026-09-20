@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -19,6 +20,16 @@ import (
 	"workbuddy2api/internal/session"
 	"workbuddy2api/internal/upstream"
 )
+
+// modelJSONPath 由 state.json 路径推导 model.json 路径（同目录同名换缀）：
+// 两者同为数据目录持久化物（Docker ./data volume），配套而非各自配置。
+// state 路径为空（纯内存测试形态）→ 空 = 禁用 model.json 落盘（内存 + 种子仍可用）。
+func modelJSONPath(stateFile string) string {
+	if stateFile == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(stateFile), "model.json")
+}
 
 func main() {
 	cfgPath := flag.String("config", "config.json", "path to config json")
@@ -46,6 +57,11 @@ func main() {
 	// Realm()/IsGlobal() 先过此闸——显式 false 时恒 cn（逃生门：纯 CN 锁定的第一道闸）。
 	auth.SetGlobalEnabled(cfg.Global.Enabled)
 
+	// model.json 本地缓存接线（context_length 四级查找链第 3 级）：数据目录与
+	// state.json 同风格（Docker volume 持久化路径 ./data）。首次缺失/损坏自动回落
+	// 仓库种子 embed；models.dev 按需拉取成功后原子写回。
+	upstream.SetModelCatalogPath(modelJSONPath(cfg.StateFile))
+
 	// redisstore：未配置/连接失败 → Noop（纯内存模式，一切功能照常）。
 	store := redisstore.New(cfg.Upstash.URL, cfg.Upstash.Token)
 
@@ -55,11 +71,20 @@ func main() {
 	p.RestoreFromSnapshot() // 择新恢复：Redis 快照比本地新才采用，否则本地优先
 	p.SyncToDir(auths)      // 与 auths 目录对齐：新账号加入、已删除文件账号剔除（状态保留）
 
+	// auths 目录热加载：新增凭证文件自动进池，免去「加完账号手动重启网关」。
+	// 启动时的 SyncToDir 已建立基线，监听只在后续目录内容变化时触发（见 pool/watch.go）。
+	stopWatch := p.StartAuthDirWatch(cfg.AuthDir)
+	defer stopWatch()
+
 	// 熔断器 + 在途上限 + 三因子加权调优（从 config 注入，非正值回退默认）。
 	p.SetBreaker(cfg.Pool.BreakerThreshold, cfg.BreakerCooldownDur, cfg.BreakerCooldownMaxD)
+	// 连败降权（issue #114）：ErrClient/传输层连败 N 次临时出池。
+	p.SetDegrade(cfg.Pool.DegradeThreshold, cfg.DegradeCooldownDur, cfg.DegradeCooldownMaxD)
 	p.SetMaxInFlight(cfg.Pool.MaxInFlight)
-	p.SetSoftRateMax(cfg.SoftRateMaxDur) // 软冷却指数退避封顶（soft_rate_max，默认 2h）
+	p.SetMaxInFlightGlobal(cfg.Pool.MaxInFlightGlobal) // global 域在途分档（WAF 403 修复 P1-1，默认 2）
+	p.SetSoftRateMax(cfg.SoftRateMaxDur)               // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
+	p.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
 
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router
@@ -181,9 +206,10 @@ func main() {
 		SoftCooldown: cfg.SoftRateDur,
 		PromptMode:   cfg.Prompt.Mode,
 		PromptText:   cfg.PromptText,
-		MaxBodyBytes: int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
 		// global realm 开关（handler 侧第三道闸：modelList 据此决定是否列 global 名单）。
 		GlobalEnabled: cfg.Global.Enabled,
+		// 运维管理端点开关（config admin.enabled，默认 false）。
+		AdminEnabled: cfg.Admin.Enabled,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -195,7 +221,8 @@ func main() {
 		Handler:           h,
 		ReadHeaderTimeout: 30 * time.Second,
 		// ReadTimeout 覆盖整个请求读取（含 body）：防慢速 body 拖死连接。
-		// 取值大于 MaxBodyMB 在常规带宽下的上传耗时；聊天请求体上限默认 8MB。
+		// max_body_mb 已移除（请求体无上限，交由上游自然响应），超大 body 成为
+		// 唯一的自然约束：60s 内传不完会得到连接错误（read timeout）而非 413。
 		ReadTimeout: 60 * time.Second,
 		// IdleTimeout keep-alive 空闲连接回收：配合 ctx 传播（FIX-2）防连接泄漏堆积。
 		// 注意：SSE 流式响应期间连接非空闲，不受此项掐断；不设全局 WriteTimeout
@@ -205,6 +232,12 @@ func main() {
 	go func() {
 		<-ctx.Done()
 		p.Flush() // 信号触发：先落盘再做优雅停机
+		// Flush 已把最后一笔状态快照提交给 Redis（fire-and-forget）；store.Close
+		// 等 Upstash 在途/排队写排空再关连接——最后一笔镜像必须写完才退出（发现 4）。
+		// Noop 的 Close 是空操作；单写上限 5s × 上限 8，Close 内部另有超时兜底。
+		if cErr := store.Close(); cErr != nil {
+			log.Printf("WARN: [server] redisstore close: %v", cErr)
+		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)

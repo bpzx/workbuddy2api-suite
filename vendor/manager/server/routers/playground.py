@@ -91,7 +91,7 @@ async def chat(body: ChatIn, request: Request, user: dict = Depends(security.req
     except Exception as exc:  # noqa: BLE001
         await client.aclose()
         gateway._record(
-            None, ip, body.model, '', 502, 0, 0,
+            None, ip, model_sent, '', 502, 0, 0,
             int((time.time() - started) * 1000),
             request.headers.get('user-agent'), str(exc), body.stream,
         )
@@ -112,7 +112,7 @@ async def chat(body: ChatIn, request: Request, user: dict = Depends(security.req
         except Exception:  # noqa: BLE001
             pass
         gateway._record(
-            None, ip, body.model, '', resp.status_code,
+            None, ip, model_sent, '', resp.status_code,
             int(usage.get('prompt_tokens') or 0),
             int(usage.get('completion_tokens') or 0),
             int((time.time() - started) * 1000),
@@ -151,7 +151,7 @@ async def chat(body: ChatIn, request: Request, user: dict = Depends(security.req
             await resp.aclose()
             await client.aclose()
             gateway._record(
-                None, ip, body.model, '', resp.status_code,
+                None, ip, model_sent, '', resp.status_code,
                 int(usage.get('prompt_tokens') or 0),
                 int(usage.get('completion_tokens') or 0),
                 int((time.time() - started) * 1000),

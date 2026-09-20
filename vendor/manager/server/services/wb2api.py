@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections import deque
 import ipaddress
 import json
+import os
 import re
+import socket
 import time
 from pathlib import Path
 
@@ -17,18 +20,29 @@ from .realm import realm_of, supports_checkin
 def _safe_file(filename: str) -> Path:
     """把请求里的文件名解析为 auths 目录下的真实路径，非法即抛错。
 
-    穿越防线（`/`、反斜杠、`..`）是根本；此外只接受 `workbuddy-*.json`
+    穿越防线（`/`、反斜杠、`..`、NUL）是根本；此外只接受 `workbuddy*.json`
     这一种形态，避免越权读到目录里的其他文件（例如隐藏文件或临时文件）。
+
+    **通配宽度必须与上游一致**（上游 `auth.AuthFileGlob = "workbuddy*.json"`，
+    其注释写明这是它自己踩过的坑：曾用窄模式 `workbuddy-*.json`，导致
+    `workbuddy_new.json` 被网关加载却被工具跳过、两边口径对不上）。
+    我们此前正是窄模式，于是那种账号**在上游池里能被选中、面板却看不到**——
+    与「面板读文件、上游读池」那个不一致是同一个问题的反方向。
+    这里的宽化不放松安全：前缀 `workbuddy`、后缀 `.json`、禁止路径分隔符
+    与 `..` 三条约束都还在。
     """
     if '/' in filename or '\\' in filename or '..' in filename:
         raise ValueError('非法的文件名')
     if '\x00' in filename:
         raise ValueError('非法的文件名')
-    # 白名单形态：账号文件一律是 workbuddy-<uid>.json
-    if not re.fullmatch(r'workbuddy-[0-9A-Za-z_-]{1,80}\.json', filename):
+    # 白名单形态：账号文件是 workbuddy<后缀>.json（后缀可为空，同上游 glob）；
+    # 末尾可带 `.disabled` —— 那是本面板的「临时禁用」标记（改名的产物，
+    # 不再匹配上游的 `workbuddy*.json` glob，于是上游不会加载它）。
+    if not re.fullmatch(r'workbuddy[0-9A-Za-z_-]{0,80}\.json(\.disabled)?', filename):
         raise ValueError('非法的文件名')
     target = config.AUTH_DIR / filename
-    if target.suffix != '.json':
+    # 结尾必须是 .json 或 .json.disabled（上面正则已保证，这里再兜一层）
+    if not (target.name.endswith('.json') or target.name.endswith('.json.disabled')):
         raise ValueError('非法的文件名')
     return target
 
@@ -89,12 +103,21 @@ def token_issued_at(access_token: str) -> int | None:
 
 
 def list_auth_accounts() -> list[dict]:
-    """读取 auths/ 目录下的本地账号（与 /status 的运行时状态互补）。"""
+    """读取 auths/ 目录下的本地账号（与 /status 的运行时状态互补）。
+
+    同时收上游**加载不到**的两类文件，否则它们会在面板上「凭空消失」：
+      · `workbuddy*.json.disabled` —— 本面板「临时禁用」改名的产物（见
+        `set_account_disabled`）。用户禁用的账号必须仍然看得见、并且能再启用，
+        否则「禁用」在使用体验上等同于「删除」。
+    """
     out: list[dict] = []
     if not config.AUTH_DIR.is_dir():
         return out
     now = time.time()
-    for path in sorted(config.AUTH_DIR.glob('workbuddy-*.json')):
+    # 上游只加载 workbuddy*.json；我们额外收 .disabled，以便展示与恢复
+    files = sorted(config.AUTH_DIR.glob('workbuddy*.json'))
+    files += sorted(config.AUTH_DIR.glob('workbuddy*.json.disabled'))
+    for path in files:
         try:
             raw = json.loads(path.read_text(encoding='utf-8'))
         except Exception:
@@ -103,6 +126,15 @@ def list_auth_accounts() -> list[dict]:
         auth = raw.get('auth', {}) or {}
         exp = int(auth.get('expiresAt', 0) or 0)
         token = str(auth.get('accessToken') or '')
+
+        # 上游 `Parse` 明确拒绝的情形：accessToken 为空时直接返回
+        # `parse_error: missing accessToken`，`LoadDir` 随即静默跳过该文件
+        # —— 它**不在账号池里，永远选不中**。这里如实标出原因，前端据此
+        # 显示「未加载」而不是「在线」（否则会出现面板全绿、调用却报
+        # 「没有健康账号」的矛盾）。判据与上游一致：只判去空白后是否为空。
+        invalid_reason = ''
+        if not str(auth.get('accessToken') or '').strip():
+            invalid_reason = '缺少 accessToken'
 
         # 总时长：优先用 JWT 自身的 iat→exp（最权威）；JWT 解不出时退回用
         # 文件修改时间推算。上游刷新 token 后会原子写回该文件，因此 mtime
@@ -144,6 +176,15 @@ def list_auth_accounts() -> list[dict]:
                     realm_of({'realm': raw.get('realm') or auth.get('realm'),
                               'domain': auth.get('domain')})),
                 'source': 'file',
+                # 已知上游不会加载该文件时的原因（空 = 没发现明显问题）。
+                # 目前只覆盖「accessToken 为空」这一条——那是上游 `Parse`
+                # 明确拒绝、且我们能在本地确定判据的情形；其余情况（例如文件
+                # 能读但我们没解析出 uid）不臆测原因，交给 in_pool 如实反映。
+                'invalid_reason': invalid_reason,
+                # 本面板的「临时禁用」标记（文件名带 .disabled 后缀）。
+                # 与上游的 disabled 是两回事：那个是上游按错误分类自动禁的，
+                # 这个是运维手动停用的，解除方式也不同（见 set_account_disabled）。
+                'disabled_by_panel': path.name.endswith('.disabled'),
             }
         )
     return out
@@ -154,6 +195,18 @@ def merge_pool_status(accounts: list[dict], status: dict) -> list[dict]:
 
     credits：账号当前可花费积分余额，由上游聚合所有套餐的
     CycleCapacityRemain 得出（见 upstream.UserResource）。
+
+    **in_pool 标记**：该账号是否出现在上游的账号池（`/status.accounts`）里。
+
+    为什么要这个标记：我们读的是 auths/ 目录下的**文件**，上游读的才是**池**。
+    两者并不总是一致——上游 `LoadDir` 对解析失败的 auth 文件**静默跳过**
+    （`Parse` 在 accessToken 为空时直接报错），那个文件因此不在池里、永远选不中。
+    而我们此前照样把它列出来，且因为 `/status` 里没有它，cooling / disabled
+    等字段全是 None，前端兜底分支就显示成「● 在线」——**面板全绿、调用却报
+    「没有健康账号」**，用户完全无从下手（这正是用户报的现象）。
+
+    `invalid_reason` 用于我们已经能确定「上游不会加载它」的情形，把原因写出来，
+    而不是让用户自己去猜文件哪里不对。
     """
     pool: dict[str, dict] = {}
     for item in (status or {}).get('accounts') or []:
@@ -162,9 +215,17 @@ def merge_pool_status(accounts: list[dict], status: dict) -> list[dict]:
 
     for a in accounts:
         p = pool.get(a['uid'])
+        a['in_pool'] = p is not None
         if not p:
-            # 上游未返回该账号（可能刚添加尚未重载），保持字段为 None
+            # 上游未返回该账号：可能刚添加尚未重载，也可能上游根本没加载成功。
+            # 保持其余字段为 None（前端据此单独展示，而不是当成「在线」）。
             a.setdefault('credits', None)
+            # 本面板**主动禁用**的账号必然不在池里（改名后上游不再加载它）——
+            # 这是预期行为，不是故障。把原因写清楚，否则界面会按「上游没加载它」
+            # 报成「账号文件可能有问题」，用户看到自己刚禁用的账号被标成疑似损坏，
+            # 反而要去查文件（实测会在界面上产生这种误导）。
+            if a.get('disabled_by_panel') and not a.get('invalid_reason'):
+                a['invalid_reason'] = '已在本面板临时禁用（不会被上游加载）'
             continue
         credits = p.get('credits')
         a['credits'] = int(credits) if isinstance(credits, (int, float)) else None
@@ -187,7 +248,33 @@ def merge_pool_status(accounts: list[dict], status: dict) -> list[dict]:
         a['success_count'] = p.get('success_count')
         a['in_flight'] = p.get('in_flight')
         a['breaker_fails'] = p.get('breaker_fails')
+        # 连败降权（上游 issue #114）：连续 N 次「不罚号的失败」后把账号临时移出池
+        # （默认阈值 5、降权 10 分钟）。**上游把它计入 cooling**（其 entry.healthy()
+        # 的三个截止是或门），所以我们这边必须单独透出，否则「冷却中」里混着两类
+        # 原因完全不同的情况：限流退避（等一会儿就好）与连败降权（说明这个号在
+        # 持续失败）。只显示「冷却中」时用户无从判断该等还是该处理（实测反馈：
+        # 「降权统计这里根本不统计」）。
+        #
+        # degrade_until 是 Go 的 *time.Time + omitempty：未降权时**整个键都不出现**
+        # （指针 nil 才真能被省略，非指针 time.Time 会序列化成 0001-01-01 假真值，
+        # 见下面 last_success 的注释），故缺省值按 None 处理即可。
+        #
+        # 用 isinstance 而不是 `or None`：后者只挡假值，`123` 这类非字符串会被原样
+        # 送到前端，而前端要 Date.parse 它。类型不符一律归 None（前端据此当「未降权」
+        # 处理，最坏是少显示一个徽章，不会把整页弄崩）。
+        _du = p.get('degrade_until')
+        a['degrade_until'] = _du if isinstance(_du, str) and _du else None
+        _cf = p.get('consecutive_fails')
+        a['consecutive_fails'] = _cf if isinstance(_cf, int) and not isinstance(_cf, bool) else None
         a['last_success'] = p.get('last_success')
+        # 累计错误数与最后一次错误时刻。为什么要透出：上游对**未命中它那几条
+        # 规则**的 4xx（例如被 WAF 拦下的 403）只「换号不罚」——不冷却、不熔断、
+        # 不禁用（见其 applyErrorPolicy 的 default 分支）。于是这种账号在面板上
+        # 一直显示「正常」，却每次请求都失败、持续几小时。用户报的正是这个
+        # （issue #14 第二点）。有了这两个数，界面才能把「一直失败但状态正常」
+        # 标出来，用户才知道该重新登录或删掉它。
+        a['err_total'] = p.get('err_total')
+        a['last_err'] = p.get('last_err')
     return accounts
 
 
@@ -197,6 +284,68 @@ def delete_auth_account(filename: str) -> bool:
         target.unlink()
         return True
     return False
+
+
+# 「临时禁用」的文件名标记：加在 `.json` 之后，于是**不再匹配上游的
+# `workbuddy*.json` glob**，上游重启后就不会加载它——这是不修改上游代码
+# 就能真正停用某个账号的唯一办法（见 set_account_disabled 的说明）。
+_DISABLED_SUFFIX = '.disabled'
+
+
+def set_account_disabled(filename: str, disabled: bool) -> dict:
+    """临时禁用 / 启用一个账号（改名实现）。返回 {file, disabled, ...}。
+
+    实现原理
+    --------
+    上游 `auth.LoadAuthFiles` 用 glob `workbuddy*.json` 收集账号文件，所以把文件
+    改名成 `workbuddy-xxx.json.disabled` 之后它就不再被加载——账号随即从池里消失、
+    不会被选中。启用就是改回原名。上游**没有**任何禁用/启用的 HTTP 接口
+    （它内部有 `Disable`/`ReviveDisabled`，但只被自身的错误处理调用，未对外暴露），
+    而且 `state.json` 每 5 秒被上位机覆盖、改它没有意义，所以改名是唯一可行路径。
+
+    生效方式（新旧上游不同）
+    ------------------------
+    改名后调用方仍会触发一次重载（`reload.request_restart()`）——这里只做文件操作，
+    保持本函数纯粹、可测。两种上游的差别：
+
+      · **新上游**（2026-09-18 起）有 auths 目录热加载：每 5 秒轮询目录指纹，
+        改名本身就会让它自动重扫，我们不触发也会生效（触发只是为了不等那 5 秒）。
+      · **旧上游**只在启动时扫描一次，必须重启容器才生效——重载就是唯一途径。
+
+    所以「总是触发一次重载」对两种形态都正确，不需要探测上游版本（上游没暴露
+    版本号，也探测不了）。
+
+    为什么不用「删掉文件再恢复」
+    --------------------------
+    删除会丢 token（那份文件里存着 accessToken / refreshToken，删了就再也恢复不了，
+    只能重新扫码）。改名是可逆的：启用时原样改回，凭证一个字节都不动。
+
+    边界
+    ----
+    · 重复禁用/启用是**幂等**的（已是目标状态就直接返回），不报错；
+    · 只接受 `workbuddy*.json(.disabled)` 形态（走 `_safe_file` 的校验）；
+    · 文件不存在时报错，避免「禁用成功」的假象。
+    """
+    target = _safe_file(filename)
+    # 规范化成「原始账号名」与「禁用名」两种形态
+    base = target.name[:-len(_DISABLED_SUFFIX)] if target.name.endswith(_DISABLED_SUFFIX) else target.name
+    base_path = _safe_file(base)
+    disabled_path = config.AUTH_DIR / (base + _DISABLED_SUFFIX)
+
+    if disabled:
+        if disabled_path.exists():
+            return {'file': disabled_path.name, 'disabled': True, 'changed': False}
+        if not base_path.exists():
+            raise ValueError(f'账号文件不存在：{base}')
+        base_path.rename(disabled_path)
+        return {'file': disabled_path.name, 'disabled': True, 'changed': True}
+
+    if base_path.exists():
+        return {'file': base_path.name, 'disabled': False, 'changed': False}
+    if not disabled_path.exists():
+        raise ValueError(f'账号文件不存在：{base}')
+    disabled_path.rename(base_path)
+    return {'file': base_path.name, 'disabled': False, 'changed': True}
 
 
 ASYNC_HEADERS = {'Content-Type': 'application/json'}
@@ -240,33 +389,100 @@ async def get_models() -> tuple[bool, list | dict]:
 
 
 def models_source(items: list) -> str:
-    """判断这份模型列表来自上游「动态拉取」还是「内置静态表」。
+    """判断这份模型列表来自上游「动态拉取」还是「静态回退」。
 
-    为什么需要区分：上游 `/v1/models` 优先用池里随机一个健康账号去动态拉取
-    （成功则缓存 1 小时），**拉取失败就回退到编译进二进制的静态表**，且失败后
-    还有 5 分钟负缓存。两者外观一样，但静态表是老版本写死的、数量少得多——
-    界面若一律标「来自上游实时列表」，用户会以为账号/配置有问题，实际是上游
-    在走回退。实测有部署只显示 6 个模型，且顺序与旧版静态表完全一致。
+    注意（上游 2026-09-15 起，commit 1b7ce4a）：上游已**删除** CN/global 的静态
+    兜底表，改为纯动态——动态拉取失败或池中无对应账号时返回**空列表**，不再回退
+    到编译进二进制的固定名单。因此下面的 `static` 只可能来自仍在跑老版本上游的
+    部署（那种情况下如实标「非实时」依然有用）。
 
-    判据：动态条目会带 `max_output_tokens`（上游 modelList 里动态分支才写这个
-    键），静态表条目只有 id/object/created/owned_by/context_length。
-    这是上游内部实现细节，故只作展示提示；判不出来返回 'unknown'，前端
-    据此回退到中性文案，绝不因此报错。
+    判据（取上游内部实现细节）：
+      * 动态条目经 `applyModelInfoFields` 写出 `name`（上游模型对象带 Name 时必写）
+        与 `max_output_tokens`（四级查找命中时写）；
+      * 老版本上游的静态表**只覆盖 CN**，条目为裸名或 `cn:` 前缀；
+      * 故「没有动态特征键 + 没有 global 条目」才判 static——国际版的探测结果在窄表
+        形态下同样不带这些键，若不加前缀约束会被误报成静态回退。
+
+    为什么同时看 `name` 和 `max_output_tokens`：后者是**四级查找全不命中就省略**
+    （上游 handler.go 的 `MaxOutputTokensListingV4`，兜底是「省略字段」而非填默认值），
+    理论上存在整张表都没这个键的情况；`name` 的写出条件宽得多（模型对象自带 Name 即可）。
+    两个信号任一命中即判动态，比只认一个稳。
+
+    判不出来返回 'unknown'，前端据此回退到中性文案，绝不因此报错。
     """
     if not isinstance(items, list) or not items:
         return 'unknown'
     dicts = [x for x in items if isinstance(x, dict)]
     if not dicts:
         return 'unknown'
-    if any('max_output_tokens' in x for x in dicts):
+    if any('max_output_tokens' in x or 'name' in x for x in dicts):
         return 'dynamic'
-    # 没有该键且条目结构齐全 → 基本可判定为静态回退表
-    if all('id' in x for x in dicts):
-        return 'static'
-    return 'unknown'
+    if not all('id' in x for x in dicts):
+        return 'unknown'
+    # 老上游静态表不含 international 条目；有 global: 说明这次拉取是真实探测结果
+    if any(str(x.get('id') or '').startswith('global:') for x in dicts):
+        return 'dynamic'
+    return 'static'
+
+
+# 原生启停脚本的执行上限（秒）。
+#
+# 为什么要设：脚本可能挂住（等交互输入、端口被占用、启动时卡在依赖上）。没有超时
+# 的话这个协程永不返回，而 reload 的状态机会一直停在 running=True —— 后续所有
+# 「保存配置后自动重载」都**静默失效**（不报错、不重试），调用方也一直挂着。
+# 60 秒对启停一个本地进程足够宽裕（正常是秒级）。
+_NATIVE_RESTART_TIMEOUT = 60
+
+
+def _kill_quietly(proc) -> None:
+    """尽力结束子进程；失败也不抛（调用方已经在处理错误路径了）。"""
+    try:
+        proc.kill()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def restart_container() -> tuple[bool, str]:
+    """重启上游；native 模式走启停脚本，其余部署保持 Docker 行为。"""
+    if config.WB2API_MODE == 'native':
+        scripts = (config.WB2API_STOP_SCRIPT, config.WB2API_START_SCRIPT)
+        missing = [str(path) for path in scripts if not path.is_file()]
+        if missing:
+            return False, f'未找到原生启停脚本：{"、".join(missing)}'
+        for script in scripts:
+            cmd = (
+                ('cmd.exe', '/d', '/c', str(script))
+                if os.name == 'nt'
+                else (str(script),)
+            )
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    cwd=str(script.parent),
+                    # 后台服务可能继承 PIPE，导致 communicate() 永远等不到 EOF。
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                # **必须有超时**：脚本可能挂住（等交互输入、被占用的端口、
+                # 启动时卡在依赖上）。没有超时的话：
+                #   · 这个协程永不返回 → reload 的状态机一直停在 running=True，
+                #     后续所有「保存配置后自动重载」都会静默失效（不报错、不重试）；
+                #   · 调用方（保存设置接口）也一直挂着。
+                # 超时后杀掉进程并如实回报，用户至少知道「重启没成功」。
+                await asyncio.wait_for(proc.communicate(), timeout=_NATIVE_RESTART_TIMEOUT)
+            except asyncio.TimeoutError:
+                _kill_quietly(proc)
+                return False, (
+                    f'{script.name} 执行超过 {_NATIVE_RESTART_TIMEOUT} 秒未结束，已终止。'
+                    f'请手动确认上游状态，或把 WB2API_START_SCRIPT / WB2API_STOP_SCRIPT '
+                    f'指向不会挂住的脚本'
+                )
+            except Exception as exc:  # noqa: BLE001
+                return False, f'执行 {script.name} 失败：{exc}'
+            if proc.returncode != 0:
+                return False, f'{script.name} 退出码 {proc.returncode}'
+        return True, '原生 workbuddy2api 已重启'
+
     name = config.WB2API_CONTAINER
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -285,11 +501,19 @@ async def restart_container() -> tuple[bool, str]:
 
 
 def read_container_logs(limit: int = 200, timestamps: bool = True) -> list[str]:
-    """读取上游容器日志（同步、失败返回空列表）。
+    """读取上游日志（原生日志文件或 Docker，失败返回空列表）。
 
     默认带 `--timestamps`：docker 会在每行前面加上精确到纳秒的 RFC3339 时间，
     自动任务日志据此获得准确时间并据此去重（上游自己的 log 前缀精度只到秒）。
     """
+    if config.WB2API_MODE == 'native':
+        try:
+            count = max(1, min(5000, limit))
+            with config.WB2API_LOG_FILE.open('r', encoding='utf-8', errors='replace') as fh:
+                return [ln.rstrip('\r\n') for ln in deque(fh, maxlen=count) if ln.strip()]
+        except Exception:  # noqa: BLE001
+            return []
+
     import subprocess
 
     cmd = ['docker', 'logs', '--tail', str(max(1, min(5000, limit)))]
@@ -303,6 +527,14 @@ def read_container_logs(limit: int = 200, timestamps: bool = True) -> list[str]:
         return [ln for ln in raw.splitlines() if ln.strip()]
     except Exception:  # noqa: BLE001
         return []
+
+
+# 管理端**允许读写**的上游配置段。既是 `save_upstream_config` 的写入白名单，
+# 也是 `load_upstream_config` 的**下发白名单**——两处必须是同一份，否则会出现
+# 「能保存但读不回来」或「读得到却存不回去」的不一致。顶层其余键（api_key、
+# auth_dir、state_file 等）一律不下发：它们是凭据或部署路径，界面不使用。
+_EDITABLE_SECTIONS = ('schedule', 'pool', 'cooldown', 'features',
+                      'session_sticky', 'prompt', 'server', 'upstream', 'global')
 
 
 def _mask(v: str) -> str:
@@ -344,9 +576,24 @@ def load_upstream_config() -> dict:
             'error': error or '无法读取上游配置',
         }
 
-    view = dict(cfg)
-    if 'api_key' in view:
-        view['api_key_masked'] = _mask(str(view.pop('api_key') or ''))
+    # **白名单**式往外发，而不是 `dict(cfg)` 之后逐个 pop 敏感键。
+    #
+    # 为什么必须反过来写：denylist 的失效模式是「上游加了一个新的密钥字段 →
+    # 原样下发给任何登录用户（含只读的 viewer）」，而且**不会有任何报错**。
+    # 白名单的失效模式则相反：新字段不显示，用户去上游改 —— 安全得多。
+    # （实测确认过 denylist 的后果：往配置里塞一个未知的 *_secret 键，
+    # 它会出现在接口响应里。）
+    view: dict = {
+        # 界面确实要用的非敏感顶层项
+        k: cfg[k] for k in ('listen',) if k in cfg
+    }
+    # 只放界面能编辑的那些配置段（与 save_upstream_config 的允许集合一致）
+    for section in _EDITABLE_SECTIONS:
+        if section in cfg and isinstance(cfg[section], dict):
+            view[section] = cfg[section]
+
+    if 'api_key' in cfg:
+        view['api_key_masked'] = _mask(str(cfg.get('api_key') or ''))
     # 账号列表实际读取的是管理端自己的 AUTH_DIR，以此为准；上游若声明了不同目录则一并暴露
     upstream_auth_dir = cfg.get('auth_dir')
     view['auth_dir'] = str(config.AUTH_DIR)
@@ -413,7 +660,19 @@ _UPSTREAM_TEXT_MAX = 512
 _INT_RANGES: dict[str, tuple[int, int, str]] = {
     'activity_report_count': (1, 50, '条'),
     'max_in_flight': (0, 64, '个'),
+    # 国际版在途上限分档（上游 2680f4c）。**语义与 max_in_flight 不同**：那边
+    # 0 = 不限制，这边的 0（含负数）在上游 config 归一化时被改成默认值 **2**
+    # ——既不是「不限」，也不是「跟随 max_in_flight」（上游池子层的注释这么写，
+    # 但归一化在它之前就把 0 换成了 2，实际生效的是 2）。前端文案按这个口径写。
+    # 单独登记是为了享受同样的区间校验 —— 不登记的话它会被归到「未知键」
+    # 原样透传，用户填个负数或超大值也能写进上游配置。
+    'max_in_flight_global': (0, 64, '个'),
     'breaker_threshold': (1, 100, '次'),
+    # 连败降权阈值（上游 cf1e7e5 新增 pool.degrade_threshold，默认 5）：ErrClient 与
+    # 传输层失败连续达此次数即临时出池。登记以享受同样的区间校验。
+    # 另外两个同批新增的键（degrade_cooldown / degrade_cooldown_max）是时长字符串，
+    # 已被下面「按 _cooldown 后缀走时长格式校验」那条规则覆盖，无需单独登记。
+    'degrade_threshold': (1, 100, '次'),
     'idle_weight_max': (0, 1000, ''),
     'max_body_mb': (1, 256, 'MB'),
 }
@@ -466,6 +725,22 @@ def _sanitize_section(section: str, incoming: dict) -> dict:
             if not _DURATION_RE.match(raw.strip()):
                 raise ValueError(f'{key} 时长格式有误，应为 30s / 10m / 2h / 1d')
             out[key] = raw.strip()
+        elif section == 'pool' and key == 'cost_explore_interval':
+            # 成本档位条件探索的周期（上游 2026-09-17 新增，默认 "30m"）。
+            #
+            # 必须在这里拦：上游对它是 `time.ParseDuration` 失败即**启动报错**
+            # （cmd/server/config.go:383 的 fail fast）。而它既不匹配上面那条按
+            # `_cooldown`/`_rate` 后缀的规则，也不在下面两张区间表里 —— 不补这条
+            # 就等于「填错也保存成功，然后上游起不来」，正是本节注释里点名的
+            # 最坏形态。可达路径是 `POST /api/settings/upstream` 直接透传 body，
+            # 不经过前端表单。
+            #
+            # **"0" 是合法值**（关停该特性，与上游 `CostExploreIntervalDur = 0` 一致），
+            # 所以不能要求必须匹配时长格式。
+            val = str(raw or '').strip()
+            if val and val != '0' and not _DURATION_RE.match(val):
+                raise ValueError('cost_explore_interval 时长格式有误，应为 30m / 1h；0 = 关停')
+            out[key] = val
         elif section == 'pool' and key == 'expiring_soon':
             # 快过期积分窗口（上游 2026-09-14 新增）：选号时优先消耗窗口内到期的
             # 积分。语义与普通时长不同——**空串或 "0" 表示禁用分桶**，不是非法值，
@@ -481,8 +756,14 @@ def _sanitize_section(section: str, incoming: dict) -> dict:
             out[key] = _check_float(key, raw)
         elif section == 'prompt' and key == 'mode':
             mode = str(raw or '').strip().lower()
-            if mode not in ('custom', 'passthrough'):
-                raise ValueError('prompt.mode 只能是 custom 或 passthrough')
+            # 取值必须与上游 `normalizePrompt` 的白名单**保持一致**：上游对非法值
+            # 是**启动即报错**（fail fast），所以这里拦不住的话，用户会存进一份让
+            # 上游起不来的配置——表现为「保存成功，然后上游挂了」，比当场报错难查得多。
+            # `append` 是上游 2026-09-17 新增（issue #129）：开头连续 system/developer
+            # 块后插网关 system，既有消息逐字不动。我们此前只认 custom/passthrough，
+            # 会把用户填的合法值拒掉（上游支持、面板说不合法）。
+            if mode not in ('custom', 'append', 'passthrough'):
+                raise ValueError('prompt.mode 只能是 custom、append 或 passthrough')
             out[key] = mode
         elif section == 'prompt' and key == 'file':
             # 路径非空但不可读会让上游启动直接失败（fail fast），
@@ -557,8 +838,7 @@ def save_upstream_config(patch: dict) -> dict:
     if not isinstance(cfg, dict):
         raise ValueError('上游配置文件不是合法的 JSON 对象，已取消保存')
 
-    for field in ('schedule', 'pool', 'cooldown', 'features',
-                  'session_sticky', 'prompt', 'server', 'upstream', 'global'):
+    for field in _EDITABLE_SECTIONS:
         if field in patch and isinstance(patch[field], dict):
             cfg.setdefault(field, {})
             clean = _sanitize_section(field, patch[field])
@@ -632,6 +912,12 @@ _BLOCKED_HOSTNAMES = (
 )
 
 
+def _is_internal_addr(addr: ipaddress._BaseAddress) -> bool:
+    """回环 / 私有 / 链路本地（含云元数据 169.254.169.254）/ 保留 / 组播 / 未指定。"""
+    return bool(addr.is_loopback or addr.is_private or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast or addr.is_unspecified)
+
+
 def _reject_internal_host(host: str) -> str | None:
     """判断主机是否指向内网/本机/元数据服务；是则返回拒绝原因，否则 None。
 
@@ -645,23 +931,77 @@ def _reject_internal_host(host: str) -> str | None:
 
     注意允许自定义 Redis 服务商（如自建 Upstash 兼容服务）：所以不是白名单
     域名，而是**排除内网与元数据**——公网主机名/IP 一律放行。
+
+    实现要点（逐条都对应一个实测可绕过的写法，别简化回去）：
+
+      1. **先剥 userinfo**：`https://evil@127.0.0.1` 里真正被连接的是 `127.0.0.1`
+         （httpx 会把 `evil@` 当认证信息），而按字符串看它不是 IP 字面量 ——
+         不剥就会放行。
+      2. **`localhost` 与 `*.localhost` 必须显式拦**：它不是 IP 字面量，
+         但解析到回环（RFC 6761 规定 localhost 恒为回环）。
+      3. **域名要真的解析再判断**：`127.0.0.1.nip.io` 这类通配 DNS 指向内网，
+         纯字符串判断看不出来。
+      4. **解析失败按拒绝处理**（fail-closed）：拿不准就不要发请求。
+         `test_upstash` 本来就是要探测连通性，拒掉一个解析不出的域名不损失功能。
+
+    已知取舍：
+
+      * 解析与请求之间理论上有 TOCTOU 窗口（DNS 可返回不同结果）。这里不做
+        「解析后固定 IP 再连接」——那需要自己管连接池，复杂度远高于收益；
+        攻击者要利用它得先控制被解析域名的 DNS，而那已超出本接口的威胁边界。
+      * **自建在私网里的 Upstash 兼容服务会被拒**。这是有意的：本接口的职责
+        是探测公网 Redis 服务，放行私网地址就等于给出一个内网探针。原实现
+        本来就拦私网 IP 字面量（只是漏了「域名解析到私网」这条），所以这不算
+        能力回退，只是把同一个口径补齐。确有私网需求时应改用部署侧的网络策略，
+        而不是放开这里。
+      * DNS 查询失败时**放行**（fail-open），而不是拒绝。这一点与直觉相反，
+        但在这里是对的：解析不出来的域名，紧接着的 httpx 请求会**用同一个解析器**
+        再解析一次、同样失败 —— 也就是说根本连不上，放行不产生 SSRF 风险。
+        若改成 fail-closed，代价是「DNS 一时抽风 → 连通性测试报无法解析」，
+        以及**测试环境/离线环境里任何域名都测不了**（我们的假主机名就因此挂掉），
+        换来的是一个不存在攻击面。已知取舍里 DNS rebinding 的窗口本就不在本
+        接口的威胁边界内（需要攻击者控制域名解析）。
     """
-    h = (host or '').strip().strip('[]').lower()
+    # 剥 userinfo（取最后一个 @ 之后的部分）与端口；去掉 IPv6 字面量的方括号
+    h = (host or '').strip().rsplit('@', 1)[-1].strip()
+    h = h.strip('[]').lower()
+    if not h:
+        return '地址为空'
+    # 端口：IPv6 已去括号，剩下的冒号只可能是「host:port」
+    if h.count(':') == 1:
+        h = h.split(':', 1)[0]
     if not h:
         return '地址为空'
     if h in _BLOCKED_HOSTNAMES or h.endswith('.internal') or h.endswith('.local'):
         return f'{host} 是不允许探测的内部地址'
-    # 明文 IP：拦掉回环 / 私有 / 链路本地（含云元数据 169.254.169.254）/ 保留段
+    if h == 'localhost' or h.endswith('.localhost'):
+        return f'{host} 是不允许探测的内部地址'
+
+    # 明文 IP：直接判段
     try:
         addr = ipaddress.ip_address(h)
     except ValueError:
-        # 不是 IP 字面量（域名）→ 放行。域名解析到内网的情况由部署方的网络策略兜底，
-        # 这里不做 DNS 解析：解析后校验会引入 TOCTOU（解析与请求之间结果可能变），
-        # 而且会让每次测试多一次 DNS 查询。
+        addr = None
+    if addr is not None:
+        if _is_internal_addr(addr):
+            return f'{host} 是不允许探测的内部地址'
         return None
-    if (addr.is_loopback or addr.is_private or addr.is_link_local
-            or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
-        return f'{host} 是不允许探测的内部地址'
+
+    # 域名：解析后逐个地址判断（任一落在内网即拒）。
+    #
+    # 解析失败 → 放行（见 docstring 的说明：解析不出的域名，接下来那次请求也会
+    # 解析失败，连不上就不存在 SSRF）。这里只关心「解析出来的地址是否内网」。
+    try:
+        infos = socket.getaddrinfo(h, None)
+    except Exception:  # noqa: BLE001
+        return None
+    for info in infos:
+        try:
+            resolved = ipaddress.ip_address(info[4][0])
+        except (ValueError, IndexError):
+            continue
+        if _is_internal_addr(resolved):
+            return f'{host} 解析到内部地址 {resolved}，不允许探测'
     return None
 
 

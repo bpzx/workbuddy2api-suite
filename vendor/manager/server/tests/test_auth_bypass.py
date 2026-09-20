@@ -114,10 +114,20 @@ class AuthBypassTest(unittest.TestCase):
     # ── 通路 B：签名 cookie ────────────────────────────
 
     def _forge(self, payload: dict, secret: str) -> str:
+        """伪造一个签名 cookie（用于测试「secret 泄露后能伪造」这条事实）。
+
+        **自动补齐 iat/orig**：会话自 2026-09-17 起带空闲滑动窗口，缺 `iat` 的
+        载荷会被判失效（fail-closed，见 `security.idle_expired`）。这些用例测的是
+        **别的**性质（secret 是信任根、删号后失效、降权立即生效），不该因为漏填
+        时间字段就在更早的一层被拦下 —— 那会让人误以为那些防线失效了。
+        要测「缺 iat 会被拒」请见 `test_session_hardening.IdleExpiryTest`。
+        """
         import base64
         import hashlib
         import hmac
-        raw = json.dumps(payload)
+        now = int(time.time())
+        full = {'iat': now, 'orig': now, **payload}
+        raw = json.dumps(full)
         sig = hmac.new(secret.encode(), raw.encode(), hashlib.sha256).hexdigest()
         return base64.urlsafe_b64encode(f'{raw}|{sig}'.encode()).decode()
 

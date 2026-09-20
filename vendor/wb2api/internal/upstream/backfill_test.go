@@ -61,19 +61,22 @@ func TestBackfillReasoningContentDeepSeek(t *testing.T) {
 				{"role":"user","content":"u2"},
 				{"role":"assistant","content":"a2"}]}`,
 			2, []string{"t1", ""}},
-		{"assistant reasoning 为空串视为无 reasoning 痕迹",
+		// 新契约下（门控 thinkingEnabled||hasTrace，issue #165）：L1 注入 enabled
+		// 后零痕迹 assistant 也补空串——期望从 <absent> 改为 ""（存在 string）。
+		{"assistant reasoning 为空串 → 视为零痕迹但 enabled 下补空串",
 			`{"model":"deepseek-v4-flash","messages":[
 				{"role":"assistant","content":"a","reasoning":""}]}`,
-			1, []string{"<absent>"}},
+			1, []string{""}},
 		{"多 assistant 都带 reasoning 全部复制",
 			`{"model":"deepseek-v4-flash","messages":[
 				{"role":"assistant","content":"a1","reasoning":"r1"},
 				{"role":"assistant","content":"a2","reasoning":"r2"}]}`,
 			2, []string{"r1", "r2"}},
-		{"reasoning 非 string 值（数字）按空串处理",
+		// 官方 "string"!=typeof 语义：非 string reasoning 无从复制，落补 "" 分支。
+		{"assistant reasoning 非 string 值（数字）→ 补空串",
 			`{"model":"deepseek-v4-flash","messages":[
 				{"role":"assistant","content":"a","reasoning":123}]}`,
-			1, []string{"<absent>"}},
+			1, []string{""}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -94,15 +97,19 @@ func TestBackfillReasoningContentDeepSeek(t *testing.T) {
 	}
 }
 
-// TestBackfillReasoningContentNoTrace 会话无任何 reasoning 痕迹 → 零改动：
-// 不白白给 assistant 消息加 reasoning_content 字段。
+// TestBackfillReasoningContentNoTrace 会话无 reasoning 痕迹 + thinking disabled
+// → 零改动：不白白给 assistant 消息加 reasoning_content 字段。
+// 官方 ReasoningContentBackfillRule 门控 = thinkingEnabled || hasTrace；disabled
+// 且无痕迹时两个半边都不亮 → 不补（issue #165 前该用例不分 disabled 与否一律不补，
+// 现按新契约收紧为 disabled 形态——纯 text + enabled 补空串由
+// TestBackfillZeroTraceThinkingEnabled 覆盖）。
 func TestBackfillReasoningContentNoTrace(t *testing.T) {
 	cases := []struct {
 		name string
 		body string
 	}{
-		{"纯 text assistant 不动",
-			`{"model":"deepseek-v4-flash","messages":[
+		{"disabled + 纯 text assistant 不动",
+			`{"model":"deepseek-v4-flash","thinking":{"type":"disabled"},"messages":[
 				{"role":"user","content":"u"},
 				{"role":"assistant","content":"plain answer"}]}`},
 		{"无 assistant 消息不动",
@@ -158,9 +165,11 @@ func TestBackfillReasoningContentBothFields(t *testing.T) {
 	}
 }
 
-// TestBackfillComposesWithInjectThinking backfill 与 injectThinking 相互独立：
-// 显式 disabled 时 reasoning_effort 被删，但 backfill 照常生效（多轮一致性不因关思维链而丢）。
+// TestBackfillComposesWithInjectThinking backfill 与 injectThinking 组合语义：
+// 显式 disabled 时 reasoning_effort 被删，但 backfill 的 hasTrace 半边照常生效
+// （多轮一致性不因关思维链而丢）；disabled + 零痕迹则零改动（thinkingEnabled 半边不亮）。
 func TestBackfillComposesWithInjectThinking(t *testing.T) {
+	// R6：disabled + 有痕迹 → 照补（复制 reasoning）。
 	body := `{"model":"DEEPSEEK-v4-flash","thinking":{"type":"disabled"},"reasoning_effort":"high","messages":[
 		{"role":"user","content":"u"},
 		{"role":"assistant","content":"a","reasoning":"thought"}]}`
@@ -176,5 +185,74 @@ func TestBackfillComposesWithInjectThinking(t *testing.T) {
 		if _, ok := objFieldString(t, out, k); ok {
 			t.Errorf("%s 应被删除（disabled 时）", k)
 		}
+	}
+
+	// R2：disabled + 零痕迹 → 零改动（新契约四分支之一）。
+	body = `{"model":"DEEPSEEK-v4-flash","thinking":{"type":"disabled"},"messages":[
+		{"role":"user","content":"u"},
+		{"role":"assistant","content":"plain"}]}`
+	out = PrepareBodyOptWithEfforts([]byte(body), false, nil)
+	for _, rc := range assistantRC(t, out) {
+		if rc != "<absent>" {
+			t.Errorf("disabled+零痕迹 不应 backfill, got reasoning_content=%q (out=%s)", rc, out)
+		}
+	}
+}
+
+// TestBackfillZeroTraceThinkingEnabled issue #165 复现锚（R1）：零痕迹多轮 deepseek，
+// 经 L1 injectThinking 注入 enabled 后，thinkingEnabled 半边亮 → 每条 assistant
+// 保证 reasoning_content 是 string（此处无 reasoning 可复制，全补空串）。
+// 官方 ReasoningContentBackfillRule 的门控是 thinkingEnabled || hasTrace，
+// 第三方客户端丢推理回传（零痕迹）形态下官方仍补，网关此前只移植了 hasTrace 半边。
+func TestBackfillZeroTraceThinkingEnabled(t *testing.T) {
+	body := `{"model":"deepseek-v4-flash","messages":[
+		{"role":"user","content":"u1"},
+		{"role":"assistant","content":"a1"},
+		{"role":"user","content":"u2"},
+		{"role":"assistant","content":"a2"},
+		{"role":"user","content":"u3"}]}`
+	out := PrepareBodyOptWithEfforts([]byte(body), false, nil)
+	// 前置：出站确实是注入后的 enabled 形态（thinkingEnabled 判定读注入后请求体）。
+	if typ, present := getThinkingType(t, out); !present || typ != "enabled" {
+		t.Fatalf("thinking.type=%q present=%v want enabled (out=%s)", typ, present, out)
+	}
+	got := assistantRC(t, out)
+	if len(got) != 2 {
+		t.Fatalf("assistant 消息数 = %d want 2 (out=%s)", len(got), out)
+	}
+	for i, rc := range got {
+		if rc != "" { // 既有 string（含空串）即满足；<absent>（键不存在）不满足
+			t.Errorf("零痕迹 enabled 形态下 assistant[%d].reasoning_content = %q want 存在且为 \"\" (out=%s)", i, rc, out)
+		}
+	}
+}
+
+// TestBackfillNullAndNonStringNormalized issue #165 null/非 string 归一化（R3）：
+// 官方跳过条件是 "string"!=typeof reasoning_content 才动手——null/数字会被旧代码
+// 的 if _, ok（键存在即跳过）当「已有」跳过，新契约归一化为 ""。
+// 注意 hasTrace 半边：reasoning_content 键存在本身即痕迹，门控必然亮。
+func TestBackfillNullAndNonStringNormalized(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"reasoning_content:null 归一化为空串",
+			`{"model":"deepseek-v4-flash","messages":[
+				{"role":"assistant","content":"a","reasoning_content":null}]}`},
+		{"reasoning_content:数字 归一化为空串",
+			`{"model":"deepseek-v4-flash","messages":[
+				{"role":"assistant","content":"a","reasoning_content":123}]}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			out := PrepareBodyOptWithEfforts([]byte(c.body), false, nil)
+			got := assistantRC(t, out)
+			if len(got) != 1 {
+				t.Fatalf("assistant 消息数 = %d want 1 (out=%s)", len(got), out)
+			}
+			if got[0] != "" || got[0] == "<absent>" {
+				t.Errorf("reasoning_content 应归一化为 \"\", got %q (out=%s)", got[0], out)
+			}
+		})
 	}
 }

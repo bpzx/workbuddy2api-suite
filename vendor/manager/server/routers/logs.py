@@ -19,10 +19,20 @@ def list_logs(
     status: str | None = None,
     ip: str | None = None,
     days: int | None = None,
+    realm: str | None = None,
     user: dict = Depends(security.current_user),
 ) -> dict:
     where: list[str] = []
     args: list[object] = []
+
+    # 版本过滤（cn / global）。历史记录该列为 NULL —— 按 cn 归类，
+    # 与 db.realm_of_model 的口径一致（无前缀即国内版）。
+    if realm in ('cn', 'global'):
+        if realm == 'cn':
+            where.append('(l.realm = ? OR l.realm IS NULL)')
+        else:
+            where.append('l.realm = ?')
+        args.append(realm)
 
     if days:
         # 钳到 [1, 3650]：超大值会在 SQLite 绑定时溢出（曾 500），
@@ -70,6 +80,7 @@ def list_logs(
             'model': r['model'],
             'mapped_model': r['mapped_model'],
             'status': r['status'],
+            'realm': r['realm'] or 'cn',
             'prompt_tokens': r['prompt_tokens'],
             'completion_tokens': r['completion_tokens'],
             'latency_ms': r['latency_ms'],

@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from .. import db, security
 from ..iputil import client_ip
-from ..services import reload, wb2api
+from ..services import reload, updater, wb2api
 
 router = APIRouter(prefix='/api', tags=['settings'])
 
@@ -36,6 +36,17 @@ async def save_upstream(body: dict, request: Request,
                    f'；来源 {client_ip(request)}')
     # 上游只在启动时读 config.json，保存后自动重载使其生效
     result['reload_scheduled'] = reload.request_restart()
+    # 无法自动重载上游时（没装 docker / 容器没挂 docker.sock），要如实告诉
+    # 用户去宿主机重启，而不是让他以为改完就生效了。
+    #
+    # 判据是**实际能力**而非"是否容器"：容器挂了 docker.sock 就能自动重载
+    # （与宿主部署等价），宿主没装 docker 反而不能。
+    if not updater.can_control_docker():
+        result['reload_scheduled'] = False
+        result['reload_hint'] = (
+            '配置已写入，但当前环境无法操作 docker，不会自动重启上游容器。'
+            '请在宿主机执行 docker compose restart wbapi（上游目录下）使其生效。'
+        )
     return result
 
 

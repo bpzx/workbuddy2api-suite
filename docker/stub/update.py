@@ -5,23 +5,29 @@
 
 背景
 ----
-manager 上游的 `deploy/update.py` 是**裸机部署**的更新流程，它依赖三样在
-容器里不存在的东西：
+manager 上游的 `deploy/update.py` 是**裸机部署**的更新流程，它依赖 `git`
+检出、`systemctl restart`、以及从 GitHub Release 下载 tar.gz 覆盖自身代码。
 
-  1. `git` 检出上游仓库（容器内没有上游的 .git，代码是构建期快照进来的）
-  2. `systemctl restart` 重启服务（容器内没有 systemd，PID 1 是 entrypoint）
-  3. 从 GitHub Release 下载 tar.gz 并验签后覆盖自身代码（容器是只读镜像层）
+上游 v1.0.33+ 也提供了容器版流程（`WB_RUN_MODE=docker`：替换代码 → 容器退出
+→ 由 compose 的 `restart` 策略拉起）。但那套流程是为**本地 build 的镜像**
+设计的；本发行版用的是 **ghcr 预构建镜像**，容器内替换的代码会在下次
+`docker compose pull` 时被镜像层覆盖 —— 结果是"版本号变了、代码还是旧的"，
+比不更新更难排查。
 
-在容器里硬跑那套流程，最坏情况是**把运行中的容器代码改坏**（下载、解压、
-替换 server/ 全部会成功执行，只有最后的 systemctl 失败）。因此这里用一个
-替身脚本占位：它**什么都不改动**，只如实告诉用户正确的更新方式。
+因此这里用替身脚本占位：它**什么都不改动**，只如实告诉用户正确的更新方式
+（在宿主机 `pull && up -d`）。
 
 为什么用「覆盖」而不是「改上游代码」
 ------------------------------------
-本项目的原则是 vendor/ 下的上游代码一字不改（见 UPSTREAMS.md），
+本项目原则是 vendor/ 下的上游代码一字不改（见 UPSTREAMS.md），
 这样同步上游才是一条命令的事。所以更新方式在**构建期**用本文件覆盖
 `/opt/manager/deploy/update.py`（见 docker/Dockerfile），
 vendor 源码保持原样。
+
+> 注：上游的 `start_update` 已用 `can_control_docker()` 做前置检查，
+> 「更新上游 / 全部」在本发行版会被**上游自己拦住**并提示宿主机操作
+> （因为我们经 socket 代理访问 docker 且关闭了 `/info` 端点）。
+> 本替身只需处理绕不过去的「仅更新管理端」这一路。
 
 输出契约
 --------
@@ -77,8 +83,9 @@ def main() -> int:
         {'level': 'info', 'text': f'收到更新请求：{target_label}（target={args.target}）'},
         {
             'level': 'warn',
-            'text': '本部署由 Docker Compose 管理，容器内不支持一键更新'
-                    '（无 git、无 systemd，镜像层只读）。',
+            'text': '本发行版用 **ghcr 上的预构建镜像**，容器内不做代码更新。'
+                    '即使替换了容器内的代码，下次 docker compose pull 也会被镜像层覆盖，'
+                    '结果是"版本号变了、代码还是旧的"——比不更新更难排查。',
         },
         {'level': 'info', 'text': '请在**宿主机**本项目目录下执行：'},
         {'level': 'info', 'text': '    docker compose pull'},
@@ -87,6 +94,11 @@ def main() -> int:
             'level': 'info',
             'text': '更新镜像前请先查看新版捆绑的上游 commit：'
                     'docker inspect <镜像> | grep upstream，或阅读 UPSTREAMS.md。',
+        },
+        {
+            'level': 'info',
+            'text': '若还需要同步上游新版本，先在本项目目录跑 '
+                    './scripts/sync-upstreams.sh，再重新构建并发布镜像。',
         },
         {
             'level': 'info',

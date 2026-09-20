@@ -20,6 +20,9 @@ import {
   FileText,
 } from 'lucide-react';
 import {notify} from '@/lib/toast';
+import {useI18n} from '@/lib/i18n/provider';
+import {t as tGlobal, tp as tpGlobal} from '@/lib/i18n';
+import {RichText} from '@/lib/i18n/rich-text';
 import {settingsApi, upstreamApi, errText} from '@/lib/api';
 import type {ModelInfo, ModelSource, UpstreamConfig, UserItem} from '@/lib/types';
 import {PageHeader} from '@/components/common/layout/PageHeader';
@@ -95,6 +98,15 @@ interface DurationField {
   label: string;
   desc: string;
   def: string;
+  /**
+   * 允许 `0` / 空串（上游语义：**关闭该特性**，不是格式错误）。
+   *
+   * 必须显式声明：`DURATION_RE` 只认「数字+单位」，`0` 与空串都过不了它。
+   * 早先「留空或填 0 = 关闭」只写在 desc 里、没告诉校验器，于是用户按提示填 0
+   * 想关掉优化，`pickValues` 又把它当成非法值**静默换回默认**（168h）——
+   * 界面看不出任何异常，用户以为自己关掉了，其实一直开着。
+   */
+  offWhenZero?: boolean;
 }
 
 interface SelectField {
@@ -131,6 +143,18 @@ type Field =
 /** 时长格式校验：数字 + 单位（s/m/h/d） */
 const DURATION_RE = /^\d+\s*(s|m|h|d)$/i;
 
+/**
+ * 一个时长字段的取值是否合法。
+ *
+ * `offWhenZero` 的字段额外接受 `0` 与空串（上游把两者都当「关闭」，见该字段注释）；
+ * 其余字段仍要求严格的「数字+单位」。
+ */
+function durationOk(f: DurationField, raw: unknown): boolean {
+  const text = String(raw ?? '').trim();
+  if (f.offWhenZero && (text === '' || text === '0')) return true;
+  return DURATION_RE.test(text);
+}
+
 /** 把时刻数组格式化为可读文本，如 [9,21] -> "9, 21" */
 function hoursToText(v: unknown): string {
   if (Array.isArray(v)) {
@@ -145,12 +169,12 @@ function hoursToText(v: unknown): string {
 /** 解析用户输入的时刻列表：返回 {ok, hours?, error?} */
 function parseHours(text: string): {ok: boolean; hours: number[]; error?: string} {
   const parts = text.split(/[,，\s]+/).filter(Boolean);
-  if (!parts.length) return {ok: false, hours: [], error: '请至少填一个时刻'};
+  if (!parts.length) return {ok: false, hours: [], error: tGlobal('settings.errNeedOneHour')};
   const out: number[] = [];
   for (const p of parts) {
     const n = Number(p);
     if (!Number.isInteger(n) || n < 0 || n > 23) {
-      return {ok: false, hours: [], error: `「${p}」不是 0-23 的整点`};
+      return {ok: false, hours: [], error: tGlobal('settings.errHourRange', {v: p})};
     }
     if (!out.includes(n)) out.push(n);
   }
@@ -283,6 +307,22 @@ const POOL_FIELDS: Field[] = [
     def: 3,
   },
   {
+    key: 'max_in_flight_global',
+    kind: 'num',
+    label: '国际版单账号最大并发',
+    // 语义与 max_in_flight **不同**（上游如此）：那边 0 = 不限制，这边 0/负数
+    // = 未设置、回落默认 2（上游 normalize 逻辑，见其 config.go:319）。
+    // 写成「不填则跟随」会误导 —— 它并不跟随上面的值。
+    desc: '国际版单独用这个上限。国际版的风控更严，官方默认压到 2——'
+      + '并发越高越容易被判为异常流量。填 0 表示用默认值 2（注意与上面那个「0 = 不限制」不同）',
+    unit: '个',
+    min: 0,
+    // 上限与后端 _INT_RANGES 的 max_in_flight_global 保持一致（0-64）：
+    // 不一致会出现「JSON 里能设、表单编辑时被拒」的矛盾。
+    max: 64,
+    def: 2,
+  },
+  {
     key: 'breaker_threshold',
     kind: 'num',
     label: '连续失败熔断阈值',
@@ -331,7 +371,19 @@ const POOL_FIELDS: Field[] = [
     kind: 'duration',
     label: '快过期积分窗口',
     desc: '到期时间落在此窗口内的积分会被标记为「快过期」，选号时优先消耗掉，避免白白过期。留空或填 0 = 关闭该优化',
+    offWhenZero: true,
     def: '168h',
+  },
+  {
+    key: 'cost_explore_interval',
+    kind: 'duration',
+    label: '成本档位探索周期',
+    // 语义偏「调优」而非「必需」，如实说清代价：探索期间会改走成本更低的档位，
+    // 因此可能与平时选到的账号不同。默认 30m 相当于每模型每天最多 48 次。
+    desc: '上游的选号优化：长时间只用高成本档位时，每隔这么久会改走一次低成本档位探测，'
+      + '成功就留在低档（省钱）。留空 = 用上游默认 30m，填 0 = 关闭该优化',
+    offWhenZero: true,
+    def: '30m',
   },
 ];
 
@@ -374,11 +426,14 @@ const PROMPT_FIELDS: Field[] = [
     key: 'mode',
     kind: 'select',
     label: '系统提示词模式',
-    desc: 'passthrough：原样透传客户端传来的 system 消息；custom：网关用自有提示词替换它',
+    desc: 'passthrough：原样透传客户端传来的 system 消息；custom：网关用自有提示词替换它；'
+      + 'append：两者并用——在开头连续的 system/developer 块之后插入网关 system，既有消息逐字不动',
     caution:
-      '默认 passthrough 会把下游的 system prompt 原样送给上游。若你依赖网关自己的提示词来稳定行为（或避免 system 指纹被判异常），请改为 custom。',
+      '默认 passthrough 会把下游的 system prompt 原样送给上游。若你依赖网关自己的提示词来稳定行为（或避免 system 指纹被判异常），请改为 custom；'
+      + '若既要保留客户端原始 system、又要网关的提示词生效，用 append。',
     options: [
       {value: 'passthrough', label: 'passthrough（透传客户端 system，默认）'},
+      {value: 'append', label: 'append（保留客户端 system，其后插入网关提示词）'},
       {value: 'custom', label: 'custom（替换为网关提示词）'},
     ],
     def: 'passthrough',
@@ -387,19 +442,30 @@ const PROMPT_FIELDS: Field[] = [
     key: 'file',
     kind: 'text',
     label: '自定义提示词文件',
-    desc: '仅在 custom 模式下生效。留空使用内置默认提示词',
+    desc: '在 custom 与 append 模式下生效。留空使用内置默认提示词',
     caution: '路径必须存在于上游容器内且可读；写错会导致上游启动失败、反代不可用。不确定就留空。',
     placeholder: '留空 = 使用内置默认',
     def: '',
   },
 ];
 
+/**
+ * `server` 段（旧版上游的请求体上限）。
+ *
+ * 上游 9d1a21b **移除了** `server.max_body_mb`（其 chat handler 不再预拦截请求体）。
+ * 这里保留字段是为了**兼容仍跑旧版上游的部署**：那些部署的这个键依然生效，界面上
+ * 还能调。新建部署在新上游上会看到它「未生效」的提示。
+ *
+ * 本端自己的请求体上限是另一个东西（`WB_GATEWAY_MAX_BODY_MB`，默认 32 MB）——
+ * 那是本网关读进内存前必须有的保护，与上游无关，因此不在这里暴露（要改改环境变量）。
+ */
 const SERVER_FIELDS: Field[] = [
   {
     key: 'max_body_mb',
     kind: 'num',
-    label: '请求体上限',
-    desc: '单个请求体最大体积，超过返回 413。反代网关也按此值限制入站请求，调大可容纳更长的上下文',
+    label: '请求体上限（旧版上游）',
+    desc: '仅对**旧版**上游生效：上游 9d1a21b 起已移除该配置、不再限制请求体大小。'
+      + '本网关自身的入站上限由环境变量 WB_GATEWAY_MAX_BODY_MB 控制（默认 32 MB）',
     unit: 'MB',
     min: 1,
     max: 256,
@@ -559,8 +625,8 @@ const GROUPS: GroupDef[] = [
   {
     id: 'server',
     section: 'server',
-    title: '请求上限',
-    desc: '网关自身的请求约束',
+    title: '请求上限（旧版上游）',
+    desc: '仅当上游仍是 9d1a21b 之前的版本时生效',
     fields: SERVER_FIELDS,
   },
   {
@@ -606,7 +672,7 @@ function pickValues(fields: Field[], source: Record<string, unknown> | undefined
         out[f.key] = Array.isArray(raw) ? hoursToText(raw) : hoursToText(f.def);
         break;
       case 'duration':
-        out[f.key] = typeof raw === 'string' && DURATION_RE.test(raw) ? raw : f.def;
+        out[f.key] = durationOk(f, raw) ? String(raw).trim() : f.def;
         break;
       case 'select':
         // 只接受枚举内的取值；配置里是别的值（上游改过枚举）时回退默认
@@ -625,9 +691,13 @@ function fieldError(f: Field, raw: FieldValue): string | undefined {
   if (f.kind === 'num') {
     // 输入框的 min/max 只是浏览器属性，不参与提交校验，这里显式检查
     const n = Number(raw);
-    if (!Number.isFinite(n)) return '请填写数字';
+    if (!Number.isFinite(n)) return tGlobal('settings.errNumber');
     if (n < f.min || n > f.max) {
-      return `请填 ${f.min}–${f.max}${f.unit ? `（${f.unit}）` : ''}`;
+      return tGlobal('settings.errRange', {
+        min: f.min ?? '',
+        max: f.max ?? '',
+        unit: f.unit ? tpGlobal(f.unit) : '',
+      });
     }
     return undefined;
   }
@@ -636,10 +706,10 @@ function fieldError(f: Field, raw: FieldValue): string | undefined {
     return r.ok ? undefined : r.error;
   }
   if (f.kind === 'duration') {
-    return DURATION_RE.test(String(raw).trim()) ? undefined : '格式如 30s / 10m / 2h / 1d';
+    return durationOk(f, raw) ? undefined : tGlobal('settings.errDuration');
   }
   if (f.kind === 'text' && /[\r\n\u0000-\u001f]/.test(String(raw))) {
-    return '不能包含换行或控制字符';
+    return tGlobal('settings.errNoNewline');
   }
   return undefined;
 }
@@ -651,17 +721,26 @@ function toWire(
 ): {ok: true; value: boolean | number | number[] | string} | {ok: false; error: string} {
   if (f.kind === 'hours') {
     const r = parseHours(String(raw));
-    return r.ok ? {ok: true, value: r.hours} : {ok: false, error: r.error ?? '时刻格式有误'};
+    return r.ok ? {ok: true, value: r.hours} : {ok: false, error: r.error ?? tGlobal('settings.errHourFormat')};
   }
   if (f.kind === 'duration') {
     const t = String(raw).trim();
-    return DURATION_RE.test(t) ? {ok: true, value: t} : {ok: false, error: '格式如 30s / 10m / 2h / 1d'};
+    return durationOk(f, t)
+      ? {ok: true, value: t}
+      : {ok: false, error: tGlobal('settings.errDuration')};
   }
   if (f.kind === 'num') {
     const n = Number(raw);
-    if (!Number.isFinite(n)) return {ok: false, error: '请填写数字'};
+    if (!Number.isFinite(n)) return {ok: false, error: tGlobal('settings.errNumber')};
     if (n < f.min || n > f.max) {
-      return {ok: false, error: `请填 ${f.min}–${f.max}${f.unit ? `（${f.unit}）` : ''}`};
+      return {
+        ok: false,
+        error: tGlobal('settings.errRange', {
+          min: f.min ?? '',
+          max: f.max ?? '',
+          unit: f.unit ? tpGlobal(f.unit) : '',
+        }),
+      };
     }
     return {ok: true, value: n};
   }
@@ -669,11 +748,11 @@ function toWire(
     const v = String(raw);
     return f.options.some((o) => o.value === v)
       ? {ok: true, value: v}
-      : {ok: false, error: '取值不在允许范围内'};
+      : {ok: false, error: tGlobal('settings.errEnum')};
   }
   if (f.kind === 'text') {
     const t = String(raw).trim();
-    if (/[\r\n\u0000-\u001f]/.test(t)) return {ok: false, error: '不能包含换行或控制字符'};
+    if (/[\r\n\u0000-\u001f]/.test(t)) return {ok: false, error: tGlobal('settings.errNoNewline')};
     return {ok: true, value: t};
   }
   return {ok: true, value: raw};
@@ -683,6 +762,7 @@ const FIELD_BY_KEY: Record<string, Field> = {};
 for (const g of GROUPS) for (const f of g.fields) FIELD_BY_KEY[f.key] = f;
 
 export default function SettingsPage() {
+  const {t, tp} = useI18n();
   const {isAdmin} = useAuth();
   const [cfg, setCfg] = useState<UpstreamConfig | null>(null);
   const [models, setModels] = useState<ModelInfo[]>([]);
@@ -790,10 +870,12 @@ export default function SettingsPage() {
   /**
    * 上游模型列表。
    *
-   * 上游自己会缓存 1 小时（动态拉取成功时），失败则回退到编译进二进制的
-   * 静态表、并有 5 分钟负缓存——所以「刷新页面」不一定能拿到新列表。
-   * 这也是为什么提供手动重新拉取：上游刷新令牌/新增模型后，用户需要能
-   * 立刻主动取一次，而不是干等缓存过期。
+   * 上游自己会缓存 1 小时（动态拉取成功时），失败则进入 5 分钟负缓存——
+   * 所以「刷新页面」不一定能拿到新列表。这也是为什么提供手动重新拉取：
+   * 上游刷新令牌/新增模型后，用户需要能立刻主动取一次，而不是干等缓存过期。
+   *
+   * 注：上游 2026-09-15（commit 1b7ce4a）起删除了静态兜底表，改为纯动态——
+   * 取不到就是空列表。下面的 static 分支只为仍在跑旧版上游的部署保留。
    */
   const loadModels = useCallback(async (silent = true) => {
     if (!silent) setModelsLoading(true);
@@ -822,7 +904,7 @@ export default function SettingsPage() {
   /** 保存 Upstash 配置（token 留空表示保持原值） */
   async function saveUpstash() {
     if (!upstashForm.url.trim()) {
-      notify.err('请填写 Upstash 地址');
+      notify.err(t('settings.upstashUrlRequired'));
       return;
     }
     setUpstashBusy(true);
@@ -833,7 +915,8 @@ export default function SettingsPage() {
           ...(upstashForm.token.trim() ? {token: upstashForm.token.trim()} : {}),
         },
       });
-      notify.ok('Upstash 配置已保存', '正在自动应用到上游…');
+      notify.ok(t('settings.upstashSaved'), t('settings.applying'));
+      // （Upstash 属于上游外部依赖，改完无需重启上游容器）
       setUpstashForm((f) => ({...f, token: ''}));
       await load();
     } catch (e) {
@@ -865,20 +948,26 @@ export default function SettingsPage() {
       if (!f) continue;
       const w = toWire(f, cur[k]);
       if (!w.ok) {
-        notify.err(`「${f.label}」填写有误`, w.error);
+        notify.err(t('settings.fieldInvalid', {label: tp(f.label)}), w.error);
         return;
       }
       patch[k] = w.value;
     }
     if (!Object.keys(patch).length) {
-      notify.info('没有需要保存的改动');
+      notify.info(t('settings.noChanges'));
       return;
     }
     setBusy(true);
     try {
       const def = GROUPS.find((g) => g.id === group);
-      await settingsApi.saveUpstream({[def?.section ?? group]: patch});
-      notify.ok('设置已保存', '正在自动应用到上游…');
+      const saved = await settingsApi.saveUpstream({[def?.section ?? group]: patch});
+      // 容器部署下无法自动重载上游（需 docker 命令，而容器刻意不挂 docker 套接字），
+      // 后端会带回 reload_hint —— 如实转达，不让人以为改完就生效了
+      if (saved?.reload_hint) {
+        notify.warn(t('settings.savedManualStep'), saved.reload_hint);
+      } else {
+        notify.ok(t('settings.saved'), t('settings.applying'));
+      }
       await load();
     } catch (e) {
       notify.err(errText(e));
@@ -897,17 +986,17 @@ export default function SettingsPage() {
     try {
       parsed = JSON.parse(text);
     } catch {
-      notify.err('JSON 格式有误，请检查括号与逗号');
+      notify.err(t('settings.jsonInvalid'));
       return;
     }
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-      notify.err('需要是一个 JSON 对象，例如 { "checkin_hours": [9, 21] }');
+      notify.err(t('settings.jsonNotObject'));
       return;
     }
     setBusy(true);
     try {
       await settingsApi.saveUpstream({[field]: parsed});
-      notify.ok('设置已保存', '正在自动应用到上游…');
+      notify.ok(t('settings.saved'), t('settings.applying'));
       await load();
     } catch (e) {
       notify.err(errText(e));
@@ -920,7 +1009,7 @@ export default function SettingsPage() {
     try {
       await settingsApi.saveModelMap(next);
       setModelMap(next);
-      notify.ok('模型映射已保存');
+      notify.ok(t('settings.modelMapSaved'));
     } catch (e) {
       notify.err(errText(e));
     }
@@ -929,21 +1018,21 @@ export default function SettingsPage() {
   return (
     <div className="flex flex-col gap-4 md:gap-6">
       <PageHeader
-        title="设置"
-        description="上游代理配置、模型别名映射与管理端用户"
+        title={t('settings.title')}
+        description={t('settings.description')}
         actions={
           <Button
             variant="outline"
             size="sm"
             className="rounded-full"
-            title="重新读取上游配置与模型列表（上游模型列表自身有 1 小时缓存）"
+            title={t('settings.reloadTitle')}
             onClick={() => {
               load();
               loadModels(false);
             }}
           >
             <RefreshCw />
-            刷新配置与模型
+            {t('settings.reload')}
           </Button>
         }
       />
@@ -952,12 +1041,12 @@ export default function SettingsPage() {
         {/* 标签较多，手机上会撑破容器，这里允许横向滚动 */}
         <div className="-mx-1 overflow-x-auto px-1 pb-1">
         <TabsList className="w-max">
-          <TabsTrigger value="upstream"><Server className="mr-1.5 h-3.5 w-3.5" />上游配置</TabsTrigger>
-          <TabsTrigger value="models"><Shuffle className="mr-1.5 h-3.5 w-3.5" />模型映射</TabsTrigger>
-          <TabsTrigger value="users"><Users className="mr-1.5 h-3.5 w-3.5" />管理用户</TabsTrigger>
-          <TabsTrigger value="system"><DownloadCloud className="mr-1.5 h-3.5 w-3.5" />系统更新</TabsTrigger>
-          <TabsTrigger value="changelog"><FileText className="mr-1.5 h-3.5 w-3.5" />更新日志</TabsTrigger>
-          <TabsTrigger value="about"><Info className="mr-1.5 h-3.5 w-3.5" />关于</TabsTrigger>
+          <TabsTrigger value="upstream"><Server className="mr-1.5 h-3.5 w-3.5" />{t('settings.tabUpstream')}</TabsTrigger>
+          <TabsTrigger value="models"><Shuffle className="mr-1.5 h-3.5 w-3.5" />{t('settings.tabModels')}</TabsTrigger>
+          <TabsTrigger value="users"><Users className="mr-1.5 h-3.5 w-3.5" />{t('settings.tabUsers')}</TabsTrigger>
+          <TabsTrigger value="system"><DownloadCloud className="mr-1.5 h-3.5 w-3.5" />{t('settings.tabSystem')}</TabsTrigger>
+          <TabsTrigger value="changelog"><FileText className="mr-1.5 h-3.5 w-3.5" />{t('settings.tabChangelog')}</TabsTrigger>
+          <TabsTrigger value="about"><Info className="mr-1.5 h-3.5 w-3.5" />{t('settings.tabAbout')}</TabsTrigger>
         </TabsList>
         </div>
 
@@ -967,11 +1056,10 @@ export default function SettingsPage() {
             <div className="flex items-start gap-2.5 rounded-[20px] border border-amber-500/30 bg-amber-500/10 p-4">
               <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
               <div className="space-y-1">
-                <div className="text-xs font-medium">无法读取上游配置</div>
+                <div className="text-xs font-medium">{t('settings.cfgUnreadable')}</div>
                 <div className="text-[11px] text-muted-foreground">{upstreamError}</div>
                 <div className="text-[11px] text-muted-foreground">
-                  请确认 workbuddy2api 已部署且路径正确（环境变量 <code className="font-mono">WB_UPSTREAM_CONFIG</code>）。
-                  在读取成功前，下方配置项已锁定，避免误写空配置覆盖真实文件。
+                  <RichText text={t('settings.cfgUnreadableHint')} />
                 </div>
               </div>
             </div>
@@ -980,24 +1068,24 @@ export default function SettingsPage() {
           {/* 账号池概况 */}
           <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
             <div className="rounded-[20px] bg-muted px-3.5 py-3">
-              <div className="mb-2 text-sm font-medium">服务信息</div>
+              <div className="mb-2 text-sm font-medium">{t('settings.serviceInfo')}</div>
               <div className="space-y-1.5 text-xs">
                 {([
-                  ['上游地址', cfg?.listen ? `127.0.0.1${cfg.listen}` : '—'],
-                  ['接入密钥', cfg?.api_key_masked ? '已配置（已隐藏）' : '—'],
-                  ['账号目录', cfg?.auth_dir || '—'],
-                ] as [string, string][]).map(([k, v]) => (
-                  <div key={k} className="flex items-center justify-between gap-3">
+                  ['listen', t('settings.infoListen'), cfg?.listen ? `127.0.0.1${cfg.listen}` : '—'],
+                  ['apiKey', t('settings.infoApiKey'), cfg?.api_key_masked ? t('settings.infoApiKeySet') : '—'],
+                  ['authDir', t('settings.infoAuthDir'), cfg?.auth_dir || '—'],
+                ] as [string, string, string][]).map(([id, k, v]) => (
+                  <div key={id} className="flex items-center justify-between gap-3">
                     <span className="shrink-0 text-muted-foreground">{k}</span>
                     <span className="min-w-0 flex-1 truncate text-right font-mono" title={v}>{v}</span>
-                    {k === '账号目录' && v !== '—' && (
-                      <CopyButton value={v} title="复制账号目录" className="h-6 w-6" />
+                    {id === 'authDir' && v !== '—' && (
+                      <CopyButton value={v} title={t('settings.copyAuthDir')} className="h-6 w-6" />
                     )}
                   </div>
                 ))}
                 {cfg?.upstream_auth_dir && (
                   <div className="flex items-start justify-between gap-3">
-                    <span className="shrink-0 text-muted-foreground">上游声明目录</span>
+                    <span className="shrink-0 text-muted-foreground">{t('settings.upstreamDeclaredDir')}</span>
                     <span
                       className="min-w-0 flex-1 truncate text-right font-mono text-amber-600 dark:text-amber-400"
                       title={cfg.upstream_auth_dir}
@@ -1009,7 +1097,7 @@ export default function SettingsPage() {
               </div>
               {cfg?.upstream_auth_dir && (
                 <p className="mt-2 text-[11px] leading-4 text-amber-600 dark:text-amber-400">
-                  上游配置里声明的账号目录与本站读取的不一致，管理端实际以「账号目录」为准。
+                  {t('settings.authDirMismatch')}
                 </p>
               )}
             </div>
@@ -1017,23 +1105,23 @@ export default function SettingsPage() {
             <div className="rounded-[20px] bg-muted px-3.5 py-3 lg:col-span-2">
               <div className="mb-2 flex items-center justify-between gap-2">
                 <div className="flex min-w-0 items-center gap-2">
-                  <div className="text-sm font-medium">可用模型</div>
+                  <div className="text-sm font-medium">{t('settings.modelsTitle')}</div>
                   {modelSource === 'dynamic' && (
                     <span className="shrink-0 text-[11px] text-muted-foreground">
-                      上游实时列表 · {models.length} 个
+                      {t('settings.modelsDynamic', {count: models.length, n: models.length})}
                     </span>
                   )}
                   {modelSource === 'static' && (
                     <span
                       className="shrink-0 text-[11px] text-amber-600 dark:text-amber-400"
-                      title="上游动态拉取失败时，会回退到其内置的静态模型表——那是编译进二进制的固定列表，数量比实际可用模型少。可直接点击右侧「重新拉取」再试一次。"
+                      title={t('settings.modelsStaticTitle')}
                     >
-                      上游内置回退表（非实时） · {models.length} 个
+                      {t('settings.modelsStatic', {count: models.length, n: models.length})}
                     </span>
                   )}
                   {modelSource === 'unknown' && models.length > 0 && (
                     <span className="shrink-0 text-[11px] text-muted-foreground">
-                      {models.length} 个
+                      {t('settings.modelsCount', {count: models.length, n: models.length})}
                     </span>
                   )}
                 </div>
@@ -1047,7 +1135,7 @@ export default function SettingsPage() {
                   size="sm"
                   className="h-7 shrink-0 gap-1.5 text-[11px]"
                   disabled={modelsLoading}
-                  title="重新向上游拉取模型列表（上游自身有 1 小时缓存，失败时回退静态表）"
+                  title={t('settings.refetchModelsTitle')}
                   onClick={() => loadModels(false)}
                 >
                   {modelsLoading ? (
@@ -1055,7 +1143,7 @@ export default function SettingsPage() {
                   ) : (
                     <RefreshCw className="h-3.5 w-3.5" />
                   )}
-                  重新拉取
+                  {t('models.refetch')}
                 </Button>
               </div>
               <div className="flex flex-wrap gap-1">
@@ -1067,7 +1155,7 @@ export default function SettingsPage() {
                   ))
                 ) : (
                   <span className="text-xs text-muted-foreground">
-                    {upstreamReady ? '暂时没取到模型列表，请确认上游容器在运行' : '配置未就绪，暂无法获取模型'}
+                    {upstreamReady ? t('settings.modelsNotFetched') : t('settings.cfgNotReady')}
                   </span>
                 )}
               </div>
@@ -1078,15 +1166,9 @@ export default function SettingsPage() {
               {models.length > 0 && (
                 <p className="mt-2 text-[10px] leading-4 text-muted-foreground/80">
                   {modelSource === 'static' ? (
-                    <>
-                      上游动态拉取失败，已回退到它<b>编译进二进制的静态表</b>——数量比实际可用模型少。
-                      可点击「重新拉取」再试，或重启上游容器后重试。
-                    </>
+                    <RichText text={t('settings.modelsStaticNote')} />
                   ) : (
-                    <>
-                      列表由上游随机选取的一个健康账号拉取，<b>取决于该账号的授权</b>——
-                      不同账号（企业 / 套餐）可见的模型数量可能不同；上游自身缓存 1 小时。
-                    </>
+                    <RichText text={t('settings.modelsNote')} />
                   )}
                 </p>
               )}
@@ -1100,8 +1182,9 @@ export default function SettingsPage() {
               <div key={g.id} className="rounded-[20px] bg-muted px-3.5 py-3">
                 <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
                   <div>
-                    <div className="text-sm font-medium">{g.title}</div>
-                    <div className="text-[11px] text-muted-foreground">{g.desc}</div>
+                    <div className="text-sm font-medium">{tp(g.title)}</div>
+                    {/* 分组说明里带加粗强调（如「只对国内版账号生效」），走 RichText 渲染 */}
+                    <RichText className="text-[11px] text-muted-foreground" text={tp(g.desc)} />
                   </div>
                   <div className="flex items-center gap-2">
                     {dirty && (
@@ -1113,7 +1196,7 @@ export default function SettingsPage() {
                         onClick={() => resetGroup(g.id)}
                       >
                         <RotateCcw className="h-3.5 w-3.5" />
-                        撤销
+                        {t('settings.revert')}
                       </Button>
                     )}
                     <Button
@@ -1124,7 +1207,7 @@ export default function SettingsPage() {
                       onClick={() => saveGroup(g.id)}
                     >
                       <Save className="h-3.5 w-3.5" />
-                      保存
+                      {t('common.save')}
                     </Button>
                   </div>
                 </div>
@@ -1140,8 +1223,11 @@ export default function SettingsPage() {
                         className="flex items-center justify-between gap-3 rounded-2xl bg-background/60 px-3 py-2"
                       >
                         <div className="min-w-0">
-                          <div className="text-xs font-medium">{f.label}</div>
-                          <div className="mt-0.5 text-[11px] leading-4 text-muted-foreground">{f.desc}</div>
+                          <div className="text-xs font-medium">{tp(f.label)}</div>
+                          <RichText
+                            className="mt-0.5 block text-[11px] leading-4 text-muted-foreground"
+                            text={tp(f.desc)}
+                          />
                           {f.kind !== 'bool' && err && (
                             <div className="mt-0.5 text-[10px] leading-3 text-destructive">{err}</div>
                           )}
@@ -1172,7 +1258,7 @@ export default function SettingsPage() {
                               }
                             />
                             {f.unit && (
-                              <span className="w-8 text-[11px] text-muted-foreground">{f.unit}</span>
+                              <span className="w-8 text-[11px] text-muted-foreground">{tp(f.unit)}</span>
                             )}
                           </div>
                         ) : f.kind === 'select' ? (
@@ -1187,7 +1273,7 @@ export default function SettingsPage() {
                             <SelectContent>
                               {f.options.map((o) => (
                                 <SelectItem key={o.value} value={o.value} className="text-xs">
-                                  {o.label}
+                                  {tp(o.label)}
                                 </SelectItem>
                               ))}
                             </SelectContent>
@@ -1196,7 +1282,7 @@ export default function SettingsPage() {
                           <Input
                             value={String(form[g.id][f.key] ?? '')}
                             disabled={!isAdmin || !upstreamReady}
-                            placeholder={f.placeholder}
+                            placeholder={f.placeholder ? tp(f.placeholder) : undefined}
                             onChange={(e) => setField(g.id, f.key, e.target.value)}
                             className={
                               'h-8 shrink-0 bg-background text-xs ' +
@@ -1232,7 +1318,7 @@ export default function SettingsPage() {
                           className="flex items-start gap-1.5 rounded-xl bg-amber-500/10 px-3 py-2 text-[11px] leading-4 text-amber-600 dark:text-amber-400"
                         >
                           <TriangleAlert className="mt-0.5 h-3 w-3 shrink-0" />
-                          <span>{f.caution}</span>
+                          <RichText text={tp(f.caution)} />
                         </div>
                       ) : null,
                     )}
@@ -1240,7 +1326,7 @@ export default function SettingsPage() {
                 )}
 
                 {!isAdmin && (
-                  <p className="mt-2 text-[11px] text-muted-foreground">只读角色无法修改设置。</p>
+                  <p className="mt-2 text-[11px] text-muted-foreground">{t('settings.readonlyNote')}</p>
                 )}
               </div>
             );
@@ -1251,21 +1337,21 @@ export default function SettingsPage() {
             <div className="mb-1 flex flex-wrap items-center justify-between gap-2">
               <div>
                 <div className="flex items-center gap-2 text-sm font-medium">
-                  Redis 持久化（Upstash）
+                  {t('settings.upstashTitle')}
                   {upstashConfigured ? (
                     <Badge variant="secondary" className="rounded-full text-emerald-600 dark:text-emerald-400">
-                      已配置
+                      {t('settings.upstashConfigured')}
                     </Badge>
                   ) : (
                     <Badge variant="secondary" className="rounded-full text-muted-foreground">
-                      未配置
+                      {t('settings.upstashNotConfigured')}
                     </Badge>
                   )}
                 </div>
                 <div className="mt-0.5 text-[11px] leading-4 text-muted-foreground">
                   {upstashConfigured
-                    ? '会话粘性与账号状态由 Upstash 共享存储，多实例部署时状态一致'
-                    : '当前为纯内存模式（noop）：状态仅存于容器内。单实例下属正常状态；扩展到多实例或希望重启后保留状态时再配置'}
+                    ? t('settings.upstashDescOn')
+                    : t('settings.upstashDescOff')}
                 </div>
               </div>
               <div className="flex items-center gap-2">
@@ -1278,7 +1364,7 @@ export default function SettingsPage() {
                     setUpstashBusy(true);
                     try {
                       const r = await settingsApi.testUpstash(upstashForm.url, upstashForm.token || undefined);
-                      (r.ok ? notify.ok : notify.err)(r.message, r.ok ? 'Upstash 可用' : undefined);
+                      (r.ok ? notify.ok : notify.err)(r.message, r.ok ? t('settings.upstashOk') : undefined);
                     } catch (e) {
                       notify.err(errText(e));
                     } finally {
@@ -1287,7 +1373,7 @@ export default function SettingsPage() {
                   }}
                 >
                   {upstashBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <PlugZap className="h-3.5 w-3.5" />}
-                  测试连接
+                  {t('settings.testConnection')}
                 </Button>
                 <Button
                   size="sm"
@@ -1296,14 +1382,14 @@ export default function SettingsPage() {
                   onClick={saveUpstash}
                 >
                   <Save className="h-3.5 w-3.5" />
-                  保存
+                  {t('common.save')}
                 </Button>
               </div>
             </div>
 
             <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div className="space-y-1.5">
-                <Label className="text-[11px] text-muted-foreground">Upstash 地址</Label>
+                <Label className="text-[11px] text-muted-foreground">{t('settings.upstashUrl')}</Label>
                 <Input
                   value={upstashForm.url}
                   disabled={!isAdmin || !upstreamReady}
@@ -1312,7 +1398,7 @@ export default function SettingsPage() {
                   className="bg-background font-mono text-xs"
                 />
                 <div className="text-[11px] text-muted-foreground">
-                  在 Upstash 控制台 <span className="font-mono">REST API</span> 一栏复制端点地址
+                  {t('settings.upstashUrlHint')}
                 </div>
               </div>
               <div className="space-y-1.5">
@@ -1322,13 +1408,17 @@ export default function SettingsPage() {
                   value={upstashForm.token}
                   disabled={!isAdmin || !upstreamReady}
                   onChange={(e) => setUpstashForm({...upstashForm, token: e.target.value})}
-                  placeholder={cfg?.upstash?.has_token ? `已保存：${cfg.upstash.token_masked}（留空则不修改）` : '粘贴 REST API Token'}
+                  placeholder={
+                    cfg?.upstash?.has_token
+                      ? t('settings.upstashTokenSaved', {masked: cfg.upstash.token_masked})
+                      : t('settings.upstashTokenPlaceholder')
+                  }
                   className="bg-background font-mono text-xs"
                 />
                 <div className="text-[11px] text-muted-foreground">
                   {cfg?.upstash?.has_token
-                    ? '出于安全考虑不回显明文；留空即保持原值不变'
-                    : '与上面的地址配套的 Token'}
+                    ? t('settings.upstashTokenHintSaved')
+                    : t('settings.upstashTokenHint')}
                 </div>
               </div>
             </div>
@@ -1336,16 +1426,16 @@ export default function SettingsPage() {
             <div className="mt-3 flex flex-wrap items-center gap-2">
               {upstashConfigured && (
                 <ConfirmDialog
-                  title="关闭 Redis 持久化？"
-                  description="将清空 Upstash 地址与 Token，上游会退回纯内存模式（noop）。保存后会自动重载上游。"
-                  confirmText="清空配置"
+                  title={t('settings.upstashClearTitle')}
+                  description={t('settings.upstashClearDesc')}
+                  confirmText={t('settings.clearConfig')}
                   destructive
                   onConfirm={async () => {
                     setUpstashBusy(true);
                     try {
                       await settingsApi.saveUpstream({upstash: {clear: true}});
                       setUpstashForm({url: '', token: ''});
-                      notify.ok('已关闭 Redis 持久化', '正在自动应用到上游');
+                      notify.ok(t('settings.upstashCleared'), t('settings.applyingShort'));
                       await load();
                     } catch (e) {
                       notify.err(errText(e));
@@ -1356,16 +1446,14 @@ export default function SettingsPage() {
                   trigger={
                     <Button size="sm" variant="ghost" className="rounded-full text-red-500" disabled={!isAdmin || upstashBusy}>
                       <Trash2 className="h-3.5 w-3.5" />
-                      清空配置
+                      {t('settings.clearConfig')}
                     </Button>
                   }
                 />
               )}
             </div>
             <div className="mt-2 text-[11px] leading-4 text-muted-foreground">
-              保存后会自动重启上游使其生效（约 0.5 秒，在途请求会正常完成）。
-              Upstash 在容器启动时连接，因此无需手动重启；
-              配置有误时上游会自动降级为 noop 并打印警告，不会导致服务不可用。
+              {t('settings.upstashFooter')}
             </div>
           </div>
 
@@ -1377,9 +1465,9 @@ export default function SettingsPage() {
               className="flex w-full items-center justify-between gap-2 text-left"
             >
               <div>
-                <div className="text-sm font-medium">高级设置</div>
+                <div className="text-sm font-medium">{t('settings.advanced')}</div>
                 <div className="text-[11px] text-muted-foreground">
-                  需要配置上面没有提到的参数时，可直接编辑原始 JSON
+                  {t('settings.advancedDesc')}
                 </div>
               </div>
               <ChevronDown
@@ -1399,7 +1487,7 @@ export default function SettingsPage() {
                       disabled={!isAdmin || busy || !upstreamReady}
                       onClick={() => saveJson('schedule', schedText)}
                     >
-                      保存
+                      {t('common.save')}
                     </Button>
                   </div>
                   <Textarea
@@ -1407,7 +1495,7 @@ export default function SettingsPage() {
                     spellCheck={false}
                     disabled={!isAdmin || !upstreamReady}
                     value={upstreamReady ? schedText : ''}
-                    placeholder={upstreamReady ? undefined : '未读取到上游配置，无法编辑'}
+                    placeholder={upstreamReady ? undefined : t('settings.cfgNotLoaded')}
                     onChange={(e) => setSchedText(e.target.value)}
                     className="bg-background font-mono text-xs"
                   />
@@ -1422,7 +1510,7 @@ export default function SettingsPage() {
                       disabled={!isAdmin || busy || !upstreamReady}
                       onClick={() => saveJson('cooldown', coolText)}
                     >
-                      保存
+                      {t('common.save')}
                     </Button>
                   </div>
                   <Textarea
@@ -1430,7 +1518,7 @@ export default function SettingsPage() {
                     spellCheck={false}
                     disabled={!isAdmin || !upstreamReady}
                     value={upstreamReady ? coolText : ''}
-                    placeholder={upstreamReady ? undefined : '未读取到上游配置，无法编辑'}
+                    placeholder={upstreamReady ? undefined : t('settings.cfgNotLoaded')}
                     onChange={(e) => setCoolText(e.target.value)}
                     className="bg-background font-mono text-xs"
                   />
@@ -1445,7 +1533,7 @@ export default function SettingsPage() {
                       disabled={!isAdmin || busy || !upstreamReady}
                       onClick={() => saveJson('features', featText)}
                     >
-                      保存
+                      {t('common.save')}
                     </Button>
                   </div>
                   <Textarea
@@ -1453,7 +1541,7 @@ export default function SettingsPage() {
                     spellCheck={false}
                     disabled={!isAdmin || !upstreamReady}
                     value={upstreamReady ? featText : ''}
-                    placeholder={upstreamReady ? undefined : '未读取到上游配置，无法编辑'}
+                    placeholder={upstreamReady ? undefined : t('settings.cfgNotLoaded')}
                     onChange={(e) => setFeatText(e.target.value)}
                     className="bg-background font-mono text-xs"
                   />
@@ -1468,7 +1556,7 @@ export default function SettingsPage() {
                       disabled={!isAdmin || busy || !upstreamReady}
                       onClick={() => saveJson('session_sticky', sessText)}
                     >
-                      保存
+                      {t('common.save')}
                     </Button>
                   </div>
                   <Textarea
@@ -1476,7 +1564,7 @@ export default function SettingsPage() {
                     spellCheck={false}
                     disabled={!isAdmin || !upstreamReady}
                     value={upstreamReady ? sessText : ''}
-                    placeholder={upstreamReady ? undefined : '未读取到上游配置，无法编辑'}
+                    placeholder={upstreamReady ? undefined : t('settings.cfgNotLoaded')}
                     onChange={(e) => setSessText(e.target.value)}
                     className="bg-background font-mono text-xs"
                   />
@@ -1491,7 +1579,7 @@ export default function SettingsPage() {
                       disabled={!isAdmin || busy || !upstreamReady}
                       onClick={() => saveJson('pool', poolText)}
                     >
-                      保存
+                      {t('common.save')}
                     </Button>
                   </div>
                   <Textarea
@@ -1499,7 +1587,7 @@ export default function SettingsPage() {
                     spellCheck={false}
                     disabled={!isAdmin || !upstreamReady}
                     value={upstreamReady ? poolText : ''}
-                    placeholder={upstreamReady ? undefined : '未读取到上游配置，无法编辑'}
+                    placeholder={upstreamReady ? undefined : t('settings.cfgNotLoaded')}
                     onChange={(e) => setPoolText(e.target.value)}
                     className="bg-background font-mono text-xs"
                   />
@@ -1520,7 +1608,7 @@ export default function SettingsPage() {
                         disabled={!isAdmin || busy || !upstreamReady}
                         onClick={() => saveJson(name, val)}
                       >
-                        保存
+                        {t('common.save')}
                       </Button>
                     </div>
                     <Textarea
@@ -1528,7 +1616,7 @@ export default function SettingsPage() {
                       spellCheck={false}
                       disabled={!isAdmin || !upstreamReady}
                       value={upstreamReady ? val : ''}
-                      placeholder={upstreamReady ? undefined : '未读取到上游配置，无法编辑'}
+                      placeholder={upstreamReady ? undefined : t('settings.cfgNotLoaded')}
                       onChange={(e) => setter(e.target.value)}
                       className="bg-background font-mono text-xs"
                     />
@@ -1542,20 +1630,19 @@ export default function SettingsPage() {
         {/* ═══ 模型映射 ═══ */}
         <TabsContent value="models" className="mt-4 space-y-4">
           <div className="rounded-[20px] bg-muted p-4">
-            <div className="mb-1 text-sm font-medium">新增模型别名</div>
+            <div className="mb-1 text-sm font-medium">{t('settings.mapNewAlias')}</div>
             <div className="mb-3 text-[11px] text-muted-foreground">
-              让下游用一个自己熟悉的名字调用某个模型。例如把 <code className="font-mono">gpt-4o-mini</code> 指向{' '}
-              <code className="font-mono">glm-5.2</code>。
+              <RichText text={t('settings.mapNewAliasDesc')} />
             </div>
             <div className="grid grid-cols-1 items-end gap-3 sm:grid-cols-4">
               <div className="space-y-1.5">
-                <Label className="text-[11px] text-muted-foreground">下游使用的名字</Label>
+                <Label className="text-[11px] text-muted-foreground">{t('settings.mapAlias')}</Label>
                 <Input value={mapAlias} onChange={(e) => setMapAlias(e.target.value)} placeholder="gpt-4o-mini" className="bg-background" disabled={!isAdmin} />
               </div>
               <div className="space-y-1.5">
-                <Label className="text-[11px] text-muted-foreground">实际调用模型</Label>
+                <Label className="text-[11px] text-muted-foreground">{t('settings.mapTarget')}</Label>
                 <Select value={mapTarget} onValueChange={setMapTarget} disabled={!isAdmin}>
-                  <SelectTrigger className="bg-background"><SelectValue placeholder="选择模型" /></SelectTrigger>
+                  <SelectTrigger className="bg-background"><SelectValue placeholder={t('chat.selectModel')} /></SelectTrigger>
                   <SelectContent>
                     {models.map((m) => (
                       <SelectItem key={m.id} value={m.id}>{m.id}</SelectItem>
@@ -1574,7 +1661,7 @@ export default function SettingsPage() {
                   }}
                 >
                   <Plus />
-                  添加映射
+                  {t('settings.mapAdd')}
                 </Button>
               </div>
             </div>
@@ -1584,9 +1671,9 @@ export default function SettingsPage() {
             <Table>
               <TableHeader>
                 <TableRow className="border-b border-border/60 hover:bg-transparent">
-                  <TableHead className="pl-4 text-[11px] text-muted-foreground">下游使用的名字</TableHead>
-                  <TableHead className="text-[11px] text-muted-foreground">实际调用模型</TableHead>
-                  {isAdmin && <TableHead className="pr-4 text-right text-[11px] text-muted-foreground">操作</TableHead>}
+                  <TableHead className="pl-4 text-[11px] text-muted-foreground">{t('settings.mapAlias')}</TableHead>
+                  <TableHead className="text-[11px] text-muted-foreground">{t('settings.mapTarget')}</TableHead>
+                  {isAdmin && <TableHead className="pr-4 text-right text-[11px] text-muted-foreground">{t('accounts.colActions')}</TableHead>}
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -1616,7 +1703,7 @@ export default function SettingsPage() {
             </Table>
             {!Object.keys(modelMap).length && (
               <div className="py-10 text-center text-xs text-muted-foreground">
-                暂无映射，下游可直接使用上方「可用模型」中的名字
+                {t('settings.mapEmpty')}
               </div>
             )}
           </div>
@@ -1626,26 +1713,26 @@ export default function SettingsPage() {
         <TabsContent value="users" className="mt-4 space-y-4">
           {isAdmin && (
             <div className="rounded-[20px] bg-muted p-4">
-              <div className="mb-1 text-sm font-medium">新增登录用户</div>
+              <div className="mb-1 text-sm font-medium">{t('settings.usersNew')}</div>
               <div className="mb-3 text-[11px] text-muted-foreground">
-                管理员可以增删账号与改设置；只读用户只能查看，适合给同事看状态用。
+                {t('settings.usersNewDesc')}
               </div>
               <div className="grid grid-cols-1 items-end gap-3 sm:grid-cols-4">
                 <div className="space-y-1.5">
-                  <Label className="text-[11px] text-muted-foreground">用户名</Label>
+                  <Label className="text-[11px] text-muted-foreground">{t('login.username')}</Label>
                   <Input value={newUser.username} onChange={(e) => setNewUser({...newUser, username: e.target.value})} className="bg-background" />
                 </div>
                 <div className="space-y-1.5">
-                  <Label className="text-[11px] text-muted-foreground">密码</Label>
+                  <Label className="text-[11px] text-muted-foreground">{t('login.password')}</Label>
                   <Input type="password" value={newUser.password} onChange={(e) => setNewUser({...newUser, password: e.target.value})} className="bg-background" />
                 </div>
                 <div className="space-y-1.5">
-                  <Label className="text-[11px] text-muted-foreground">权限</Label>
+                  <Label className="text-[11px] text-muted-foreground">{t('settings.usersRole')}</Label>
                   <Select value={newUser.role} onValueChange={(v) => setNewUser({...newUser, role: v})}>
                     <SelectTrigger className="bg-background"><SelectValue /></SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="admin">管理员（可修改）</SelectItem>
-                      <SelectItem value="viewer">只读用户（仅查看）</SelectItem>
+                      <SelectItem value="admin">{t('settings.roleAdmin')}</SelectItem>
+                      <SelectItem value="viewer">{t('settings.roleViewer')}</SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
@@ -1654,13 +1741,13 @@ export default function SettingsPage() {
                   disabled={busy}
                   onClick={async () => {
                     if (!newUser.username.trim() || !newUser.password) {
-                      notify.err('请填写用户名与密码');
+                      notify.err(t('settings.usersRequired'));
                       return;
                     }
                     setBusy(true);
                     try {
                       await settingsApi.addUser(newUser);
-                      notify.ok('用户已创建');
+                      notify.ok(t('settings.usersCreated'));
                       setNewUser({username: '', password: '', role: 'viewer'});
                       load();
                     } catch (e) {
@@ -1671,7 +1758,7 @@ export default function SettingsPage() {
                   }}
                 >
                   <Plus />
-                  创建
+                  {t('keys.create')}
                 </Button>
               </div>
             </div>
@@ -1681,9 +1768,9 @@ export default function SettingsPage() {
             <Table>
               <TableHeader>
                 <TableRow className="border-b border-border/60 hover:bg-transparent">
-                  <TableHead className="pl-4 text-[11px] text-muted-foreground">用户名</TableHead>
-                  <TableHead className="text-[11px] text-muted-foreground">权限</TableHead>
-                  {isAdmin && <TableHead className="pr-4 text-right text-[11px] text-muted-foreground">操作</TableHead>}
+                  <TableHead className="pl-4 text-[11px] text-muted-foreground">{t('login.username')}</TableHead>
+                  <TableHead className="text-[11px] text-muted-foreground">{t('settings.usersRole')}</TableHead>
+                  {isAdmin && <TableHead className="pr-4 text-right text-[11px] text-muted-foreground">{t('accounts.colActions')}</TableHead>}
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -1692,7 +1779,7 @@ export default function SettingsPage() {
                     <TableCell className="pl-4 text-sm font-medium">{u.username}</TableCell>
                     <TableCell>
                       <Badge variant="secondary" className="rounded-full">
-                        {u.role === 'admin' ? '管理员' : '只读'}
+                        {u.role === 'admin' ? t('profile.roleAdmin') : t('profile.roleViewer')}
                       </Badge>
                     </TableCell>
                     {isAdmin && (
@@ -1704,7 +1791,7 @@ export default function SettingsPage() {
                             className="h-7 rounded-full text-xs"
                             onClick={async () => {
                               const pwd = window.prompt(
-                                `为「${u.username}」设置新密码（至少 8 位）：`);
+                                t('settings.resetPasswordPrompt', {name: u.username}));
                               if (!pwd) return;
                               try {
                                 const r = await settingsApi.updateUser(u.username, {password: pwd});
@@ -1712,29 +1799,29 @@ export default function SettingsPage() {
                                 // 当前登录态也随之失效——必须明确告知要去重新登录，
                                 // 否则用户会以为「界面卡住了」（下次请求就是 401）。
                                 if (r?.relogin_required) {
-                                  notify.ok('密码已更新', '当前登录状态已失效，请用新密码重新登录');
+                                  notify.ok(t('settings.passwordUpdated'), t('settings.passwordRelogin'));
                                   window.setTimeout(() => {
                                     window.location.href = '/login';
                                   }, 1800);
                                   return;
                                 }
-                                notify.ok('密码已更新', '该用户的其他登录状态已全部失效');
+                                notify.ok(t('settings.passwordUpdated'), t('settings.passwordOthersRevoked'));
                               } catch (e) {
                                 notify.err(errText(e));
                               }
                             }}
                           >
-                            重置密码
+                            {t('settings.resetPassword')}
                           </Button>
                           <ConfirmDialog
-                            title={`删除用户「${u.username}」？`}
-                            description="删除后该用户将无法登录管理端。"
-                            confirmText="删除"
+                            title={t('settings.deleteUserTitle', {name: u.username})}
+                            description={t('settings.deleteUserDesc')}
+                            confirmText={t('keys.delete')}
                             destructive
                             onConfirm={async () => {
                               try {
                                 await settingsApi.removeUser(u.username);
-                                notify.ok('已删除');
+                                notify.ok(t('keys.deleted'));
                                 load();
                               } catch (e) {
                                 notify.err(errText(e));
@@ -1756,8 +1843,8 @@ export default function SettingsPage() {
             {!users.length && (
               <EmptyState
                 icon={Users}
-                title="暂无管理用户"
-                description="至少保留一个管理员账号"
+                title={t('settings.usersEmpty')}
+                description={t('settings.usersEmptyDesc')}
                 className="flex flex-col items-center justify-center py-12 text-center"
               />
             )}
@@ -1782,15 +1869,13 @@ export default function SettingsPage() {
               WorkBuddy Manager
             </div>
             <p>
-              本项目为 workbuddy2api（腾讯 CodeBuddy → OpenAI 兼容代理）提供网页管理界面与对外接口网关。
-              账号轮询、并发与熔断由 workbuddy2api 负责；本管理端负责账号纳管、密钥分发、IP 管控、请求日志与用量统计。
+              {t('settings.aboutDesc')}
             </p>
             <p className="mt-3">
-              界面风格参考 linux-do/cdk（MIT），特此致谢。
+              {t('settings.aboutCredits')}
             </p>
             <p className="mt-3">
-              下游接入：Base URL 填 <span className="font-mono">https://你的域名/v1</span>，密钥用「API 密钥」页生成的{' '}
-              <span className="font-mono">wbk_...</span>。
+              <RichText text={t('settings.aboutUsage')} />
             </p>
           </div>
         </TabsContent>

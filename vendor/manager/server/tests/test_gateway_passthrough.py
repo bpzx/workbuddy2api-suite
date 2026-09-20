@@ -106,15 +106,36 @@ class GatewayPassthroughTest(unittest.TestCase):
                          f'转发热路径出现了非透传的 yield：{yields}')
 
     def test_no_tool_calls_handling_anywhere(self) -> None:
-        """全仓库不碰 tool_calls —— 上游的修复通过透传自动生效。
+        """转发热路径不碰 tool_calls —— 上游的修复通过透传自动生效。
 
         若将来需要在此处加逻辑（例如为了兼容某个客户端），请先确认
         **上游是否已经修过同一个问题**：重复修一遍往往引入新的不一致。
+
+        两个例外都是**协议转换层**（不是转发热路径）：
+          · **Anthropic 兼容层**（`routers/anthropic.py`）：它**必须**处理
+            tool_calls，因为那正是协议转换本身——OpenAI 把工具参数作为
+            **分片字符串**下发（`{"loc` + `ation":…}`），而 Anthropic 的客户端要的是
+            `input_json_delta` 事件、且参数以对象形式呈现。
+          · **Responses 兼容层**（`routers/responses.py`）：同理——Chat
+            Completions 的 `tool_calls[].index` 要重建成 Responses 的
+            `function_call` 输出项与 `function_call_arguments.delta` 事件。
+
+        这与「替上游兜底」是两回事：它们不改动转发给上游的内容，只改变回给
+        客户端的表达形式；「转发热路径必须原样透传」这条约束由上面几个用例
+        独立守着（`gateway.py` 里不得出现非透传的 yield）。
+
+        新增此类转换层时**显式**登记在此，而不是放宽匹配——豁免名单越长越该
+        有人复核，静默放行会让这条约束慢慢失效。
         """
+        # 例外：协议转换层（不是转发热路径）
+        allow = {'routers/anthropic.py', 'routers/responses.py'}
         root = Path(__file__).resolve().parents[2] / 'server'
         hits = []
         for f in root.rglob('*.py'):
             if 'tests' in str(f):
+                continue
+            rel = str(f.relative_to(root)).replace('\\', '/')
+            if rel in allow:
                 continue
             if 'tool_calls' in f.read_text(encoding='utf-8'):
                 hits.append(str(f.relative_to(root)))

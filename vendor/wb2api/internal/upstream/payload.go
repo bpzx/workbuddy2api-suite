@@ -10,6 +10,9 @@ import (
 )
 
 // PrepareBodyOpt 单 pass 改写；sanitize=false 时行为完全还原（仅强制 stream + 归一化 tool_choice）。
+// DeptestOnly: 仅测试引用（upstream 各 _test + server 稳定性回归）；生产经
+// prepareBody 走 PrepareBodyOptWithEffortsAndDefault。跨包测试引用，
+// 迁 export_test.go 不可行。保留作三层封装的最底层语义锚点。
 func PrepareBodyOpt(src []byte, sanitize bool) []byte {
 	return PrepareBodyOptWithEffortsAndDefault(src, sanitize, nil, nil)
 }
@@ -17,6 +20,10 @@ func PrepareBodyOpt(src []byte, sanitize bool) []byte {
 // PrepareBodyOptWithEfforts 在 PrepareBodyOpt 基础上按模型 supportedEfforts 降级 reasoning_effort：
 // 仅当请求显式携带且模型不支持该档位时，改为 ≤请求档位的最高支持档；支持档全部高于请求档时取最低档；
 // 未知模型/未知档位/未携带该字段一律透传。efforts 为 nil 表示未知（不降级）。
+//
+// DeptestOnly: 仅测试引用（upstream stability/thinking/cache_key/sse 族 +
+// server 稳定性回归）；生产经 prepareBody 走 PrepareBodyOptWithEffortsAndDefault。
+// 跨包测试引用，迁 export_test.go 不可行。保留作无默认档的降级管线锚点。
 //
 // 向后兼容封装：不传 defaultEfforts（无模型声明默认档），thinking.go 回退硬编码 high。
 func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]string) []byte {
@@ -34,6 +41,18 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 		return src
 	}
 	obj["stream"] = true
+	// max_completion_tokens → max_tokens 翻译（吸收 PR #116，Closes #117）：
+	// OpenAI 规范里 max_tokens 已 deprecated、max_completion_tokens 是新字段
+	// （o-series 起引入）；DeepSeek Harness 等新客户端只发别名。WorkBuddy 上游
+	//（CN /v2 与 global /console 同源，见 context_catalog「两区是同一套 API 的两次
+	// 部署」实测结论）只认 max_tokens——别名透传会被上游忽略后回落默认输出上限
+	//（实测 32000），长流任务被截。
+	//   - 显式 max_tokens 存在 → 原样保留（显式优先，别名只删不译）；
+	//   - 别名值为 0/null/负数/非数值 → 不翻译（0/null 语义是「未设置」，走上游
+	//     默认；负数是非法值，翻译等于把垃圾搬进 max_tokens）；
+	//   - 翻译后删别名字段（上游 Go struct 未知字段宽松，但留着徒增 body 体积与
+	//     排障噪音）。
+	translateMaxCompletionTokens(obj)
 	// stream_options 仅当 body 未显式带时补 {include_usage: true}（D7）：
 	// 官方 CLI 流式必发该字段，上游据此在末帧返回 usage 用量；显式带则不覆盖。
 	if _, has := obj["stream_options"]; !has {
@@ -41,13 +60,18 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	}
 	normalizeToolChoice(obj)
 	normalizeRoles(obj)
-	// 孤儿 tool_call↔tool 配对清理（见 tool_pairing.go）：所有模型一律执行（独立于
+	// tool 配对两步（见 tool_pairing.go）：先重排再清理。所有模型一律执行（独立于
 	// deepseek-only 的 sanitize 开关）。这是「让请求通过」的安全网——不完整配对的
-	// tool_calls/tool 结果会让上游对之后每条消息都返 400，必须先行剔除。
+	// tool_calls/tool 结果会让上游对之后每条消息都返 400，必须先行剔除；
+	// 插在结果中间的非 tool 消息（Codex image_resize_notice）同样判配对断裂，
+	// 先 repack 挪后，再 cleanup 删孤儿，两侧同口径。
 	if msgs, ok := obj["messages"].([]any); ok {
-		if cleaned, ch := cleanupOrphanToolCalls(msgs); ch {
-			obj["messages"] = cleaned
-		}
+		msgs, _ = repackToolResultBlocks(msgs)
+		msgs, _ = cleanupOrphanToolCalls(msgs)
+		// 无改动时两步都返回原 slice，这里回写等于零操作；任一步重排/删除
+		// （哪怕后续步骤零改动）也必须落到 obj——不能只在「最后一步改动」时回写，
+		// 否则 repack 单独生效的结果会被原 slice 覆盖丢失。
+		obj["messages"] = msgs
 	}
 	// DeepSeek 思维链开关（见 thinking.go）：注入 thinking.type=enabled + 缺档补默认档。
 	// 先于 normalizeReasoningEffort 执行：补入的默认档也要走既有降级管线，
@@ -68,6 +92,40 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 		return src
 	}
 	return out
+}
+
+// translateMaxCompletionTokens 把 OpenAI 别名 max_completion_tokens 翻译为上游
+// 认的 max_tokens（吸收 PR #116）。调用点在 PrepareBodyOptWithEffortsAndDefault
+// 管线 stream 强制之后（同一预处理管线挂载，任务书 prompt-too-long §3）。
+// 规则：显式 max_tokens 优先（别名只删）；别名非正数值（0/null/负数）不翻译；
+// 非数值别名（字符串等畸形）不翻译（原样透传由上游报 11101 参数错）。
+// 两域同口径：CN /v2 与 global /console 是同一套 API（见 context_catalog 文件头
+// 实测结论），翻译不分 realm——global 域上游同样只认 max_tokens。
+func translateMaxCompletionTokens(obj map[string]any) {
+	alias, has := obj["max_completion_tokens"]
+	delete(obj, "max_completion_tokens") // 无论翻译与否，别名一律删（见上方注释）
+	if !has {
+		return
+	}
+	if _, explicit := obj["max_tokens"]; explicit {
+		return // 显式 max_tokens 优先：别名只删不译
+	}
+	// json.Unmarshal 数字 → float64（整数去整后回写，避免 1.28e5 科学计数法/小数尾
+	// 巴进上游 body）；其他数值类型防御性兼容（int 家族——手构造 map 的调用方）。
+	switch v := alias.(type) {
+	case float64:
+		if v > 0 && v == float64(int64(v)) {
+			obj["max_tokens"] = int64(v)
+		}
+	case int64:
+		if v > 0 {
+			obj["max_tokens"] = v
+		}
+	case int:
+		if v > 0 {
+			obj["max_tokens"] = int64(v)
+		}
+	}
 }
 
 // effortRank 档位从低到高。

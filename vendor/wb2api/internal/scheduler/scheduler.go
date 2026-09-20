@@ -62,6 +62,12 @@ type Scheduler struct {
 	mu         sync.Mutex
 	adoptTried map[string]string
 
+	// rewardClaimed 连登奖励按自然日（CST）领取标记：uid → 当日日期。已领/已尝试的账号
+	// 当日不再重打 redeem（领取类写操作按天幂等，避免对上游重复写请求）；自然日 00:00
+	// CST 重置（上游增长体系按 CST 自然日刷新，见 travelDay/cstZone）。进程重启即清零
+	// （服务端幂等兜底：重启后当日重复 redeem 会拿 409 正常态，无副作用）。
+	rewardClaimed map[string]string
+
 	// checkinMu 串行化签到：定时入口与手动触发互斥，避免同一时刻重复打上游签到接口。
 	checkinMu sync.Mutex
 }
@@ -90,7 +96,7 @@ func New(cfg Config) *Scheduler {
 	if cfg.ActivityReportCount <= 0 {
 		cfg.ActivityReportCount = 1
 	}
-	return &Scheduler{cfg: cfg, adoptTried: make(map[string]string)}
+	return &Scheduler{cfg: cfg, adoptTried: make(map[string]string), rewardClaimed: make(map[string]string)}
 }
 
 // checkinRefreshSkew 签到前判定"token 是否临近过期"的时间窗口（10 分钟）。
@@ -194,6 +200,29 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	return earliest, kinds
 }
 
+// wakeupGraceDelay 迟到唤醒补跑的派发前网络宽限：Windows Modern Standby exit 后
+// 网络栈/DNS 1-2s 才恢复（issue #152 实测 dial tcp lookup no such host 与
+// Kernel-Power 507 standby exit ≤1s 重合），宽限 5s 覆盖 90%+ 唤醒场景。
+// 只对迟到补跑生效（准点触发零延迟），零配置（分析报告裁定全套配置不成比例）。
+// 测试可缩短（与 travelAccountDelay「测试可置 0」同口径）。
+var wakeupGraceDelay = 5 * time.Second
+
+// wakeupLateThreshold 迟到判定阈值：now 晚于槽位计划时刻超过 1s 才算迟到补跑。
+// 毫秒级抖动（timer 正常触发的偏移量级）不算，避免准点触发被误宽限。
+const wakeupLateThreshold = 1 * time.Second
+
+// awaitWakeupGrace 迟到唤醒补跑派发前的网络宽限：槽位时刻已过点超过阈值
+// （机器刚从睡眠唤醒）时先等满 wakeupGraceDelay 让网络栈/DNS 就绪再派发。
+// 准点/阈值内抖动零延迟直接放行。ctx 取消立即返回 false（优雅停机不等宽限睡满，
+// 本批放弃，下轮 nextWake 照旧从"现在"起算）。返回是否继续派发。
+func awaitWakeupGrace(ctx context.Context, planned time.Time) bool {
+	if late := time.Since(planned); late <= wakeupLateThreshold {
+		return ctx.Err() == nil // 准点触发：零延迟放行
+	}
+	log.Printf("wakeup grace %s: late catch-up for slot %s", wakeupGraceDelay, planned.Format("15:04"))
+	return sleepCtx(ctx, wakeupGraceDelay)
+}
+
 // Run 主循环，阻塞直到 ctx 取消。
 func (s *Scheduler) Run(ctx context.Context) {
 	for {
@@ -210,6 +239,12 @@ func (s *Scheduler) Run(ctx context.Context) {
 			return
 		case <-timer.C:
 			// 到点任务在排程时确定（不依赖唤醒时刻的小时数），迟到唤醒也不会漏跑。
+			// 迟到唤醒（睡眠跨过槽位时刻，timer 在唤醒瞬间才到期）先等网络宽限：
+			// 唤醒瞬间 DNS 未就绪，零宽限派发等于把唯一一次补跑机会打在注定失败
+			// 的窗口里（issue #152）；准点触发零延迟不受影响。
+			if !awaitWakeupGrace(ctx, next) {
+				return // ctx 取消：放弃本批，优雅退出
+			}
 			// 唤醒时全部并行派发：每类一个 goroutine，慢任务族（如活跃上报
 			// 54 号 × 5 条 ≈ 7-8 分钟睡眠）不再阻塞同槽其他任务族；返回前
 			// 等全部任务收尾（下一轮 nextWake 照旧从"现在"起算，多轮重叠
@@ -284,7 +319,7 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshToken == "" {
+		if a == nil || a.RefreshTokenValue() == "" {
 			oc.Status, oc.Detail = CheckinSkipped, "no credentials"
 			skipN++
 			out = append(out, oc)
@@ -302,11 +337,11 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 		// 停机跨过 token 有效期（关机过夜/容器长期停跑）时先补一次刷新，否则签到必然 401 白跑。
 		if a.NeedsRefresh(checkinRefreshSkew) {
 			if err := s.cfg.Upstream.RefreshToken(a); err != nil {
-				log.Printf("checkin %s refresh: %v", logfmt.UID8(st.UID), err)
+				log.Printf("checkin %s refresh: %v", logfmt.Label(st.UID, st.Nickname), err)
 				var ue *upstream.Error
 				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
 					if s.cfg.Pool.NoteSessionDead(st.UID) {
-						log.Printf("WARN: checkin %s: 连续 %d 次 12153 session dead — 禁用", logfmt.UID8(st.UID), pool.SessionDeadThreshold())
+						log.Printf("WARN: checkin %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
 					}
 				}
 				// 刷新只是"提前补票"：token 若仍有效，继续照常签到（否则刷新接口抖动
@@ -321,7 +356,7 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 				a.BackfillRealm() // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
 				if err := a.SaveAtomic(); err != nil {
 					// 刷新成功但落盘失败：重启会用旧 token，必须暴露。
-					log.Printf("checkin %s save: %v", logfmt.UID8(st.UID), err)
+					log.Printf("checkin %s save: %v", logfmt.Label(st.UID, st.Nickname), err)
 				}
 			}
 		}
@@ -334,7 +369,7 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 			} else {
 				oc.Status = CheckinFail
 				oc.Detail = err.Error()
-				log.Printf("checkin %s: %v", logfmt.UID8(st.UID), err)
+				log.Printf("checkin %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			}
 		} else {
 			oc.Status = CheckinOK
@@ -343,7 +378,7 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 		// ExpiringSoonWindow<=0 时退化为纯总量（与引入前一致）。
 		remain, buckets, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
 		if err != nil {
-			log.Printf("user-resource %s: %v", logfmt.UID8(st.UID), err)
+			log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			oc.Status = CheckinFail
 			oc.Detail = joinDetail(oc.Detail, "resource: "+err.Error())
 			failN++
@@ -408,7 +443,7 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.AccessToken == "" {
+		if a == nil || a.AccessTokenValue() == "" {
 			continue
 		}
 		// global 账号同样上报（PR #45 实测国际版 /v2/report 在 workbuddy.ai 上 code=0 OK，
@@ -426,10 +461,10 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		for i := 1; i <= count; i++ {
 			rid := fmt.Sprintf("%s-r%d", cid, i)
 			if err := s.cfg.Upstream.ReportChatActivity(a, cid, rid); err != nil {
-				log.Printf("activity %s: report %d/%d: %v", logfmt.UID8(a.UID), i, count, err)
+				log.Printf("activity %s: report %d/%d: %v", logfmt.Label(a.UID, a.Nickname), i, count, err)
 				break // 本号上报失败：不再续发，streak 自检无意义
 			}
-			log.Printf("activity %s: report %d/%d ok", logfmt.UID8(a.UID), i, count)
+			log.Printf("activity %s: report %d/%d ok", logfmt.Label(a.UID, a.Nickname), i, count)
 			ok++
 			if i < count {
 				// 账号内 5 条之间间隔，避免秒发风控；取消时立即放弃本号剩余条数。
@@ -443,6 +478,7 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		}
 		s.checkActivityStreak(a) // N 条全发满 → 回读 streak 自检（只留结论行）
 		s.travelAdoptForce(a)    // 无猫账号对话量刚补满 → 立即重试领养（豁免防抖）
+		s.claimGrowthRewards(a)  // 连登奖励 + 抽奖：点亮连登后按天领取（finally 语义：失败不拖累上报）
 	}
 }
 
@@ -456,15 +492,182 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 	days, err := s.cfg.Upstream.GrowthStreak(a)
 	if err != nil {
-		log.Printf("WARN: activity %s: streak check failed (report OK): %v", logfmt.UID8(a.UID), err)
+		log.Printf("WARN: activity %s: streak check failed (report OK): %v", logfmt.Label(a.UID, a.Nickname), err)
 		return true
 	}
 	if days == 0 {
-		log.Printf("WARN: activity %s: report OK but streak.days=0 (silent drop?)", logfmt.UID8(a.UID))
+		log.Printf("WARN: activity %s: report OK but streak.days=0 (silent drop?)", logfmt.Label(a.UID, a.Nickname))
 		return true
 	}
-	log.Printf("activity %s: streak days=%d", logfmt.UID8(a.UID), days)
+	log.Printf("activity %s: streak days=%d", logfmt.Label(a.UID, a.Nickname), days)
 	return false
+}
+
+// claimGrowthRewards 领取连登奖励（里程碑兑换）+ 执行连登抽奖。
+// 在 runActivity 上报成功 + streak 自检之后调用：连登达标（days>=某档）才能领奖，
+// 领奖送的 chances 才是抽奖次数来源，故先领奖后抽奖。
+//
+// 全链（panel 连登管家吸收版）：礼包/补偿领取 → 读 reward-state → 补签保连登
+// （补签成功重读 state 吃恢复后的天数）→ 挑档 redeem → chances → draw。
+//
+// 幂等/风控语义（与现有 travel/travel 同口径：单号失败只该号 WARN，不影响其他账号）：
+//   - 按天幂等：每日每号最多领一轮（rewardClaimedToday 闸；自然日 CST 重置，进程重启清零——
+//     重启后当日重复 redeem 由上游 409 duplicate 正常态兜底，不刷 WARN）。
+//   - 服务端正常态识别为静默跳过：redeem 409 duplicate/403 天数不足；lottery 400 无次数/未开启——
+//     这些不是失败，不刷 WARN（见 upstream.IsRedeemAlreadyClaimed 等）。
+//   - 领奖只领「本次新达标」的档位：状态非 claimed 且 days>=档位天数。跨档连领（14d 未领而
+//     days 已到 28）是官方正常态（spa 按 byTier 逐档可兑），但每日一轮限一档，避免同日多写。
+//   - 礼包/补偿是「有则领」的幂等写，业务错误静默；补签只在「昨日漏签且有卡」时触发，
+//     无卡/无漏签不写。
+//
+// 日志每号一行可 grep：`activity %s: redeem tier=%s ...` / `activity %s: lottery ...`。
+func (s *Scheduler) claimGrowthRewards(a *auth.Auth) {
+	if a == nil || a.AccessTokenValue() == "" {
+		return
+	}
+	// global 门控：连登奖励/抽奖链只服务 CN。国际版 /activity/growth/* 端点虽同构存在
+	// （/tmp/analysis-global-credit.md §1.1：lottery/streak/redeem 在国际版上线），但真实
+	// global 新账号 GET /activity/growth/streak 返回 500（实测 sliverkiss）——链上第一步就
+	// 拿不到 days，无法挑档；且 streak 500 会每趟刷 WARN 污染日志。结论：证据不足，跳过
+	// global（不发起任何领取类调用）。CN 账号无此问题（CN streak 200 days=N）。
+	if a.IsGlobal() {
+		return
+	}
+	if s.rewardClaimedToday(a.UID) {
+		return // 当日已领过一轮，跳过（按天幂等）
+	}
+	// 0. 礼包/补偿领取（panel 连登管家口径）：每号一次 / 有则领的幂等写，
+	// 业务错误静默跳过（不刷 WARN），先于 redeem——到账积分不依赖连登状态。
+	s.claimGrowthBonus(a)
+	state, err := s.cfg.Upstream.GrowthRewardState(a)
+	if err != nil {
+		log.Printf("WARN: activity %s: reward-state: %v", logfmt.Label(a.UID, a.Nickname), err)
+		return
+	}
+	// 0.5 补签保连登（panel makeupYesterday 口径）：昨日漏签（heatmap score==0）且
+	// 有补签卡 → 补昨日。放在 reward-state 之后：若补签把 streak 恢复到新档位，
+	// 重读 state 让本日 redeem 直接吃到恢复后的天数（补签是保 7d/14d/28d 里程碑的关键）。
+	if s.makeupYesterday(a) {
+		if st2, err2 := s.cfg.Upstream.GrowthRewardState(a); err2 == nil {
+			state = st2 // 补签成功 → 用恢复后的天数挑档
+		}
+	}
+	days := state.Days()
+	tier := growthEligibleTier(days, &state.Redemption)
+	if tier == "" {
+		// 无新达标档位：不动写接口（不刷 WARN，这是正常态——很多天没到 7d）。
+		return
+	}
+	res, err := s.cfg.Upstream.GrowthRedeem(a, tier, "")
+	switch {
+	case err == nil:
+		log.Printf("activity %s: redeem tier=%s ok (+%d credit, +%d energy, +%d chances)",
+			logfmt.Label(a.UID, a.Nickname), tier, res.CreditGranted, res.EnergyGranted, res.ChancesGranted)
+	case upstream.IsRedeemAlreadyClaimed(err) || upstream.IsRedeemNotEnoughDays(err):
+		log.Printf("activity %s: redeem tier=%s skip (already claimed or days not enough)", logfmt.Label(a.UID, a.Nickname), tier)
+	default:
+		log.Printf("activity %s: redeem tier=%s: %v", logfmt.Label(a.UID, a.Nickname), tier, err)
+	}
+	// 标记当日已处理（无论 redeem 是否成功都记一次：领取类各状态当日不再重试，
+	// 避免对上游重复写；成功→无需再领，失败→当日不轰炸，次日自然日重置/上游幂等兜底）。
+	s.markRewardClaimed(a.UID)
+	s.claimGrowthLottery(a)
+}
+
+// growthEligibleTier 按当前连登天数挑选「尚未领取且达标」的最高档位。
+// 返回 "" 表示无可领档（未达标或全部已领），调用方据此跳过 redeem（正常态）。
+func growthEligibleTier(days int, rs *upstream.GrowthRedemptionStatus) string {
+	if rs == nil {
+		return ""
+	}
+	// 档位按 days 升序，从高到低挑最高的已达标未领档（一次领一份，每日一轮）。
+	for i := len(rs.Tiers) - 1; i >= 0; i-- {
+		sp := rs.Tiers[i]
+		if days >= sp.Days && !rs.Claimed(sp.Tier) {
+			return sp.Tier
+		}
+	}
+	return ""
+}
+
+// claimGrowthBonus 新手礼包 + 活动补偿领取（panel 连登管家口径）。
+// 两者都是幂等写：礼包每号一次（已领业务错误静默）、补偿有则领（无则业务错误静默）。
+// 只在成功到账时打日志（每号一生一次的事件，不值得每日刷行）；失败静默——
+// 业务错误是常态（绝大多数号早已领过），无法与真错误可靠区分，不刷 WARN。
+func (s *Scheduler) claimGrowthBonus(a *auth.Auth) {
+	if credit, err := s.cfg.Upstream.ClaimGift(a); err == nil && credit > 0 {
+		log.Printf("activity %s: gift ok (+%d credit)", logfmt.Label(a.UID, a.Nickname), credit)
+	}
+	if credit, err := s.cfg.Upstream.ClaimCompensation(a); err == nil && credit > 0 {
+		log.Printf("activity %s: compensation ok (+%d credit)", logfmt.Label(a.UID, a.Nickname), credit)
+	}
+}
+
+// makeupYesterday 昨日漏签且有补签卡时自动补签（保住连登连续天数，panel 口径）。
+// 连续天数一断就要重攒 7 天，一张卡代价远小——有漏签 + 有卡即补。
+// 判据链：heatmap 昨日格 score==0（漏签）→ streak.makeup_cards.balance>0（有卡）
+// → POST makeup-cards/use {"target_date":昨日}。
+// 无卡 / 无漏签 / 无该日格 / 查询失败均静默返回 false（不影响主流程）；
+// 补签成功打一行日志并返回 true（调用方重读 streak 天数挑档）。
+func (s *Scheduler) makeupYesterday(a *auth.Auth) bool {
+	cells, err := s.cfg.Upstream.GrowthHeatmap(a)
+	if err != nil {
+		return false // 只读判据失败：静默（每日重试，无写风险）
+	}
+	yesterday := upstream.GrowthYesterdayDate(time.Now())
+	score, ok := upstream.HeatmapDayScore(cells, yesterday)
+	if !ok || score != 0 {
+		return false // 昨日有分或无判据：无需补签
+	}
+	// 有漏签 → 查补签卡余额（streak 端点同一响应体）。
+	st, err := s.cfg.Upstream.GrowthStreakWithCards(a)
+	if err != nil || st.MakeupCards.Balance <= 0 {
+		return false // 无卡或查询失败：静默（次日再判）
+	}
+	if err := s.cfg.Upstream.UseMakeupCard(a, yesterday); err != nil {
+		log.Printf("activity %s: makeup %s: %v", logfmt.Label(a.UID, a.Nickname), yesterday, err)
+		return false
+	}
+	log.Printf("activity %s: makeup ok %s (+streak kept)", logfmt.Label(a.UID, a.Nickname), yesterday)
+	return true
+}
+
+// claimGrowthLottery 消耗连登奖励赠与的抽奖次数。仅抽 balance>0 的次数；无次数跳过
+// （400 insufficient 正常态静默）；抽奖未开启（400 lottery disabled）静默。
+// client_token 每次 draw 必须新键（security-relevant，见 upstream.GrowthLotteryDraw）。
+func (s *Scheduler) claimGrowthLottery(a *auth.Auth) {
+	chances, err := s.cfg.Upstream.GrowthLotteryChances(a)
+	if err != nil {
+		log.Printf("WARN: activity %s: lottery-chances: %v", logfmt.Label(a.UID, a.Nickname), err)
+		return
+	}
+	if chances <= 0 {
+		log.Printf("activity %s: lottery skip (no chances)", logfmt.Label(a.UID, a.Nickname))
+		return
+	}
+	res, err := s.cfg.Upstream.GrowthLotteryDraw(a, "") // 每次自动新 client_token
+	switch {
+	case err == nil:
+		log.Printf("activity %s: lottery drawn prize=%s (%s)", logfmt.Label(a.UID, a.Nickname), res.PrizeName, res.PrizeType)
+	case upstream.IsLotteryNoChance(err) || upstream.IsLotteryDisabled(err):
+		log.Printf("activity %s: lottery skip (no chances or disabled)", logfmt.Label(a.UID, a.Nickname))
+	default:
+		log.Printf("activity %s: lottery draw: %v", logfmt.Label(a.UID, a.Nickname), err)
+	}
+}
+
+// rewardClaimedToday 该账号当日是否已处理过连登奖励领取（自然日 CST）。
+func (s *Scheduler) rewardClaimedToday(uid string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rewardClaimed[uid] == travelDay(time.Now())
+}
+
+// markRewardClaimed 记录该账号当日已处理连登奖励领取。
+func (s *Scheduler) markRewardClaimed(uid string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rewardClaimed[uid] = travelDay(time.Now())
 }
 
 // RunKeepaliveNow 立即对所有账号刷新 token；session 死亡的自动禁用。
@@ -477,15 +680,15 @@ func (s *Scheduler) RunKeepaliveNow() {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshToken == "" {
+		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
-			log.Printf("keepalive %s: %v", logfmt.UID8(st.UID), err)
+			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			var ue *upstream.Error
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
 				if s.cfg.Pool.NoteSessionDead(st.UID) {
-					log.Printf("WARN: keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.UID8(st.UID), pool.SessionDeadThreshold())
+					log.Printf("WARN: keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
 				}
 			}
 			continue
@@ -493,7 +696,7 @@ func (s *Scheduler) RunKeepaliveNow() {
 		s.cfg.Pool.ClearSessionDead(st.UID) // 刷新成功清误判计数，失败不该累计
 		a.BackfillRealm()                   // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
 		if err := a.SaveAtomic(); err != nil {
-			log.Printf("keepalive %s save: %v", logfmt.UID8(st.UID), err)
+			log.Printf("keepalive %s save: %v", logfmt.Label(st.UID, st.Nickname), err)
 		}
 	}
 }

@@ -5,8 +5,10 @@ name: Build & Publish
 
 on:
   schedule:
-    # 每天北京时间 12:00 = UTC 04:00
-    - cron: '0 4 * * *'
+    # 每天北京时间 12:23 = UTC 04:23。
+    # 不用整点 04:00：GitHub schedule 在整点高峰排队严重（实测连续三天迟到 5h+，
+    # 2026-09-17 的 04:00 排队被静默丢弃、整天未跑），错峰 23 分降低排队延迟与丢弃率。
+    - cron: '23 4 * * *'
   workflow_dispatch:
   push:
     tags: ['v*'] # 打 tag 也触发发布

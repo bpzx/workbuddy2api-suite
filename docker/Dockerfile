@@ -196,6 +196,16 @@ RUN ln -s /data/auths /opt/wb2api/auths \
  && chown -h app:app /opt/wb2api/auths /opt/wb2api/config.json
 
 # ── 运行时约定 ────────────────────────────────────────────
+#
+# 版本检测：面板「系统更新」页显示的是上游 manager 的**版本号**变化
+# （如「管理端：v1.0.31 → v1.0.35」），由 manager 的 `current_version()`
+# 读代码里的 app.version（vendored 快照带来的**上游**版本号）与 GitHub 上
+# 上游仓库的最新 Release 比较得出。
+#
+# 该提示的用途是**提醒"上游发新版了、该去同步快照"**，不是"本镜像该更新了"
+# （后者走 docker compose pull，由用户手动做）。因此这里**有意不注入任何
+# 覆盖版本的环境变量**，让上游原行为生效。
+# 详见 UPSTREAMS.md 的「构建期补丁登记」。
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     TZ=Asia/Shanghai \

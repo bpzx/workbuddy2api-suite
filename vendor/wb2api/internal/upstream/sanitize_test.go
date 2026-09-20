@@ -416,3 +416,82 @@ func TestReasoningContentSanitized(t *testing.T) {
 		t.Fatalf("reasoning_content 指纹残留: %q", rc)
 	}
 }
+
+// TestSanitizeLiteralByteExact 逐字节快照护栏：把 sanitizeFeatures 7 项 +
+// sanitizeRewrites 5 对 + 3 个正则的当前字节值硬编码断言。
+// 这些字面量是实验逆向出的上游内容审核黑名单（无契约可引用），上游按逐字精确
+// 匹配拦截，一字之差即漏拦（400 code=11128）或误伤。任何未来改动（含看似无害的
+// 统一常量/抽配置）都会先红在本测试——必须走 analysis 报告 #6 的逐字节验证
+// 步骤：grep 全部出现点（表/正则/测试断言四处同查）+ 真实账号上游实测 +
+// TestSanitize 全族回归，方可同步更新本快照。
+func TestSanitizeLiteralByteExact(t *testing.T) {
+	features := []string{
+		"x-anthropic-billing-header", // header 键值段键名
+		"cc_entrypoint=",             // 尾随裸键值（截断前缀即可命中）
+		"You are Claude Code",        // 身份句（截断前缀即可命中）
+		"Main branch (",              // 注入指令句（截断前缀即可命中）
+		"You are a coding agent running in the Codex CLI", // Codex instructions 首段（截断前缀即可命中）
+		"github.com/anthropics/",     // 反馈句里的 Anthropic 仓库链接
+		"11128",                      // 上游反探测：裸数字错误码
+	}
+	if len(sanitizeFeatures) != len(features) {
+		t.Fatalf("sanitizeFeatures 项数=%d want %d（快照与实现不同步，见测试头注释的验证步骤）", len(sanitizeFeatures), len(features))
+	}
+	for i, want := range features {
+		if sanitizeFeatures[i] != want {
+			t.Errorf("sanitizeFeatures[%d]=%q want %q（逐字节不一致，改动前先走快照验证流程）", i, sanitizeFeatures[i], want)
+		}
+	}
+
+	rewrites := [][2]string{
+		{
+			"You are Claude Code, Anthropic's official CLI for Claude",
+			"You are Claude Code, Anthropic's official CLI tool for Claude",
+		},
+		{
+			"Main branch (you will usually use this for PRs)",
+			"Default branch (you will usually use this for PRs)",
+		},
+		{
+			"You are a coding agent running in the Codex CLI, a terminal-based coding assistant.",
+			"You are a coding agent running in the Codex CLI tool, a terminal-based coding assistant.",
+		},
+		{
+			"To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
+			"To provide feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
+		},
+		{
+			"11128",
+			"11-128",
+		},
+	}
+	if len(sanitizeRewrites) != len(rewrites) {
+		t.Fatalf("sanitizeRewrites 对数=%d want %d（快照与实现不同步，见测试头注释的验证步骤）", len(sanitizeRewrites), len(rewrites))
+	}
+	for i, want := range rewrites {
+		if sanitizeRewrites[i][0] != want[0] || sanitizeRewrites[i][1] != want[1] {
+			t.Errorf("sanitizeRewrites[%d]=%q→%q want %q→%q（逐字节不一致，改动前先走快照验证流程）",
+				i, sanitizeRewrites[i][0], sanitizeRewrites[i][1], want[0], want[1])
+		}
+	}
+
+	regexes := map[string]string{
+		"sanitizeHdrRe":     `(?i)x-anthropic-billing-header:[^;\n]*;?\s*`,
+		"sanitizeBareHdrRe": `(?i)x-anthropic-billing-header`,
+		"sanitizeKvRe":      `(?i)\bcc_[a-z0-9_]+=[^;\n]*;?\s*`,
+	}
+	for name, want := range regexes {
+		var got string
+		switch name {
+		case "sanitizeHdrRe":
+			got = sanitizeHdrRe.String()
+		case "sanitizeBareHdrRe":
+			got = sanitizeBareHdrRe.String()
+		case "sanitizeKvRe":
+			got = sanitizeKvRe.String()
+		}
+		if got != want {
+			t.Errorf("%s=%q want %q（逐字节不一致，改动前先走快照验证流程）", name, got, want)
+		}
+	}
+}

@@ -6,6 +6,8 @@ import {ChevronRight, FileText, Loader2, Package, TriangleAlert} from 'lucide-re
 import {Badge} from '@/components/ui/badge';
 import {Button} from '@/components/ui/button';
 import {systemApi} from '@/lib/api';
+import {RichText} from '@/lib/i18n/rich-text';
+import {useT} from '@/lib/i18n/provider';
 import {cn} from '@/lib/utils';
 import type {Changelog, ChangelogItem} from '@/lib/types';
 
@@ -20,6 +22,27 @@ const SECTION_STYLE: Record<string, string> = {
   说明: 'border-border bg-muted text-muted-foreground',
   计划中: 'border-violet-500/30 bg-violet-500/10 text-violet-600 dark:text-violet-400',
 };
+
+/**
+ * 分类标题 → i18n 键。
+ *
+ * 分类名来自服务端解析 CHANGELOG.md 的小标题（固定的几个），属**数据**；
+ * 按原值映射到译文。条目正文仍按仓库里写的中文原样展示——那是文档内容，
+ * 翻译它属于改 CHANGELOG.md 本身，不在界面适配范围内。
+ */
+const SECTION_LABEL_KEYS: Record<string, string> = {
+  安全: 'changelog.sectionSecurity',
+  新增: 'changelog.sectionAdded',
+  修复: 'changelog.sectionFixed',
+  改进: 'changelog.sectionImproved',
+  说明: 'changelog.sectionNotes',
+  计划中: 'changelog.sectionPlanned',
+};
+
+function sectionLabel(title: string, t: (key: string) => string): string {
+  const key = SECTION_LABEL_KEYS[title];
+  return key ? t(key) : title;
+}
 
 /**
  * 轻量行内渲染：只处理 `**加粗**` 与 `` `代码` ``，不引入 markdown 依赖。
@@ -98,6 +121,7 @@ function VersionBlock({
   onToggle: () => void;
   sections: Changelog['versions'][number]['sections'];
 }) {
+  const t = useT();
   const count = sections.reduce((n, s) => n + s.items.length, 0);
   // 当前版本置顶时也默认展开，方便一眼看到最新改了什么
   return (
@@ -121,11 +145,11 @@ function VersionBlock({
         />
         <span className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1">
           <span className="font-mono text-xs font-medium">
-            {unreleased ? '未发布' : `v${version}`}
+            {unreleased ? t('changelog.unreleased') : `v${version}`}
           </span>
           {isCurrent && !unreleased && (
             <Badge variant="secondary" className="h-5 px-1.5 text-[10px]">
-              当前版本
+              {t('changelog.currentVersion')}
             </Badge>
           )}
           {unreleased && (
@@ -133,13 +157,15 @@ function VersionBlock({
               variant="outline"
               className="h-5 border-amber-500/40 bg-amber-500/10 px-1.5 text-[10px] text-amber-600 dark:text-amber-400"
             >
-              开发中
+              {t('changelog.inProgress')}
             </Badge>
           )}
           {date && <span className="text-[11px] text-muted-foreground">{date}</span>}
         </span>
         {!expanded && (
-          <span className="shrink-0 text-[11px] text-muted-foreground">{count} 项</span>
+          <span className="shrink-0 text-[11px] text-muted-foreground">
+            {t('changelog.items', {count, n: count})}
+          </span>
         )}
       </button>
 
@@ -154,10 +180,10 @@ function VersionBlock({
                     SECTION_STYLE[sec.title] ?? 'border-border bg-muted text-muted-foreground',
                   )}
                 >
-                  {sec.title}
+                  {sectionLabel(sec.title, t)}
                 </span>
                 <span className="text-[10px] text-muted-foreground/70">
-                  {sec.items.length} 项
+                  {t('changelog.items', {count: sec.items.length, n: sec.items.length})}
                 </span>
               </div>
               <ItemList items={sec.items} />
@@ -165,12 +191,12 @@ function VersionBlock({
           ))}
           {isCurrent && currentVersion && !unreleased && (
             <div className="pt-0.5 text-[10px] text-muted-foreground/70">
-              你当前运行的正是这个版本
+              {t('changelog.thisIsCurrent')}
             </div>
           )}
           {index === 0 && !unreleased && (
             <div className="pt-0.5 text-[10px] text-muted-foreground/70">
-              查看全部版本：见仓库 Releases 页面
+              {t('changelog.seeAll')}
             </div>
           )}
         </div>
@@ -180,6 +206,7 @@ function VersionBlock({
 }
 
 export function ChangelogPanel() {
+  const t = useT();
   const [data, setData] = useState<Changelog | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
@@ -192,21 +219,21 @@ export function ChangelogPanel() {
       .then((d) => {
         if (!alive) return;
         setData(d);
-        if (!d.available) setError(d.error || '更新日志不可用');
+        if (!d.available) setError(d.error || t('changelog.unavailable'));
         else if (d.versions.length) setOpen(d.versions[0].version);
       })
-      .catch(() => alive && setError('读取更新日志失败'))
+      .catch(() => alive && setError(t('changelog.loadFailed')))
       .finally(() => alive && setLoading(false));
     return () => {
       alive = false;
     };
-  }, []);
+  }, [t]);
 
   if (loading) {
     return (
       <div className="flex items-center justify-center gap-2 rounded-[20px] bg-muted py-16 text-xs text-muted-foreground">
         <Loader2 className="h-4 w-4 animate-spin" />
-        正在读取更新日志…
+        {t('changelog.loading')}
       </div>
     );
   }
@@ -216,12 +243,10 @@ export function ChangelogPanel() {
       <div className="flex items-start gap-2.5 rounded-[20px] border border-amber-500/30 bg-amber-500/10 p-4">
         <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
         <div className="space-y-1 text-xs">
-          <div className="font-medium">更新日志不可用</div>
+          <div className="font-medium">{t('changelog.unavailable')}</div>
           <div className="text-muted-foreground">{error || data?.error}</div>
           <div className="text-muted-foreground">
-            📄 更新日志随发布包一起分发（<code className="font-mono">CHANGELOG.md</code>）。
-            若你是从旧版本升级上来的，去「系统更新」执行一次更新即可补上；
-            从源码运行时，请确认仓库根目录存在该文件。
+            <RichText text={t('changelog.unavailableHint')} />
           </div>
         </div>
       </div>
@@ -235,10 +260,10 @@ export function ChangelogPanel() {
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2 text-sm font-medium">
           <FileText className="h-4 w-4" />
-          更新日志
+          {t('changelog.title')}
           {currentVersion && (
             <span className="font-mono text-xs text-muted-foreground">
-              当前 v{currentVersion}
+              {t('changelog.currentVersionLabel', {v: currentVersion})}
             </span>
           )}
         </div>
@@ -269,7 +294,7 @@ export function ChangelogPanel() {
 
       {data.truncated && (
         <p className="text-[11px] text-muted-foreground">
-          仅显示最近 {data.versions.length} 个版本（共 {data.total} 个），更早的请查看仓库 Releases 页面。
+          {t('changelog.truncated', {n: data.versions.length, total: data.total ?? 0})}
         </p>
       )}
     </div>

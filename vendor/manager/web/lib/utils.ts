@@ -1,6 +1,8 @@
 import {clsx, type ClassValue} from 'clsx';
 import {twMerge} from 'tailwind-merge';
 
+import {intlLocale, t} from '@/lib/i18n';
+
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
@@ -13,7 +15,7 @@ export function cn(...inputs: ClassValue[]) {
 export function formatDate(dateString: string): string {
   try {
     const date = new Date(dateString);
-    return date.toLocaleDateString('zh-CN', {
+    return date.toLocaleDateString(intlLocale(), {
       year: 'numeric',
       month: '2-digit',
       day: '2-digit',
@@ -31,7 +33,7 @@ export function formatDate(dateString: string): string {
 export function formatDateTime(dateString: string): string {
   try {
     const date = new Date(dateString);
-    return date.toLocaleString('zh-CN', {
+    return date.toLocaleString(intlLocale(), {
       year: 'numeric',
       month: '2-digit',
       day: '2-digit',
@@ -51,7 +53,7 @@ export function formatDateTime(dateString: string): string {
 export function formatDateTimeWithSeconds(dateString: string): string {
   try {
     const date = new Date(dateString);
-    return date.toLocaleString('zh-CN', {
+    return date.toLocaleString(intlLocale(), {
       year: 'numeric',
       month: '2-digit',
       day: '2-digit',
@@ -84,7 +86,7 @@ export async function copyToClipboard(text: string): Promise<void> {
       document.execCommand('copy');
       document.body.removeChild(textArea);
     } catch {
-      throw new Error('复制失败');
+      throw new Error(t('common.copyFailed'));
     }
   }
 }

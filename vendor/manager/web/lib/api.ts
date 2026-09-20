@@ -1,8 +1,10 @@
 import axios, {AxiosError} from 'axios';
+import {tp} from './i18n';
 import type {Realm} from './realm-context';
 import type {
   Account,
   CheckinLogPage,
+  CreditExpiry,
   CreditsMeta,
   AccountsResponse,
   ApiKey,
@@ -20,6 +22,7 @@ import type {
   SecurityConfig,
   StatsSummary,
   TaskLogResponse,
+  TaskRunStatus,
   UpstreamConfig,
   UpstreamStatus,
   UsageBreakdown,
@@ -36,11 +39,18 @@ export const http = axios.create({
   timeout: 60000,
 });
 
-/** 统一抽取后端错误信息 */
+/**
+ * 统一抽取后端错误信息。
+ *
+ * 后端的报错是中文（服务端不做多语言，见 README 的多语言说明），这里过一遍
+ * 短语表：命中已收录的后端文案就换成当前语言，没收录的原样展示——既不需要
+ * 后端改造，也不会因为漏收录而显示成键名或空白。
+ */
 export function errText(e: unknown): string {
   const ax = e as AxiosError<{detail?: string; error?: string}>;
   const d = ax?.response?.data;
-  return (typeof d === 'string' ? d : d?.detail || d?.error) || ax?.message || '请求失败';
+  const raw = (typeof d === 'string' ? d : d?.detail || d?.error) || ax?.message || '';
+  return raw ? tp(raw) : tp('请求失败');
 }
 
 http.interceptors.response.use(
@@ -63,6 +73,8 @@ const post = async <T>(url: string, body?: unknown): Promise<T> =>
   (await http.post<T>(url, body)).data;
 const patch = async <T>(url: string, body?: unknown): Promise<T> =>
   (await http.patch<T>(url, body)).data;
+const put = async <T>(url: string, body?: unknown): Promise<T> =>
+  (await http.put<T>(url, body)).data;
 const del = async <T>(url: string): Promise<T> => (await http.delete<T>(url)).data;
 
 /* ── 鉴权 ───────────────────────────────────────────── */
@@ -71,6 +83,8 @@ export const authApi = {
   login: (username: string, password: string) =>
     post<{ok: boolean; username: string; role: string}>('/api/login', {username, password}),
   logout: () => post<{ok: boolean}>('/api/logout'),
+  /** 吊销当前用户的**全部**会话（含本机）——服务端递增会话版本，所有 cookie 立即失效。 */
+  revokeSessions: () => post<{ok: boolean; relogin_required: boolean}>('/api/sessions/revoke'),
 };
 
 /* ── 账号 ───────────────────────────────────────────── */
@@ -92,15 +106,25 @@ export const accountApi = {
       got?: Realm;
     }>('/api/auth/poll', {state, realm, region}),
   remove: (file: string) => del<{success: boolean}>(`/api/accounts/${encodeURIComponent(file)}`),
+  /** 临时禁用 / 启用账号（issue #21）：改文件名 + 触发上游重载。 */
+  setDisabled: (file: string, disabled: boolean) =>
+    post<{ok: boolean; file: string; disabled: boolean; changed: boolean;
+          reload_triggered: boolean; message: string}>(
+      `/api/accounts/${encodeURIComponent(file)}/disabled`, {disabled}),
   checkin: (file: string) =>
     post<{code: number; message: string; credits?: number | null}>(
       `/api/accounts/${encodeURIComponent(file)}/checkin`,
     ),
   /** 单个账号的实时积分（直接向腾讯查询） */
   credits: (file: string) =>
-    get<{ok: boolean; credits: number | null; message: string; cached: boolean; cache_age: number | null}>(
-      `/api/accounts/${encodeURIComponent(file)}/credits`,
-    ),
+    get<{
+      ok: boolean;
+      credits: number | null;
+      message: string;
+      cached: boolean;
+      cache_age: number | null;
+      expiries?: CreditExpiry[];
+    }>(`/api/accounts/${encodeURIComponent(file)}/credits`),
   /** 并发刷新所有账号的实时积分 */
   /** 查询全部账号积分；force=false 时 60 秒内命中服务端缓存 */
   refreshCredits: (force = true) =>
@@ -131,6 +155,17 @@ export const accountApi = {
   refresh: (file: string) =>
     post<{ok: boolean; message: string}>(`/api/accounts/${encodeURIComponent(file)}/refresh`),
   restart: () => post<{ok: boolean; message: string}>('/api/restart'),
+
+  /* ── 成长任务一键执行（issue #19）─────────────────────
+   * 调用上游自带的 scripts/task_runner.py。full（点亮）会伪造活跃上报，
+   * 因此单独要求 confirm，与幂等的 claim 区分开。 */
+  taskRunStatus: () => get<TaskRunStatus>('/api/task-run'),
+  taskRunStart: (mode: 'preview' | 'claim' | 'full', target = 'ALL', confirm = false) =>
+    post<{ok: boolean; message: string}>('/api/task-run', {mode, target, confirm}),
+  taskRunStop: () => post<{ok: boolean; message: string}>('/api/task-run/stop'),
+  taskClaimSchedule: () => get<{enabled: boolean; hours: number[]}>('/api/task-claim-schedule'),
+  saveTaskClaimSchedule: (enabled: boolean, hours: number[]) =>
+    put<{enabled: boolean; hours: number[]}>('/api/task-claim-schedule', {enabled, hours}),
 };
 
 /* ── 上游状态 ───────────────────────────────────────── */
@@ -171,10 +206,13 @@ export const logApi = {
 
 /* ── 用量统计 ───────────────────────────────────────── */
 export const statsApi = {
-  summary: () => get<StatsSummary>('/api/stats/summary'),
-  daily: (days = 30) => get<UsagePoint[]>('/api/stats/daily', {days}),
-  byModel: (days = 30) => get<UsageBreakdown[]>('/api/stats/by-model', {days}),
-  byKey: (days = 30) => get<UsageBreakdown[]>('/api/stats/by-key', {days}),
+  /** realm 非空时只统计该版本（界面按版本切换时传） */
+  summary: (realm?: Realm) => get<StatsSummary>('/api/stats/summary', {realm}),
+  daily: (days = 30, realm?: Realm) => get<UsagePoint[]>('/api/stats/daily', {days, realm}),
+  byModel: (days = 30, realm?: Realm) =>
+    get<UsageBreakdown[]>('/api/stats/by-model', {days, realm}),
+  byKey: (days = 30, realm?: Realm) =>
+    get<UsageBreakdown[]>('/api/stats/by-key', {days, realm}),
   /** 按请求日志回填用量缺口（幂等） */
   rebuildUsage: () =>
     post<{rows_before: number; rows_after: number; requests_delta: number; tokens_delta: number}>(

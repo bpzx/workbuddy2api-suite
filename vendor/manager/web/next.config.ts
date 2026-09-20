@@ -23,6 +23,12 @@ const nextConfig: NextConfig = {
     unoptimized: true,
     remotePatterns: [],
   },
+  // 构建时间注入为环境变量：package.json 里的 buildDate 是死值（从没更新过），
+  // 界面上「Build At」会永远显示同一个日期，属于会误导人的信息。
+  // 运行版本另以后端为准，这里只回答「这份前端产物是什么时候构建的」。
+  env: {
+    NEXT_PUBLIC_BUILD_TIME: new Date().toISOString(),
+  },
 };
 
 export default nextConfig;

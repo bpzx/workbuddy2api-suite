@@ -1,9 +1,19 @@
 package session
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"testing"
 )
+
+// imagePartSig 计算 part 原文摘要（sha256 前 8 hex），供期望值精确构造——
+// 签名算法变更时测试期望值随此 helper 单点同步。
+func imagePartSig(t *testing.T, part string) string {
+	t.Helper()
+	sum := sha256.Sum256([]byte(part))
+	return hex.EncodeToString(sum[:4])
+}
 
 // TestResolveConversationID 覆盖 conversationId 提取的 snake/camel/缺失三态：
 //   - metadata.conversation_id / metadata.conversationId → 取值
@@ -90,7 +100,7 @@ func TestTurnKeyExtraction(t *testing.T) {
 		{"last user wins", `{"messages":[{"role":"user","content":"第一问"},{"role":"assistant","content":"答"},{"role":"user","content":"第二问"}]}`, "u2:第二问"},
 		// agent 多步：轮内追加 assistant/tool 消息，末条 user 位置与内容不变 → 同键。
 		{"agent step keeps same key", `{"messages":[{"role":"user","content":"任务"},{"role":"assistant","tool_calls":[{"id":"c1"}]},{"role":"tool","content":"结果"}]}`, "u0:任务"},
-		{"multimodal parts text joined", `{"messages":[{"role":"user","content":[{"type":"text","text":"看图"},{"type":"image_url","image_url":{"url":"data:x"}}]}]}`, "u0:看图"},
+		{"multimodal parts text joined", `{"messages":[{"role":"user","content":[{"type":"text","text":"看图"},{"type":"image_url","image_url":{"url":"data:x"}}]}]}`, "u0:看图\n[image_url:" + imagePartSig(t, `{"type":"image_url","image_url":{"url":"data:x"}}`) + "]"},
 		{"no user message", `{"messages":[{"role":"system","content":"sys"}]}`, ""},
 		{"empty messages", `{"messages":[]}`, ""},
 		{"messages key absent", `{"model":"glm-5.2"}`, ""},
@@ -98,7 +108,9 @@ func TestTurnKeyExtraction(t *testing.T) {
 		{"empty body", ``, ""},
 		{"empty content", `{"messages":[{"role":"user","content":""}]}`, ""},
 		{"null content", `{"messages":[{"role":"user","content":null}]}`, ""},
-		{"image only content", `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}]}`, ""},
+		// 纯图片 content 现按内容签名派生非空轮级键（G1 修复，原为 ""）；
+		// 键含 image part 摘要（sha256 前 8 hex）。
+		{"image only content", `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}]}`, "u0:[image_url:" + imagePartSig(t, `{"type":"image_url","image_url":{"url":"x"}}`) + "]"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

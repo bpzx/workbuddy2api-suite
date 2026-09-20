@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 
 from .. import config, db, security
 from ..services import (
-    credits as creditsvc, modelcatalog, reload, tasklog, tencent, wb2api,
+    credits as creditsvc, modelcatalog, reload, tasklog, taskrun, tencent, wb2api,
 )
 from ..services.realm import realm_of, supports_checkin
 
@@ -38,6 +39,14 @@ async def upstream_status(user: dict = Depends(security.current_user)) -> dict:
     return await wb2api.get_status()
 
 
+def _strip_cn_prefix(m: dict) -> dict:
+    """去掉模型 id 的 `cn:` 前缀，**保留 `global:`**（见调用处注释）。"""
+    mid = str(m.get('id') or '')
+    if mid.lower().startswith('cn:'):
+        return {**m, 'id': mid[3:]}
+    return m
+
+
 @router.get('/models')
 async def models(
     realm: str | None = None,
@@ -65,6 +74,17 @@ async def models(
     if realm:
         r = 'global' if str(realm).strip().lower() == 'global' else 'cn'
         items = [m for m in items if modelcatalog._belongs(m, r)]
+    # 去掉 `cn:` 前缀：那是**上游的路由约定**，不是模型本身的名字。
+    # 界面要显示的是「腾讯自带的模型名」（glm-5.2 / deepseek-v4.1-flash），
+    # 前面挂个 cn: 既难看又让人以为得照着写。
+    #
+    # ⚠️ 只去 `cn:`，**绝不能动 `global:`**：上游 resolveModel 只认 `[realm:]model`
+    # 协议——取第一个 `:` 前段恰为 cn/global 才剥离，**其余一律当裸名（= 国内版）**。
+    # 所以裸名走国内版本来就成立（存量客户端一直如此），但**国际版一旦失去
+    # `global:` 前缀就会被路由到国内账号池**（模型名对不上，必然报错）。
+    # 曾用过 modelcatalog._strip_realm_prefix()，它把两种前缀都去掉了——那会让
+    # 界面上的国际版模型名变成「不可用」，实测发现后改为只去 cn:。
+    items = [_strip_cn_prefix(m) for m in items]
     return {
         'models': items,
         'source': wb2api.models_source(source_items),
@@ -114,6 +134,12 @@ async def auth_poll(
     if not state:
         return {'status': 'invalid'}
 
+    # 落盘成功后 state 会在下面被丢弃，但如果**落盘失败**（issue #26），
+    # 前端会继续轮询同一个 state 让用户重试 —— 那条路径不能把签到、领 trial
+    # 这些**有副作用**的动作重跑一遍（会重复写签到记录、重复调腾讯接口）。
+    # 所以记一笔「这个 state 已经做过供给」，重试时直接跳到落盘。
+    provisioned = _provisioned_states.get(state)
+
     r = None
     if realm is not None:
         r = 'global' if str(realm).strip().lower() == 'global' else 'cn'
@@ -122,6 +148,9 @@ async def auth_poll(
         return result
 
     realm_of_result = result.get('realm') or 'cn'
+    if provisioned:
+        # 已经供给过：只补落盘（上次就是败在这一步），其余一律不重做
+        return _save_and_finish(result, realm_of_result, region_msg='', state=state)
 
     # 探测 dict：billing 域身份头（X-User-Id / X-Domain 等）需要这些字段，
     # 与 _auth_dict 同构；device_token 此刻还没有（落盘时由外部写入）
@@ -155,8 +184,66 @@ async def auth_poll(
         'add', code in (0, 10001), code, message,
     )
 
+    # 供给（签到 / trial）做完了才允许重试时跳过它们 —— 标记要在**动副作用之前**
+    # 落位，否则「签到成功但标记没写」的窗口里重试仍会重跑一次。
+    _mark_provisioned(state)
     creditsvc.invalidate(str(result.get('uid', '')))
-    filename, existed = tencent.write_auth_file(result)
+    return _save_and_finish(result, realm_of_result, region_msg, state)
+
+
+def _mark_provisioned(state: str) -> None:
+    """记下「这个 state 已完成签到/trial 等有副作用的供给」。
+
+    只在内存里、且随 state 一起被 TTL 回收：它只需覆盖「落盘失败 → 用户重试」
+    这个短窗口（发码起 5 分钟内）；服务重启后 state 本身也失效，标记没有意义。
+    """
+    _provisioned_states[state] = time.time()
+    # 顺手清掉过期的，避免长期运行后无限增长（与 state 同一有效期）
+    cutoff = time.time() - tencent.STATE_TTL
+    for k in [k for k, at in _provisioned_states.items() if at < cutoff]:
+        _provisioned_states.pop(k, None)
+
+
+def _save_and_finish(result: dict, realm_of_result: str, region_msg: str,
+                     state: str) -> dict:
+    """落盘 + 收尾（重载上游、丢弃 state）。落盘失败时抛出**可执行**的提示。
+
+    单独抽出来是因为它有两条进入路径：首次供给后、以及「上次就是败在落盘」
+    的重试。两条路径都必须给出同样的引导，且都**不丢 state**（issue #26）。
+    """
+    # 落盘是这一步里**唯一真正关键**的动作：成功才算账号加进来了。
+    # 把它包起来是为了给出可执行的提示 —— 失败的一个常见成因是 auths 目录
+    # 权限不对（宝塔/1Panel 用 root 装、却以别的 uid 跑），而那个错误的原文
+    # 只有一行 PermissionError，用户看不出「该 chown 哪个目录」。
+    try:
+        filename, existed = tencent.write_auth_file(result)
+    except ValueError as exc:
+        # uid 形态异常（`write_auth_file` 会校验后才拼文件名）。这不是权限问题，
+        # 给「去 chown」的提示会把用户引到错方向 —— 如实说明是上游返回的数据异常。
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f'账号已授权成功，但返回的账号标识形态异常，已拒绝写入：{exc}。'
+                f'这通常是上游接口返回了非预期的数据；请重试一次，'
+                f'若持续出现请把本条信息反馈给我们。'
+            ),
+        ) from exc
+    except OSError as exc:
+        # 不 drop state：用户此刻重试（或前端再轮询一次）应当能成功，
+        # 而不是拿到「二维码已失效」被引导去重新扫码（issue #26 的现象）。
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f'账号已授权成功，但写入账号文件失败：{exc}。'
+                f'请检查 {config.AUTH_DIR} 的目录权限（容器部署见 compose 里 '
+                f'chown 10001:10001 的说明），修好后**直接重试本弹窗**即可，'
+                f'不需要重新扫码。'
+            ),
+        ) from exc
+
+    # 账号已确实落盘，这时才丢 state（成功路径的收尾）
+    tencent.drop_state(state)
+    _provisioned_states.pop(state, None)
 
     # 自动重载上游以加载新账号（后台合并执行，不阻塞本次响应）
     reload.request_restart()
@@ -230,14 +317,20 @@ async def account_checkin(filename: str, user: dict = Depends(security.require_a
     # 签到后顺带查实时积分：上游只在它自己的定时任务里刷新 credits，
     # 手动签到不会带动它更新，所以这里主动查一次返回给前端。
     credits: int | float | None = None
+    expiries: list[dict] = []
     if ok:
         # 签到会改变余额，先失效缓存再查实时值
         creditsvc.invalidate(uid)
-        _, credits, _, _, _ = await creditsvc.get_credits(
+        _, credits, _, _, _, expiries = await creditsvc.get_credits(
             _auth_dict(raw), nickname=str(acct.get('nickname') or ''),
         )
 
-    return {'code': code, 'message': message, 'credits': credits}
+    return {
+        'code': code,
+        'message': message,
+        'credits': credits,
+        'expiries': expiries,
+    }
 
 
 @router.get('/accounts/{filename}/credits')
@@ -246,16 +339,24 @@ async def account_credits(
     force: bool = False,
     user: dict = Depends(security.require_admin),
 ) -> dict:
-    """查询单个账号的实时积分余额（直接向腾讯查询，带 60s 缓存）。
+    """查询单个账号的实时积分余额与套餐到期时间（直接向腾讯查询，带 60s 缓存）。
 
     force=true 可绕过缓存强制查询。
+    expiries: [{'at': epoch 秒, 'amount': 额度}]，按到期时间升序，只含仍有余额的套餐。
     """
     raw = _load(filename)
     acct = raw.get('account') or {}
-    ok, value, message, cached, age = await creditsvc.get_credits(
+    ok, value, message, cached, age, expiries = await creditsvc.get_credits(
         _auth_dict(raw), force=force, nickname=str(acct.get('nickname') or ''),
     )
-    return {'ok': ok, 'credits': value, 'message': message, 'cached': cached, 'cache_age': age}
+    return {
+        'ok': ok,
+        'credits': value,
+        'message': message,
+        'cached': cached,
+        'cache_age': age,
+        'expiries': expiries,
+    }
 
 
 @router.post('/accounts/refresh-credits')
@@ -272,24 +373,31 @@ async def refresh_all_credits(
     """
     accounts = wb2api.list_auth_accounts()
 
-    async def one(acc: dict) -> tuple[str, int | float | None, str, bool, int | None]:
+    async def one(
+        acc: dict,
+    ) -> tuple[str, int | float | None, str, bool, int | None, list[dict]]:
         try:
             raw = wb2api.read_account_file(acc['file'])
         except Exception as exc:  # noqa: BLE001
-            return acc['uid'], None, f'读取失败: {exc}', False, None
-        ok, value, message, cached, age = await creditsvc.get_credits(
+            return acc['uid'], None, f'读取失败: {exc}', False, None, []
+        ok, value, message, cached, age, expiries = await creditsvc.get_credits(
             _auth_dict(raw), force=force, nickname=str(acc.get('nickname') or ''),
         )
-        return acc['uid'], value if ok else None, message, cached, age
+        return acc['uid'], value if ok else None, message, cached, age, expiries
 
     results = await asyncio.gather(*(one(a) for a in accounts)) if accounts else []
 
     credits_map: dict[str, int | float | None] = {}
     meta: dict[str, dict] = {}
     failed: list[str] = []
-    for uid, credits, message, cached, age in results:
+    for uid, credits, message, cached, age, expiries in results:
         credits_map[uid] = credits
-        meta[uid] = {'cached': cached, 'cache_age': age, 'message': message}
+        meta[uid] = {
+            'cached': cached,
+            'cache_age': age,
+            'message': message,
+            'expiries': expiries,
+        }
         if credits is None:
             failed.append(f'{uid[:12]}: {message}')
 
@@ -560,15 +668,23 @@ def task_logs(
         row['message_cn'] = tasklog.translate_message(row.get('message', ''))
         row['nickname'] = resolve_nick(str(row.get('uid') or ''))
 
-    # 统计也要按同一口径：不过滤时用数据库聚合（快），过滤时按筛后的行算，
-    # 否则会出现「徽标说 62 条、列表只有 3 条」的矛盾
+    # `total` 是**当前筛选下**的条数（列表分页要用），而 `stats` 是**各类型**的
+    # 汇总（筛选栏要用它显示每个类型的条数与总条数）。
+    #
+    # 两者口径必须分开，不能一起按 kind 过滤 —— 这里踩过坑（issue #35）：
+    # 原先 realm 分支用 `list_task_logs(kind=kind, ...)` 重算 stats，于是
+    # `stats.total` 变成了「当前筛选下」的条数。界面用 `stats.total > 0` 决定
+    # 筛选栏是否渲染，点进一个没有记录的类型时它就变成 0 → **整条筛选栏消失**，
+    # 用户再也切不回「全部」，只能刷新页面。
+    # 也就是说：筛选栏的可见性绝不能依赖筛选结果本身。
     stats = db.task_log_stats(days=days)
     total = db.count_task_logs(uid=uid, kind=kind, days=days)
     if realm_map is not None:
-        all_rows = db.list_task_logs(limit=2000, uid=uid, kind=kind, offset=0, days=days)
+        # 版本过滤只能按行做（日志表没有 realm 列）。注意这里**不带 kind**：
+        # 要的就是「该版本下所有类型」的分布。
+        all_rows = db.list_task_logs(limit=2000, uid=uid, kind=None, offset=0, days=days)
         kept = [r for r in all_rows
                 if _uid_matches_realm(str(r.get('uid') or ''), realm_map, realm)]
-        total = len(kept)
         by_kind: dict[str, dict] = {}
         for r in kept:
             k = str(r.get('kind') or '')
@@ -580,6 +696,10 @@ def task_logs(
             'total': len(kept),
             'total_credits': sum(v['credits'] for v in by_kind.values()),
         }
+        # total 同样要按版本口径重算（带 kind），与列表一致
+        scoped = ([r for r in kept if str(r.get('kind') or '') == kind]
+                  if kind else kept)
+        total = len(scoped)
 
     return {
         'logs': logs,
@@ -601,6 +721,83 @@ async def collect_task_logs(user: dict = Depends(security.require_admin)) -> dic
 def clear_task_logs(user: dict = Depends(security.require_admin)) -> dict:
     db.clear_task_logs()
     return {'ok': True}
+
+
+# 已完成「有副作用的供给」（签到 / 国际版 trial）的扫码 state。
+#
+# 为什么需要（issue #26 的连带问题）：落盘失败时我们**故意不丢 state**，好让
+# 用户重试不用重新扫码；但前端是每 2 秒轮询同一个 state，而 poll_login 每次都
+# 会返回 ready —— 不记一笔的话，每次轮询都会重跑签到与领 trial：重复写签到
+# 记录、重复调腾讯接口。仅供「落盘失败 → 重试」这个短窗口使用，随 state 的
+# 5 分钟 TTL 一起过期（服务重启后 state 本身也失效，标记无意义）。
+_provisioned_states: dict[str, float] = {}
+
+
+# ── 成长任务一键执行（issue #19）─────────────────────────────
+# 调用上游自带的 scripts/task_runner.py。三种模式按风险分级，见 taskrun 模块注释：
+# preview 只读 / claim 幂等领奖 / full 点亮+领奖（会伪造上报）。
+# 全部仅管理员可用 —— 这些操作会对账号发起真实写请求。
+
+
+@router.get('/task-run')
+def task_run_status(user: dict = Depends(security.require_admin)) -> dict:
+    """当前/上次执行状态与输出尾部（界面轮询）。"""
+    return taskrun.status()
+
+
+@router.post('/task-run')
+async def task_run_start(
+    body: dict = Body(...),
+    user: dict = Depends(security.require_admin),
+) -> dict:
+    """启动一次执行。body: {mode, target}。
+
+    `full`（点亮 + 领奖）会伪造活跃上报，因此要求显式传 `confirm: true` ——
+    与「领奖」区分开，避免手滑点到风险最高的那个。
+    """
+    mode = str(body.get('mode') or '').strip()
+    target = str(body.get('target') or 'ALL').strip() or 'ALL'
+    if mode not in ('preview', 'claim', 'full'):
+        raise HTTPException(status_code=400, detail='模式只能是 preview / claim / full')
+    if mode == 'full' and body.get('confirm') is not True:
+        raise HTTPException(
+            status_code=400,
+            detail='「点亮任务」会向腾讯发送活跃上报（造画布、连发对话等），'
+                   '请先确认：该操作有风控风险，建议先用「预览」看清将要做的事。',
+        )
+    # 走线程池版本：start() 内部会解析脚本路径（脚本缺失时还要 fork docker
+    # 提取，最长 60 秒），本接口是 async，同步跑它会冻住整个事件循环——
+    # 连带把对外网关一起卡住。
+    ok, msg = await taskrun.start_async(mode, target)
+    if not ok:
+        # 前置拒绝（脚本缺失/已有任务在跑/参数不合法）用 409 表达「状态冲突」，
+        # 与「请求本身有错」（400）区分开。
+        raise HTTPException(status_code=409, detail=msg)
+    return {'ok': True, 'message': msg}
+
+
+@router.post('/task-run/stop')
+async def task_run_stop(user: dict = Depends(security.require_admin)) -> dict:
+    stopped = await taskrun.stop()
+    return {'ok': stopped, 'message': '已停止' if stopped else '当前没有正在执行的任务'}
+
+
+@router.get('/task-claim-schedule')
+def task_claim_schedule_get(user: dict = Depends(security.require_admin)) -> dict:
+    """定时领奖配置（仅幂等领奖，不含点亮）。"""
+    return taskrun.get_schedule()
+
+
+@router.put('/task-claim-schedule')
+def task_claim_schedule_put(
+    body: dict = Body(...),
+    user: dict = Depends(security.require_admin),
+) -> dict:
+    """保存定时领奖配置。"""
+    try:
+        return taskrun.set_schedule(body.get('enabled'), body.get('hours'))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get('/upstream/logs')
@@ -664,3 +861,45 @@ async def account_delete(filename: str, user: dict = Depends(security.require_ad
 async def restart(user: dict = Depends(security.require_admin)) -> dict:
     ok, message = await reload.restart_now()
     return {'ok': ok, 'message': message}
+
+
+@router.post('/accounts/{filename}/disabled')
+async def account_set_disabled(
+    filename: str,
+    body: dict = Body(...),
+    user: dict = Depends(security.require_admin),
+) -> dict:
+    """临时禁用 / 启用一个账号（issue #21）。
+
+    实现是**改文件名**（加/去 `.disabled` 后缀）——上游只加载 `workbuddy*.json`，
+    所以改名后它就不再被加载、从池里消失（详见 `wb2api.set_account_disabled`
+    的说明：上游没有对外暴露禁用接口，改 state.json 也会被 5 秒一次的上位机覆盖）。
+
+    body: {disabled: bool, reload: bool}。`reload` 默认 true ——
+    旧上游不监听文件变化，不重载就不会生效，而用户点「禁用」时期待的是
+    **立即生效**；新上游（2026-09-18 起）有 5 秒热加载，重载只是为了不等那 5 秒。
+    要批量操作时可以先传 false，最后一次统一重载。
+    """
+    if not isinstance(body.get('disabled'), bool):
+        raise HTTPException(status_code=400, detail='disabled 必须是布尔值')
+    disabled = bool(body['disabled'])
+    try:
+        result = wb2api.set_account_disabled(filename, disabled)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    reloaded = False
+    if result['changed'] and body.get('reload', True) is not False:
+        reloaded = reload.request_restart()
+
+    return {
+        'ok': True,
+        **result,
+        # 是否已触发上游重载。未触发时调用方要自己重启，否则改名不生效。
+        'reload_triggered': reloaded,
+        'message': (
+            f"已{'禁用' if disabled else '启用'}该账号"
+            + ('，正在重载上游使其生效' if reloaded
+               else ('；请手动重启上游以生效' if result['changed'] else ''))
+        ),
+    }

@@ -36,10 +36,10 @@ import (
 // 上游常量：CN → copilot.tencent.com（Origin 为 codebuddy.cn）；global → www.workbuddy.ai
 // （base 与 Origin/Referer 同域）。端点 URL 由 realmConfig 按 realm 动态拼出，不再硬编码。
 const (
-	upstreamBaseCN     = "https://copilot.tencent.com"
-	upstreamBaseGlobal = "https://www.workbuddy.ai"
-	clientUA           = "CLI/2.63.2 CodeBuddy/2.63.2"
-	originRefererCN    = "https://www.codebuddy.cn"
+	upstreamBaseCN      = "https://copilot.tencent.com"
+	upstreamBaseGlobal  = "https://www.workbuddy.ai"
+	clientUA            = "CLI/2.63.2 CodeBuddy/2.63.2"
+	originRefererCN     = "https://www.codebuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
 )
 
@@ -73,14 +73,14 @@ func commonHeaders(origin string) func(*http.Request) {
 	}
 }
 
-// apiEnvelope 与 main.go:429-433 一致
+// apiEnvelope 上游 {code,msg,data} 业务信封（与 upstream doJSON 家族解析口径一致）。
 type apiEnvelope struct {
 	Code int             `json:"code"`
 	Msg  string          `json:"msg"`
 	Data json.RawMessage `json:"data"`
 }
 
-// doJSON 与 oauth.go:33-66 一致：{code,msg,data} 信封，code!=0 → error
+// doJSON 与 upstream.doJSON 语义一致：{code,msg,data} 信封，code!=0 → error
 func doJSON(client *http.Client, method, fullURL string, headers func(*http.Request), body io.Reader) (json.RawMessage, int, error) {
 	req, err := http.NewRequest(method, fullURL, body)
 	if err != nil {
@@ -245,7 +245,7 @@ func runPoll(base, origin, realm, statePath string, client *http.Client, out io.
 		fatal("%v", err)
 	}
 	headers := commonHeaders(origin)
-	// handlePollLogin (oauth.go:108-162)：auth/token 是权威登录状态端点，
+	// handlePollLogin：auth/token 是权威登录状态端点，
 	// pending 时业务 code 非 0（"login ing"），完成时 code=0 + token bundle
 	tokRaw, status, errTok := doJSON(client, http.MethodGet, base+"/v2/plugin/auth/token?state="+ls.State, headers, nil)
 	if errTok != nil {
@@ -314,7 +314,7 @@ func main() {
 	if len(rest) < 1 {
 		fatal("usage: login [--realm=cn|global] <url|poll>")
 	}
-	// 每个流程独立 cookie jar（oauth.go:22-29：多账号登录互不串会话）
+	// 每个流程独立 cookie jar（多账号登录互不串会话）
 	jar, _ := cookiejar.New(nil)
 	client := &http.Client{Timeout: 30 * time.Second, Jar: jar}
 

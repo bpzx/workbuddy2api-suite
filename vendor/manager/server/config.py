@@ -28,10 +28,21 @@ HOST = _env('WB_MANAGER_HOST', '0.0.0.0')
 WB2API_BASE = _env('WB2API_BASE', 'http://127.0.0.1:7863').rstrip('/')
 WB2API_KEY = _env('WB2API_KEY', '')
 WB2API_CONTAINER = _env('WB2API_CONTAINER', 'workbuddy2api')
+WB2API_MODE = _env('WB2API_MODE', 'docker').lower()  # docker | native
 
 # 上游数据文件（与 workbuddy2api 共享）
 AUTH_DIR = Path(_env('WB_AUTH_DIR', '/opt/workbuddy2api/auths'))
 UPSTREAM_CONFIG = Path(_env('WB_UPSTREAM_CONFIG', '/opt/workbuddy2api/config.json'))
+UPSTREAM_DIR = Path(_env('WB_UPSTREAM_DIR', str(UPSTREAM_CONFIG.parent)))
+WB2API_START_SCRIPT = Path(_env(
+    'WB2API_START_SCRIPT', str(UPSTREAM_DIR / 'start-workbuddy2api.cmd'),
+))
+WB2API_STOP_SCRIPT = Path(_env(
+    'WB2API_STOP_SCRIPT', str(UPSTREAM_DIR / 'stop-workbuddy2api.cmd'),
+))
+WB2API_LOG_FILE = Path(_env(
+    'WB2API_LOG_FILE', str(UPSTREAM_DIR / 'data' / 'server.err.log'),
+))
 
 # 本管理端数据
 DATA_DIR = Path(_env('WB_DATA_DIR', str(ROOT / 'data')))
@@ -67,11 +78,32 @@ TRUSTED_PROXY_CIDRS = [
 ]
 # 是否暴露 /docs、/openapi.json、/redoc。生产环境建议关闭（默认关闭）。
 ENABLE_DOCS = _env('WB_ENABLE_DOCS', '0') == '1'
+# 入站访问日志（安全页的「IP 访问日志」）是否记录**放行**的请求。
+#
+# 默认关闭：那张表的用途是安全审计（谁在扫我、谁被挡了），记全量会把信号淹没。
+# 实测线上 7877 行里只有 17 行是拦截记录（0.2%），而表有 2 万行滚动上限，
+# 被正常流量占满后保留窗口从数月压到约 17 天——真出事时记录可能已被挤掉。
+# 放行的明细在「请求日志」页有完整记录，这里不重复记不丢信息。
+#
+# 需要核对「某个 IP 到底来过什么」时临时设 1 恢复全量记录。
+AUDIT_ALL_ACCESS = _env('WB_AUDIT_ALL_ACCESS', '0') == '1'
 # 显式出口代理（可选，如 http://127.0.0.1:7890）。
 # 留空时所有请求都不使用任何代理：httpx 默认 trust_env=True 会读取系统/环境代理，
 # 会把内网请求（如 127.0.0.1:7863）也交给系统代理，导致连接被劫持或长时间超时。
 HTTP_PROXY = _env('WB_HTTP_PROXY', '')
-SESSION_DAYS = _env_int('WB_SESSION_DAYS', 7)
+# 会话**总时长**上限（天）：登录后最多维持这么久，到点必须重新登录。
+#
+# 下限钳到 1 天：0（或负数）会让 cookie 的 exp 等于签发时刻，即「登录成功但
+# 立刻过期」——用户被锁在门外，而报错只会说「未登录」，看不出是配置写错了。
+# 想「几乎不过期」就把值调大（如 30），而不是写 0。
+SESSION_DAYS = max(1, _env_int('WB_SESSION_DAYS', 1))
+# 会话**空闲**上限（小时）：距上次活动超过它就失效（滑动续期的窗口）。
+# **0 = 关闭空闲判定**，只按总时长失效（`security.idle_expired` 显式处理）。
+#
+# 为什么要有这个、而不只是把总时长调短：只减总时长会惩罚**天天用**的人
+# （每天都要重登一次），却对「登录一次就再也不碰」的会话没有额外约束。
+# 滑动续期把两件事分开——常用的人不断续、不被打扰；放着不用的会话自己过期。
+SESSION_IDLE_HOURS = _env_int('WB_SESSION_IDLE_HOURS', 12)
 COOKIE_NAME = 'wb_session'
 SECURE_COOKIE = _env('WB_SECURE_COOKIE', 'auto')  # auto | true | false
 

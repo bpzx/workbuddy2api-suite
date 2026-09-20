@@ -2,7 +2,6 @@
 package pool
 
 import (
-	"sort"
 	"time"
 
 	"workbuddy2api/internal/auth"
@@ -17,47 +16,17 @@ func (p *Pool) PickExcludingForRealm(tried map[string]bool, reqModel, realm stri
 }
 
 // AvailableUIDsForRealm 同 AvailableUIDs，但仅返回 Realm()==realm 的账号。
+// DeptestOnly: 仅 realm_test.go 引用；生产经 wiring.go 走
+// AvailableUIDsForModelRealm。保留作 ForModelRealm 的模型维度退化
+// （model=""）语义锚点测试。
 // realm=="" 退化为 AvailableUIDs（现状语义）。
 func (p *Pool) AvailableUIDsForRealm(realm string) []string {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	now := time.Now()
-	uids := make([]string, 0, len(p.byUID))
-	for uid, e := range p.byUID {
-		if realm != "" && e.a.Realm() != realm {
-			continue
-		}
-		if !e.healthy(now) {
-			continue
-		}
-		if p.inFlightFull(e) {
-			continue
-		}
-		uids = append(uids, uid)
-	}
-	sort.Strings(uids)
-	return uids
+	return p.availableUIDsLocked(realm, func(e *entry, now time.Time) bool { return e.healthy(now) })
 }
 
 // AvailableUIDsForModelRealm 同 AvailableUIDsForModel，但仅返回 Realm()==realm 的账号
 // （6004 模型豁免照常生效）。realm=="" 退化为 AvailableUIDsForModel。
 func (p *Pool) AvailableUIDsForModelRealm(model, realm string) []string {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	now := time.Now()
-	uids := make([]string, 0, len(p.byUID))
-	for uid, e := range p.byUID {
-		if realm != "" && e.a.Realm() != realm {
-			continue
-		}
-		if !e.healthyForModel(now, model) {
-			continue
-		}
-		if p.inFlightFull(e) {
-			continue
-		}
-		uids = append(uids, uid)
-	}
-	sort.Strings(uids)
-	return uids
+	return p.availableUIDsLocked(realm,
+		func(e *entry, now time.Time) bool { return e.healthyForModel(now, model) })
 }

@@ -169,27 +169,20 @@ func TestChatConversationRequestIDInboundPassthrough(t *testing.T) {
 	}
 }
 
-// TestChatAGlobalPathAndFallbackReuseConvReqID global realm /console → /v2 fallback：
-// 同一 ChatStream 内两条候选路径出站复用同一 conversationRequestID（换路径不改聚合键）。
-func TestChatAGlobalPathAndFallbackReuseConvReqID(t *testing.T) {
+// TestChatAGlobalPathReuseConvReqID global realm /v2 单路径（#119 后无 fallback）：
+// 出站打 /v2/chat/completions 恰一次，conversationRequestID 与 B3 头族完整。
+// （旧 fallback 复用 ConvReqID 语义随 [console→v2] 双路径移除而退役。）
+func TestChatAGlobalPathReuseConvReqID(t *testing.T) {
 	auth.SetGlobalEnabled(true)
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
 
 	var headers []http.Header
-	reqs := 0
+	var paths []string
 	up := &upstream.Client{
 		GlobalEnabled: true,
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			reqs++
+			paths = append(paths, r.URL.Path)
 			headers = append(headers, r.Header.Clone())
-			// 首次路径（console）404 → 触发 fallback 到 /v2。
-			if reqs == 1 {
-				return &http.Response{
-					StatusCode: 404,
-					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"code":404}`)),
-				}, nil
-			}
 			return &http.Response{
 				StatusCode: 200,
 				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
@@ -208,21 +201,17 @@ func TestChatAGlobalPathAndFallbackReuseConvReqID(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 200 {
-		t.Fatalf("code=%d body=%s (global /v2 fallback)", rec.Code, rec.Body)
+		t.Fatalf("code=%d body=%s (global /v2 single path)", rec.Code, rec.Body)
 	}
-	if reqs != 2 {
-		t.Fatalf("reqs=%d want 2 (console 404 → fallback /v2)", reqs)
+	if len(paths) != 1 || paths[0] != "/v2/chat/completions" {
+		t.Fatalf("paths=%v want exactly [/v2/chat/completions] (single path, no fallback)", paths)
 	}
 	if headers[0].Get("X-Conversation-Request-ID") == "" {
-		t.Fatal("console attempt missing X-Conversation-Request-ID")
-	}
-	if headers[0].Get("X-Conversation-Request-ID") != headers[1].Get("X-Conversation-Request-ID") {
-		t.Errorf("console vs /v2 fallback conversationRequestID differ: %q vs %q",
-			headers[0].Get("X-Conversation-Request-ID"), headers[1].Get("X-Conversation-Request-ID"))
+		t.Fatal("global /v2 attempt missing X-Conversation-Request-ID")
 	}
 	// global 侧头族同样完整：CN/global 同构。
 	if headers[0].Get("X-B3-TraceId") == "" || headers[0].Get("X-B3-SpanId") == "" {
-		t.Errorf("global console attempt missing B3 family: trace=%q span=%q",
+		t.Errorf("global /v2 attempt missing B3 family: trace=%q span=%q",
 			headers[0].Get("X-B3-TraceId"), headers[0].Get("X-B3-SpanId"))
 	}
 }
@@ -312,15 +301,113 @@ func TestChatTurnKeyStableAcrossAgentSteps(t *testing.T) {
 	}
 }
 
-// TestChatSessionKeyBeatsTurnKey 会话键优先于轮级兜底：带 conversationId 时聚合键是
-// 会话级的（跨轮同键，不随末条 user 消息变化），与无会话键的轮级行为明确区分。
+// TestChatSessionKeyBeatsTurnKey 带 conversationId 时聚合键随末条 user 消息变化
+// （#170 统一轮级，取代旧「会话键跨轮稳定」契约——对齐官方 CLI）。同轮同会话
+// 仍同键（与 TestChatSessionKeyTurnStableWithinTurn 互补：这里覆盖顶层
+// conversationId 形态 + 重复文本轮不并轮）。
 func TestChatSessionKeyBeatsTurnKey(t *testing.T) {
 	a := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"conversationId":"conv-x","messages":[{"role":"user","content":"第一问"}]}`)
 	b := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"conversationId":"conv-x","messages":[{"role":"user","content":"第二问"}]}`)
 	if a == "" {
 		t.Fatal("X-Conversation-Request-ID missing")
 	}
+	if a == b {
+		t.Errorf("会话键路径应轮级换键（随末条 user 变化，#170 对齐官方 CLI）: %q", a)
+	}
+	// 同轮同会话（重复发同一问）：turnKey 含 user 序号 + 内容签名 → 同键。
+	c := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"conversationId":"conv-x","messages":[{"role":"user","content":"第一问"}]}`)
+	if a != c {
+		t.Errorf("同会话同轮文本应同聚合键: a=%q c=%q", a, c)
+	}
+}
+
+// TestChatSessionKeyTurnScoped issue #170 RED 锚（R1）：带会话键客户端
+// （metadata.conversation_id）同会话两轮（末条 user 不同）→ 出站
+// X-Conversation-Request-ID 必须不同——对齐官方桌面 CLI 的轮级语义
+// （TraceStartHook 每次 USER_PROMPT_SUBMIT 清空重生成）。旧行为
+// RequestIDForKey(sessKey) 会话级跨轮同值 → RED。
+func TestChatSessionKeyTurnScoped(t *testing.T) {
+	a := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"metadata":{"conversation_id":"conv-t"},"messages":[{"role":"user","content":"第一问"}]}`)
+	b := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"metadata":{"conversation_id":"conv-t"},"messages":[`+
+		`{"role":"user","content":"第一问"},{"role":"assistant","content":"答"},`+
+		`{"role":"user","content":"第二问"}]}`)
+	if a == "" || b == "" {
+		t.Fatal("X-Conversation-Request-ID missing on session-keyed request")
+	}
+	if a == b {
+		t.Errorf("同会话跨轮应换聚合 ID（轮级，对齐官方 CLI）: a=%q b=%q", a, b)
+	}
+}
+
+// TestChatSessionKeyTurnStableWithinTurn R2：带会话键客户端轮内 tool-call
+// 多步（追加 assistant/tool，末条 user 不变）→ 同 ID（#35 轮内聚合核心语义保留）。
+func TestChatSessionKeyTurnStableWithinTurn(t *testing.T) {
+	step1 := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"metadata":{"conversation_id":"conv-t"},"messages":[{"role":"user","content":"跑一下"}]}`)
+	step2 := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"metadata":{"conversation_id":"conv-t"},"messages":[`+
+		`{"role":"user","content":"跑一下"},`+
+		`{"role":"assistant","tool_calls":[{"id":"c1","function":{"name":"pwsh"}}]},`+
+		`{"role":"tool","tool_call_id":"c1","content":"结果"}]}`)
+	if step1 == "" {
+		t.Fatal("X-Conversation-Request-ID missing")
+	}
+	if step1 != step2 {
+		t.Errorf("轮内追加消息不应改变聚合键（会话键客户端）: step1=%q step2=%q", step1, step2)
+	}
+}
+
+// TestChatSessionKeyCrossSessionSameTurnText R4：不同会话同轮文本 → 不同 ID
+// （sessKey 入复合键防跨会话互撞）。
+func TestChatSessionKeyCrossSessionSameTurnText(t *testing.T) {
+	a := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"metadata":{"conversation_id":"conv-a"},"messages":[{"role":"user","content":"同样的问题"}]}`)
+	b := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"metadata":{"conversation_id":"conv-b"},"messages":[{"role":"user","content":"同样的问题"}]}`)
+	if a == "" || b == "" {
+		t.Fatal("X-Conversation-Request-ID missing")
+	}
+	if a == b {
+		t.Errorf("不同会话同轮文本不应共用聚合 ID（会话段入键防撞）: %q", a)
+	}
+}
+
+// TestChatSessionKeyEmptyTurnKeyFallback R5：turnKey 空态（无 user 消息）
+// + sessKey 非空 → 会话级兜底同值（残留空态仍聚合，好于请求级随机）。
+func TestChatSessionKeyEmptyTurnKeyFallback(t *testing.T) {
+	a := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"metadata":{"conversation_id":"conv-e"},"messages":[{"role":"assistant","content":"续"}]}`)
+	b := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"metadata":{"conversation_id":"conv-e"},"messages":[{"role":"assistant","content":"又续"}]}`)
+	if a == "" || b == "" {
+		t.Fatal("X-Conversation-Request-ID missing")
+	}
 	if a != b {
-		t.Errorf("会话键路径应跨轮稳定（不受末条 user 变化影响）: %q vs %q", a, b)
+		t.Errorf("turnKey 空态应回落会话级兜底（同 sessKey 同值）: a=%q b=%q", a, b)
+	}
+	// 且是会话派生（非请求级随机）：同 body 重放同值。
+	c := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"metadata":{"conversation_id":"conv-e"},"messages":[{"role":"assistant","content":"续"}]}`)
+	if a != c {
+		t.Errorf("会话级兜底应为纯派生（同 body 同值）: a=%q c=%q", a, c)
+	}
+}
+
+// TestChatImageTurnAggregation 纯图 body 两次经 /v1/chat/completions：出站
+// X-Conversation-Request-ID 同值（contentSignature 修复 G1——原为请求级随机
+// 碎片化；审计 §3.1 探针用例转正）。带文本的下一轮换键（跨轮不混并）。
+func TestChatImageTurnAggregation(t *testing.T) {
+	imgBody := `{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":[` +
+		`{"type":"image_url","image_url":{"url":"https://img.example/cat.png"}}]}]}`
+	first := turnRequestIDForBody(t, imgBody)
+	second := turnRequestIDForBody(t, imgBody)
+	if first == "" {
+		t.Fatal("纯图请求应派生轮级聚合 ID（G1：原请求级随机）")
+	}
+	if first != second {
+		t.Errorf("纯图同 body 两次出站应同聚合 ID: %q vs %q", first, second)
+	}
+	if !isValidB3Trace(first) {
+		t.Errorf("轮级 id %q want 32 hex", first)
+	}
+	// 跨轮：末条 user 换成文本 → 换键。
+	next := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"messages":[`+
+		`{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://img.example/cat.png"}}]},`+
+		`{"role":"assistant","content":"答"},{"role":"user","content":"继续"}]}`)
+	if next == "" || next == first {
+		t.Errorf("下一轮（末条 user 换文本）应换聚合键: first=%q next=%q", first, next)
 	}
 }

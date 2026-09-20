@@ -249,6 +249,39 @@ chown -R 10001:10001 /opt/workbuddy2api/auths /opt/workbuddy2api/data
 上游是 Go 项目，首次 `docker compose up --build` 需拉取基础镜像并编译，
 视网络情况可能需要几分钟，属正常现象。
 
+**Q：构建管理端镜像失败 / 启动后打开页面显示 ERR_CONNECTION_REFUSED**
+
+先确认容器到底有没有起来——「端口拒绝连接」几乎都是**镜像没构建成功**，
+而不是服务本身的问题：
+
+```bash
+docker compose ps        # 没有 workbuddy-manager 这一行 = 容器没起来
+docker compose build     # 重新构建，看真正的报错
+```
+
+构建在国内网络下最常见的失败点是**软件源/依赖源不可达**，典型报错：
+
+```
+E: Failed to fetch http://deb.debian.org/... 502  Bad Gateway
+E: The repository '...' is no longer signed.
+SSL: UNEXPECTED_EOF_WHILE_READING        # pip 拉 PyPI 时
+```
+
+官方源（`deb.debian.org` / `pypi.org`）走国际 CDN，国内实测约 367 kB/s 且频繁
+502。Dockerfile 内置了一次**自动降级**（失败后改用阿里云 / 清华镜像重试），
+所以通常能自己建成功，只是会先白等几分钟。想直接跳过这段等待，显式指定镜像源：
+
+```bash
+docker compose build \
+  --build-arg DEBIAN_MIRROR=mirrors.aliyun.com \
+  --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+
+docker compose up -d
+```
+
+也可以把这两个值写进 `docker-compose.yml` 的 `build.args`，之后 `up --build` 就不必再带参数。
+可选镜像：`mirrors.aliyun.com` / `mirrors.tuna.tsinghua.edu.cn` / `mirrors.ustc.edu.cn`。
+
 **Q：扫码后账号没出现**
 检查上游日志与账号文件：
 
@@ -256,6 +289,83 @@ chown -R 10001:10001 /opt/workbuddy2api/auths /opt/workbuddy2api/data
 docker compose -f /opt/workbuddy2api/docker-compose.yml logs --tail 50
 ls -l /opt/workbuddy2api/auths/
 ```
+
+**Q：打开 `http://127.0.0.1:7863` 显示「404 page not found」，是不是装坏了？**
+
+**不是，这是正常现象。** 7863 是**上游网关 workbuddy2api**，它是一个**纯 API 服务，
+本身没有网页界面**——上游的定位就是「网关核心保持精简，不内嵌 Web 管理面板」，
+因此根路径没有任何页面，访问任意非接口路径都会返回 Go 默认的 `404 page not found`。
+
+两个端口的分工：
+
+| 地址 | 是什么 | 怎么用 |
+|---|---|---|
+| `127.0.0.1:7864` | **WorkBuddy Manager（本管理端）** | 用浏览器打开，账号 / 密钥 / 日志 / 设置都在这里 |
+| `127.0.0.1:7863` | 上游网关（workbuddy2api） | 只提供接口，用命令行或下游客户端调用 |
+
+上游真正提供的接口只有这四个：
+
+```bash
+# 健康检查（无需鉴权）：healthy / total 即为账号数
+curl -s http://127.0.0.1:7863/healthz
+
+# 账号池状态（需带 api_key，脚本部署时由 install.sh 生成）
+curl -s -H "Authorization: Bearer <api_key>" http://127.0.0.1:7863/status
+
+# 可用模型
+curl -s -H "Authorization: Bearer <api_key>" http://127.0.0.1:7863/v1/models
+
+# 对话补全（OpenAI 兼容，下游客户端用这个）
+POST http://127.0.0.1:7863/v1/chat/completions
+```
+
+`api_key` 在上游的 `config.json` 里：
+
+```bash
+grep api_key /opt/workbuddy2api/config.json
+```
+
+> **想看上游状态的话，不需要开 7863**：管理端已经把它可视化了——
+> 「仪表盘 → 反代上游」显示连接状态、健康 / 冷却 / 禁用账号数与粘性会话；
+> 「设置 → 上游配置 → 服务信息」显示上游地址与接入密钥（已隐藏）。
+> 这正是本管理端存在的意义：把上游的命令行能力变成看得见的界面。
+
+> **顺带一提（安全）**：管理端默认只绑 `127.0.0.1:7864`，而上游默认监听
+> `0.0.0.0:7863`——也就是**公网可直接访问上游端口**（仍需 api_key，但少一层
+> 暴露少一类风险）。
+>
+> 想收紧的话，**别直接照抄「改成 127.0.0.1」**：上游能不能只绑回环，取决于
+> 管理端怎么连它。
+>
+> - 管理端**跑在宿主机**（systemd 部署，连 `127.0.0.1:7863`）：可以绑回环。
+> - 管理端**跑在容器里**（compose 部署，连 `host.docker.internal:7863`）：
+>   这个地址并非回环，绑回环后**可能连不上上游**。实测 Docker Desktop
+>   （Windows / macOS）会把 `host.docker.internal` 转发到宿主回环、连得上；
+>   而 Linux 上容器访问宿主回环通常**不通**。
+>
+> 更可靠的做法有两条，按你的部署形态选：
+>
+> **① 让两个容器进同一个 Docker 网络（推荐，最干净）**
+> 这样管理端用**服务名**直连上游，上游**根本不需要对外发布端口**：
+>
+> ```yaml
+> # 管理端 compose：把上游地址写成服务名
+> WB2API_BASE: http://workbuddy2api:7863
+> ```
+>
+> 然后删掉上游 compose 里的 `ports: ["7863:7863"]`（或改成
+> `"127.0.0.1:7863:7863"` 只留给宿主调试）。本仓库 compose 里
+> 已经把这个地址作为推荐值写在注释里了。
+>
+> **② 只绑到内网网卡**
+> 把上游的端口映射从 `"7863:7863"` 改成 `"<服务器内网IP>:7863:7863"`，
+> 公网访问不到，而管理端仍连得上。
+>
+> ⚠️ 别指望用 `ufw deny 7863` 之类的**宿主机防火墙规则**去挡：Docker 发布端口
+> 走的是 iptables 的 `DOCKER` 链，会绕过 ufw 的 `INPUT` 规则，看着配了实际没生效。
+>
+> 无论用哪种方式，改完都回管理端「仪表盘 → 反代上游」确认仍是「正常」——
+> 别只看端口在监听。
 
 **Q：公网访问点「添加账号」二维码加载不出来**
 管理端需要访问腾讯接口生成授权链接，请确认服务器可访问外网。

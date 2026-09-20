@@ -2,8 +2,12 @@ package main
 
 import (
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
+	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -97,6 +101,49 @@ func TestCheckinStatusOf(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			if got := checkinStatusOf(c.err); got != c.want {
 				t.Errorf("checkinStatusOf(%q)=%q want %q", c.err, got, c.want)
+			}
+		})
+	}
+}
+
+// TestSigninFileGlobViaAuthLoadFiles (P2-10)：signin 的文件清单改走
+// auth.LoadAuthFiles 后，不带连字符的文件（workbuddy_new.json）与网关
+// LoadDir 同口径加载。main() 不可直测，此处锁共享契约 + signin 侧无
+// 私有 glob 残留（源码层面 sort/filepath.Glob 依赖已随重构移除，编译期
+// 由未用 import 守卫）。
+func TestSigninFileGlobViaAuthLoadFiles(t *testing.T) {
+	dir := t.TempDir()
+	doc := `{"auth":{"accessToken":"at","refreshToken":"r","expiresAt":1,"domain":""},"account":{"uid":"u1"}}`
+	if err := os.WriteFile(filepath.Join(dir, "workbuddy_new.json"), []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files, err := auth.LoadAuthFiles(dir)
+	if err != nil || len(files) != 1 {
+		t.Fatalf("LoadAuthFiles: files=%v err=%v want 1", files, err)
+	}
+}
+
+// TestRefreshStatusOfWrappedError (P2-11 RED)：refresh 失败分支此前用
+// err.(*upstream.Error) 类型断言，错误被 %w 包装时漏判 ErrSessionDead →
+// 已死号被标成普通 FAIL 而非 AUTH_INVALID。同文件 isAlready 早已用
+// errors.As 的正确写法，此处对齐。
+func TestRefreshStatusOfWrappedError(t *testing.T) {
+	plain := &upstream.Error{Kind: upstream.ErrSessionDead, Status: 401, Msg: "code=12153"}
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"bare session dead", plain, "AUTH_INVALID"},
+		{"wrapped session dead", fmt.Errorf("refresh: %w", plain), "AUTH_INVALID"},
+		{"double wrapped", fmt.Errorf("outer: %w", fmt.Errorf("inner: %w", plain)), "AUTH_INVALID"},
+		{"other upstream error", &upstream.Error{Kind: upstream.ErrServer, Status: 500, Msg: "boom"}, "FAIL"},
+		{"transport error", errors.New("dial tcp: connection refused"), "FAIL"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := refreshStatusOf(c.err); got != c.want {
+				t.Errorf("refreshStatusOf(%v)=%q want %q", c.err, got, c.want)
 			}
 		})
 	}

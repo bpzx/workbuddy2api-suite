@@ -185,6 +185,7 @@ if [ "${SRC_DIR}" != "${APP_DIR}" ]; then
   # 文档：界面的「更新日志」页直接读它（server/ 内另有一份副本兜底）
   cp "${SRC_DIR}/CHANGELOG.md" "${APP_DIR}/" 2>/dev/null || true
   cp "${SRC_DIR}/README.md" "${APP_DIR}/" 2>/dev/null || true
+  cp "${SRC_DIR}/README.en.md" "${APP_DIR}/" 2>/dev/null || true
 fi
 
 # 静态前端：优先用发布包内的 web/out；否则尝试本地构建
@@ -204,7 +205,7 @@ elif [ -f "${SRC_DIR}/web/package.json" ]; then
     die "需要 Node.js 构建前端；或下载 Release 包（内含已构建的 web/out）"
   fi
 else
-  die "缺少前端产物 web/out，请使用 Release 包或先执行 npm run build:export"
+  die "源码目录里既没有前端产物、也没有前端源码（${SRC_DIR}/web 不存在）——请确认源码完整，或改用 Release 包"
 fi
 
 # 写入版本标记（供界面显示当前版本）

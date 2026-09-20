@@ -9,32 +9,15 @@ import (
 	"workbuddy2api/internal/upstream"
 )
 
-// TestModelListEffortFieldsStaticCN CN 静态兜底分支：/v1/models 输出 reasoning_supported_efforts
-// 与 reasoning_default_effort（deepseek-v4-pro 在 CN 面 ['low','high','xhigh']），且不破坏既有字段。
-func TestModelListEffortFieldsStaticCN(t *testing.T) {
+// TestModelListEffortFieldsNoCNEmpty 无 CN 健康号触发动态拉取失败 → /v1/models CN 面空列表
+// （纯动态，无静态兜底）。
+func TestModelListEffortFieldsNoCNEmpty(t *testing.T) {
 	resetModelsCache()
-	// 无 CN 健康号触发动态拉取 → 走静态表分支。
 	h := NewHandler(Config{Pool: testPoolWith(), Upstream: upstream.New(), GlobalEnabled: false})
 
 	got := h.modelList()
-	var target map[string]any
-	for _, m := range got {
-		if id, _ := m["id"].(string); id == "cn:deepseek-v4-pro" {
-			target = m
-		}
-	}
-	if target == nil {
-		t.Fatal("cn:deepseek-v4-pro missing from static fallback")
-	}
-	if !reflect.DeepEqual(target["reasoning_supported_efforts"], []string{"low", "high", "xhigh"}) {
-		t.Errorf("reasoning_supported_efforts=%v want [low high xhigh]", target["reasoning_supported_efforts"])
-	}
-	if target["reasoning_default_effort"] != "high" {
-		t.Errorf("reasoning_default_effort=%v want high", target["reasoning_default_effort"])
-	}
-	// 既有字段零改动：id/object/owned_by 保持原样。
-	if target["object"] != "model" || target["owned_by"] != "workbuddy" {
-		t.Errorf("existing fields altered: %v", target)
+	if len(got) != 0 {
+		t.Fatalf("no CN account: modelList=%v want empty (pure dynamic, no static fallback)", got)
 	}
 }
 
@@ -80,44 +63,26 @@ func TestModelListEffortFieldsDynamicCN(t *testing.T) {
 	}
 }
 
-// TestModelListEffortFieldsGlobal 静态 global 面：deepseek-v4.1-flash 国际版只 ['high']，
-// 不沿用 CN 三档（issue #84 正确解法：不盲改网关暴露三档）。
-func TestModelListEffortFieldsGlobal(t *testing.T) {
+// TestModelListEffortFieldsGlobalProbeFailEmpty global 探测失败 → 空名单（纯动态，无静态兜底），
+// deepseek-v4.1-flash 等静态历史名单成员不出现。
+func TestModelListEffortFieldsGlobalProbeFailEmpty(t *testing.T) {
 	auth.SetGlobalEnabled(true)
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
 	resetModelsCache()
 
-	cf := newGlobalModelsHandlerFake(t, 500, `{"code":500,"msg":"boom"}`) // 探测失败→静态名单
+	cf := newGlobalModelsHandlerFake(t, 500, `{"code":500,"msg":"boom"}`) // 探测失败→空名单
 	p := testPoolWith(&auth.Auth{UID: "g1", AccessToken: "at_gl", Domain: "www.workbuddy.ai", ExpiresAt: 9999999999})
 	h := NewHandler(Config{Pool: p, Upstream: cf.up, GlobalEnabled: true})
 
-	var target map[string]any
 	for _, m := range h.modelList() {
 		if id, _ := m["id"].(string); id == "global:deepseek-v4.1-flash" {
-			target = m
-		}
-	}
-	if target == nil {
-		t.Fatal("global:deepseek-v4.1-flash missing")
-	}
-	if !reflect.DeepEqual(target["reasoning_supported_efforts"], []string{"high"}) {
-		t.Errorf("global reasoning_supported_efforts=%v want [high]", target["reasoning_supported_efforts"])
-	}
-	if _, ok := target["reasoning_default_effort"]; ok {
-		t.Errorf("global deepseek-v4.1-flash must not carry default effort (upstream 无声明): %v", target)
-	}
-	// 无档位模型（default-model / deep-model）省略字段。
-	for _, m := range h.modelList() {
-		if id, _ := m["id"].(string); id == "global:default-model" {
-			if _, ok := m["reasoning_supported_efforts"]; ok {
-				t.Error("global:default-model should omit effort fields (无档位声明)")
-			}
+			t.Fatalf("global:deepseek-v4.1-flash must not appear on probe failure (pure dynamic): %v", m)
 		}
 	}
 }
 
-// TestModelListEffortFieldsGlobalRemote 探测下发档位 → /v1/models global 面用远端桶（权威），
-// 远程未覆盖的模型仍落静态兜底表。
+// TestModelListEffortFieldsGlobalRemote 探测下发档位 → /v1/models global 面用远端桶（权威）；
+// 探测未覆盖的模型不出现（纯动态，无静态兜底）。
 func TestModelListEffortFieldsGlobalRemote(t *testing.T) {
 	auth.SetGlobalEnabled(true)
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
@@ -148,9 +113,9 @@ func TestModelListEffortFieldsGlobalRemote(t *testing.T) {
 	if !reflect.DeepEqual(byID["global:probe-only-x"]["reasoning_supported_efforts"], []string{"low"}) {
 		t.Errorf("probe-only-x remote efforts=%v want [low]", byID["global:probe-only-x"]["reasoning_supported_efforts"])
 	}
-	// 静态兜底表仍生效（deepseek-v4.1-flash 国际版 ['high']，探测未下发）。
-	if !reflect.DeepEqual(byID["global:deepseek-v4.1-flash"]["reasoning_supported_efforts"], []string{"high"}) {
-		t.Errorf("static fallback efforts=%v want [high]", byID["global:deepseek-v4.1-flash"]["reasoning_supported_efforts"])
+	// 纯动态：探测未覆盖的静态历史名单成员（deepseek-v4.1-flash）不出现。
+	if _, ok := byID["global:deepseek-v4.1-flash"]; ok {
+		t.Error("global:deepseek-v4.1-flash must not appear (not probed, no static fallback)")
 	}
 }
 

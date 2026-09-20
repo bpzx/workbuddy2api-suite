@@ -178,26 +178,25 @@ func TestPickWeightedTopFiveOnly(t *testing.T) {
 
 func TestPickTopFiveBySuccessRateNotCredits(t *testing.T) {
 	withNoPickGap(t)
-	// C1 回归：top5 短名单必须按三因子权重（含成功率）而非纯 credits 截断。
-	// a1..a5 credits=100 但成功率极低（1/100），a6 credits=90 但成功率 100%。
-	// 纯 credits 排序时 a6（90 < 100）是第 6 名，永远进不了 top5；
-	// 三因子权重下 a6 权重最高，首轮必被选中。仅断言首轮（后续 a6 闲置补偿衰减会合法发散）。
+	// C1 回归（成功率因子删除后的等价形态）：top5 短名单按三因子权重而非纯
+	// credits 截断。a1..a5 credits=100 但连续失败达熔断阈值（退出可选集），
+	// a6 credits=90 且从未使用。纯 credits 排序时 a6（90 < 100）不占优；
+	// 熔断把 a1..a5 移出候选后 a6 必被选中——失败处置由熔断器（而非成功率权重）
+	// 承担正是因子删除后的语义（success-ema-review §2：失败侧与熔断 100% 同源）。
 	p := New("")
 	p.SetRandomSource(func(n int64) int64 { return 0 }) // r=0 → 选权重最高的候选
 	for _, u := range []string{"a1", "a2", "a3", "a4", "a5"} {
 		p.Add(&auth.Auth{UID: u})
 		p.SetCredits(u, 100)
-		for i := 0; i < 99; i++ {
-			p.NoteError(u) // 成功率 1/(1+99)≈0.03
+		for i := 0; i < 3; i++ {
+			p.NoteError(u) // 连续 3 次达默认熔断阈值 → 退出可选集
 		}
-		p.NoteSuccess(u)
 	}
 	p.Add(&auth.Auth{UID: "a6"})
 	p.SetCredits("a6", 90)
-	p.NoteSuccess("a6") // 成功率 100%
 
 	if got := p.Pick(""); got == nil || got.UID != "a6" {
-		t.Fatalf("pick=%v, want a6 (high-success low-credit must enter top5 by weight)", got)
+		t.Fatalf("pick=%v, want a6 (breaker removes failing accounts from candidates)", got)
 	}
 }
 
@@ -514,6 +513,13 @@ func TestStateRoundTripExtendedFields(t *testing.T) {
 	for _, want := range []string{`"cool_kind"`, `"success_count"`, `"err_total"`, `"last_success"`, `"last_err"`} {
 		if !strings.Contains(string(raw), want) {
 			t.Errorf("state.json missing %s:\n%s", want, raw)
+		}
+	}
+	// 运维可见的运行态字段即使零值也显式写出（去 omitempty）：缺失会被误解为"没记录"。
+	// （原 error_ema/success_ema 已随成功率 EMA 因子删除，不再落盘。）
+	for _, want := range []string{`"soft_streak"`, `"session_dead_fails"`, `"credits_expiring"`} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("state.json missing %s（零值也应显式写出）:\n%s", want, raw)
 		}
 	}
 	if strings.Contains(string(raw), `"err_count"`) {
@@ -1662,6 +1668,10 @@ func TestWeightIdleCompensation(t *testing.T) {
 	}
 }
 
+// TestWeightLowSuccessRateDowngrades 改写（成功率因子已删，success-ema-review §4）：
+// 失败侧处置已全权由熔断/冷却/降权接管——NoteError 达阈值触发熔断后账号不可选
+// （healthyForModel 失败），不再依赖权重降级。断言锁定新语义：仅成败计数不
+// 影响权重（等权），但连续失败达熔断阈值后账号退出可选集（重语义由状态机承担）。
 func TestWeightLowSuccessRateDowngrades(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "good"})
@@ -1670,10 +1680,15 @@ func TestWeightLowSuccessRateDowngrades(t *testing.T) {
 	p.SetCredits("bad", 100)
 	p.NoteSuccess("good")
 	p.NoteError("bad")
-	p.NoteError("bad")
 	wGood, wBad := p.entryWeight("good"), p.entryWeight("bad")
-	if wBad >= wGood {
-		t.Errorf("low success rate should weigh less: good=%v bad=%v", wGood, wBad)
+	if wBad != wGood {
+		t.Errorf("因子删除后成败计数不应影响权重: good=%v bad=%v", wGood, wBad)
+	}
+	// 熔断接管失败侧：连续 NoteError 达默认阈值 3 → bad 不可选。
+	p.NoteError("bad")
+	p.NoteError("bad")
+	if got := p.Pick(""); got == nil || got.UID != "good" {
+		t.Errorf("熔断后 bad 应退出可选集, got %v", got)
 	}
 }
 
@@ -1941,6 +1956,31 @@ func TestRestoreNoRedisUsesLocal(t *testing.T) {
 	st, ok := p.Status("u1")
 	if !ok || st.Credits != 55 {
 		t.Fatalf("no redis → use local: %+v ok=%v", st, ok)
+	}
+}
+
+func TestRestoreUsesRedisWhenLocalMissing(t *testing.T) {
+	// 本地 state.json 不存在（首次在新卷/新节点启动）+ 有效 Redis 快照 → 必须采用快照。
+	// 此时本地没有可"优先"的状态，快照是本轮唯一来源（快照作为"启动恢复备份"的核心场景，
+	// 见 StoreSnapshotter 契约）。旧实现把该情形并进「本地较新」的 fall-through：快照被
+	// 静默丢弃（既不改内存也不置 dirty），全池运行态清零，且打出"本地较新于快照"的假日志。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json") // 刻意不创建：模拟新卷首启
+
+	ms := &memStore{loadOK: true}
+	snap := snapshot{stateFile: stateFile{Accounts: map[string]stateAccount{"u1": {Credits: 999}}}, SavedAt: time.Now()}
+	ms.loadData, _ = json.Marshal(snap)
+
+	p := New(fp)
+	p.SetStore(ms)
+	p.RestoreFromSnapshot()
+
+	st, ok := p.Status("u1")
+	if !ok {
+		t.Fatalf("本地缺失时应采用 Redis 快照恢复账号，但池内无 u1（有效快照被丢弃）")
+	}
+	if st.Credits != 999 {
+		t.Fatalf("should restore from Redis snapshot when local missing: credits=%d want 999", st.Credits)
 	}
 }
 

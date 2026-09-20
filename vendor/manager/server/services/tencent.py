@@ -6,8 +6,13 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import re
+import tempfile
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -34,7 +39,25 @@ from .realm import (
 # 记 realm 是为了在回调时校验一致——若用户先开国内版的码、又切到国际版再轮询，
 # 不校验就会把国际版的 token 写进国内版的会话流程（上游 validateRealmMatch 同此意图）。
 _state_cache: dict[str, tuple[float, Realm]] = {}
-STATE_TTL = 300
+
+# state 的有效期（秒）。
+#
+# **给得宽松是刻意的**（社区反馈：手机号登录时「返回登录」出问题）：
+# 腾讯那个授权页除了扫码，还支持**手机号 + 短信验证码**登录，而短信有运营商延迟、
+# 用户也可能中途去翻手机 —— 全程超过 5 分钟很常见。此前这里写 300 秒，超时后前端
+# 报「二维码已失效」，而用户觉得自己刚授权成功，完全对不上。
+#
+# 上游 workbuddy2api 对此**没有任何超时**（它的 login.sh 是手动按 y 才 poll）。
+# 我们保留 TTL 只是为了不给内存留垃圾——每个条目只有几十字节，且是**人工**低频操作，
+# 放宽到 15 分钟的开销可以忽略，换来的是不必让用户赶时间。
+STATE_TTL = 900
+
+# 模型目录的 v3 端点（国内版与国际版同路径，按账号切 base）。
+# 它是官方客户端模型目录的第二级取数：企业端点拿不到的那几个模型只在
+# /v3/config 下发——实测国际版独有的 deepseek-v4.1-flash / gpt-6-astra /
+# hy4-preview-f / kimi-k2.8-preview 都从这里来（见 fetch_models 的说明）。
+# 该端点有 UA 门禁：只有三段式 CLI UA（我们 _ua 的形态）能过，web UA 被 400 拒。
+V3_CONFIG_PATH = '/v3/config'
 
 
 def _envelope(resp: httpx.Response) -> tuple[int, Any]:
@@ -48,9 +71,15 @@ def _envelope(resp: httpx.Response) -> tuple[int, Any]:
     return resp.status_code, env
 
 
-def _hdr(realm: Realm, token: str | None = None) -> dict:
-    """该版本的通用请求头（Origin/Referer/UA 随版本变）。"""
-    return realm_headers(realm, token)
+def _hdr(realm: Realm, token: str | None = None,
+         uid: str | None = None) -> dict:
+    """该版本的通用请求头（Origin/Referer/UA 随版本变）。
+
+    uid 非空时附账号级设备指纹头（X-Machine-ID / X-Session-ID）。
+    能拿到账号 uid 的调用点都应传——那是官方客户端「每账号一台固定虚拟设备」
+    的形态，缺失会被按设备指纹异常关联风控。
+    """
+    return realm_headers(realm, token, uid)
 
 
 def _billing_hdr(realm: Realm, auth: dict | str | None = None) -> dict:
@@ -60,8 +89,8 @@ def _billing_hdr(realm: Realm, auth: dict | str | None = None) -> dict:
     我们此前只发通用头——Go 侧测试明确断言 trial 必须带 X-User-Id，签到与查
     积分同理。这里统一走 realm.billing_headers。
 
-    auth 允许传 token 字符串（兼容既有调用），此时只有 Authorization，
-    身份头缺失——新调用点应尽量传完整 dict。
+    auth 允许传 token 字符串（兼容既有调用），此时只有 Authorization 与
+    通用头，**身份头与设备指纹头都缺失**——新调用点应尽量传完整 dict。
     """
     if isinstance(auth, str):
         return realm_headers(realm, auth)
@@ -145,7 +174,18 @@ async def poll_login(state: str, realm: Realm | None = None) -> dict:
     if not uid:
         return {'status': 'waiting'}
 
-    drop_state(state)
+    # 这里**不** drop_state —— 刻意留给调用方在账号真正落盘之后再丢。
+    #
+    # 早先是先丢再返回，看起来更整洁，实际制造了一个很难查的故障（issue #26）：
+    # 轮询拿到 ready 后，路由还要落盘（写 auths/）并记签到日志；若其中任何一步抛错
+    # （宝塔/1Panel 部署下 auths 目录属主不对 → PermissionError 很常见），
+    # 前端那次请求拿到 500、它的 catch 静默吞掉，下一轮再轮询时 state 已不在缓存里
+    # → 返回 invalid → 界面显示「二维码已失效」。而**腾讯侧其实已经授权成功**，
+    # 用户被引导去重新扫码，重扫还是一样 —— 因为真正的毛病是目录权限，
+    # 报错信息却指向二维码。
+    #
+    # 语义上也不对：state 的有效期是「发码起 5 分钟」，不是「拿到 token 就走完一生」。
+    # 留给路由 drop，超时兜底仍由上面的 TTL 分支负责（那才是它该管的范围）。
     return {
         'status': 'ready',
         'uid': str(uid),
@@ -170,7 +210,16 @@ def write_auth_file(account: dict) -> tuple[str, bool]:
     它是设备风控凭据，用户手动写入后若因换 token 重登而丢失，会静默降级风控
     形态——所以这里读旧文件保留，而不是当作字段缺失。
     """
-    uid = account['uid']
+    uid = str(account['uid'])
+    # uid 会被拼进文件名，写入 auths 目录，所以必须先校验字符集。
+    #
+    # 它来自腾讯 `/v2/plugin/login/account` 的响应（`acct.get('uid')`），
+    # 是**外部输入**：真实 uid 是 uuid（`9b212d8c-f5f7-...`），但没有校验时
+    # `../x` 这类值会让路径拐出 auths 目录（`workbuddy-` 前缀只挡住了大部分形态，
+    # 分隔符仍能生效）。同目录下 `wb2api._safe_file` 早已对**读**路径做了同样的
+    # 白名单，这里把**写**路径补齐，两边口径一致。
+    if not re.fullmatch(r'[0-9A-Za-z_-]{1,80}', uid):
+        raise ValueError(f'账号 uid 形态异常，已拒绝写入（{uid[:40]!r}）')
     config.AUTH_DIR.mkdir(parents=True, exist_ok=True)
     target = config.AUTH_DIR / f'workbuddy-{uid}.json'
     existed = target.exists()
@@ -203,7 +252,49 @@ def write_auth_file(account: dict) -> tuple[str, bool]:
     }
     if old_device_token:
         payload['device_token'] = old_device_token
-    target.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding='utf-8')
+
+    # **原子替换**（临时文件 + os.replace），不能直接 write_text。
+    #
+    # 为什么必须这样：上游 2026-09-18 起新增了 auths 目录热加载——每 5 秒轮询
+    # 目录指纹（文件名 + mtime + 大小），一有变化就重新全量加载。而 `write_text`
+    # 是「先截断再写」，中间存在**长度为 0 的窗口**；轮询若正好落在那里，读到空文件
+    # → `Parse` 失败 → 该账号被判定为「已删除」而从池里剔除，随后才被写回。
+    # 表现是账号偶发地短时间掉线，且日志里看不出原因（大概率碰不上，但轮询是永久的，
+    # 迟早会碰上）。
+    #
+    # 上游自己也依赖这个前提：其 watch.go 注释写明「半写入的临时文件
+    # （login.sh 用 tempfile + os.replace 原子替换）不会造成误判」—— 我们的写入
+    # 路径必须符合同一个约定。
+    #
+    # 临时文件名以 `.` 开头且不以 `.json` 结尾：既不会被上游的 `workbuddy*.json`
+    # glob 收到，也不会被它的目录指纹计入（指纹只统计 `.json`）。
+    #
+    # **名字必须唯一**（mkstemp 的随机后缀），不能用固定的 `.workbuddy-x.json.tmp`：
+    # 同一账号被并发写入时（批量扫码、或用户连点重试），两次写会共用同一个临时
+    # 文件——先完成者 `os.replace` 成功后该临时文件已不存在，后完成者的 replace
+    # 失败并触发清理，把对方刚写好的内容一并删掉。实测 4 个并发线程全部报错、
+    # 且原账号文件消失。唯一名让每次写各自独立。
+    fd, tmp_name = tempfile.mkstemp(prefix=f'.{target.name}.', suffix='.tmp',
+                                    dir=str(target.parent))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False, indent=1))
+        # **必须显式放宽权限**：mkstemp 在 Linux 上固定创建 0600，而这里写入的
+        # 文件是给**上游**读的 —— 宿主部署下本面板以 root 写、上游容器以 uid
+        # 10001 读，0600 会让上游读不到该账号（表现为账号加进去了但池里没有）。
+        # 原来的 `write_text` 走 umask（典型 0644），这里要保持同样的可读性。
+        #
+        # 为什么不照抄上游 SaveAtomic 的 0o600：上游是「同一个进程既写又读」，
+        # 0600 自洽；我们是跨 uid 写读，前提不同。
+        os.chmod(tmp_name, 0o644)
+        os.replace(tmp_name, target)
+    except Exception:
+        # 失败时清掉临时文件，避免在 auths 目录里留垃圾（它不会被加载，但会让人困惑）
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
     return target.name, existed
 
 
@@ -236,38 +327,34 @@ async def checkin(access_token: str | dict, realm: Realm = CN) -> tuple[int, str
         return -1, f'签到异常: {exc}'
 
 
-def _pick_accounts(data: object) -> list | None:
-    """从 billing 响应里取套餐数组（兼容多层信封）。"""
-    return _extract_resource_accounts(data)
-
-
-def _credits_of(accounts: list) -> float:
-    total = 0.0
-    for item in accounts:
-        if not isinstance(item, dict):
-            continue
-        total += _package_remain(item)
-    return max(0.0, total)
-
-
-async def fetch_credits(auth: dict) -> tuple[bool, int | float | None, str]:
-    """查询账号**实时**积分余额。
+async def fetch_credits(auth: dict) -> tuple[bool, int | float | None, str, list[dict]]:
+    """查询账号**实时**积分余额与各套餐到期时间。
 
     为什么必须由管理端自己查：workbuddy2api 只在它的定时任务
     （签到 / 保活时刻）刷新 credits，之后 /status 里一直是旧值；
     手动签到也不会触发它刷新。因此要拿到当前余额只能直接调腾讯接口。
 
     口径与上游保持一致：优先取套餐的 CycleCapacityRemain，
-    无 Cycle 字段时退回 CapacityRemain（见 upstream.UserResource）。
+    无 Cycle 字段时退回 CapacityRemain（见 upstream.packageRemainUsed）。
     billing 路径按版本分派（国际版无 /v2 前缀优先，与国内版相反）。
-    返回 (ok, credits, message)。
+    返回 (ok, credits, message, expiries)。
+
+    expiries 是 [{'at': epoch 秒, 'amount': 额度}]，按到期时间升序，**只含仍有
+    余额的套餐**（余额为 0 的套餐到期与否不影响任何决策）。上游只用它算一个
+    「快过期总额」的数字、不下发到期时刻，所以倒计时只能我们自己在这里取。
     """
     access_token = str(auth.get('access_token') or '')
     if not access_token:
-        return False, None, '该账号无有效 accessToken'
+        return False, None, '该账号无有效 accessToken', []
     realm = realm_of(auth)
 
     now = time.time()
+    # 时间窗用本机时区格式化，**照抄上游**（其 getUserResourceBody 用 now.Format）。
+    # 这与下面解析 CycleEndTime 时固定 UTC+8 不一致，看着像 bug，其实是上游原样：
+    # 这个窗口只是「往后 101 年、从今天起」的粗过滤，8 小时偏移不会漏掉任何套餐
+    # （窗口边界离真实到期时间有 101 年的余量）。而解析出来的到期时刻要展示给
+    # 用户、还要跟腾讯官网对账，那里的 8 小时偏移是看得见的错误 —— 两处要求不同，
+    # 因此口径也就不同。不要「顺手统一」，那会偏离上游行为。
     body = {
         'PageNumber': 1,
         'PageSize': 100,
@@ -293,22 +380,30 @@ async def fetch_credits(auth: dict) -> tuple[bool, int | float | None, str]:
         assert resp is not None
         code, data = _envelope(resp)
         if code != 0 or not data:
-            return False, None, f'查询失败 code={code}'
+            return False, None, f'查询失败 code={code}', []
 
         accounts = _extract_resource_accounts(data)
         if accounts is None:
-            return False, None, '响应结构无法识别'
+            return False, None, '响应结构无法识别', []
 
         total = 0.0
+        expiries: list[dict] = []
         for item in accounts:
             if not isinstance(item, dict):
                 continue
-            total += _package_remain(item)
-        # 上游会把负值钳为 0；保留小数以贴近官方展示
-        total = max(0.0, total)
-        return True, (int(total) if total.is_integer() else round(total, 2)), '查询成功'
+            # 逐个套餐钳负值**再**累加，与上游同序（其 `if r < 0 { r = 0 }` 在
+            # `remain += r` 之前）。顺序不能换：先求和再钳的话，一个 -100 的坏
+            # 套餐会从合计里扣掉 100，而上游只把它当 0 —— 同一个账号我们显示的
+            # 余额会比上游少，用户对不上账。
+            remain = max(0.0, _package_remain(item))
+            total += remain
+            at = _package_expiry(item) if remain > 0 else None
+            if at is not None:
+                expiries.append({'at': at, 'amount': _round_credits(remain)})
+        expiries.sort(key=lambda e: e['at'])
+        return True, _round_credits(total), '查询成功', expiries
     except Exception as exc:  # noqa: BLE001
-        return False, None, f'查询异常: {exc}'
+        return False, None, f'查询异常: {exc}', []
 
 
 async def fetch_models(auth: dict) -> tuple[bool, list | str]:
@@ -319,53 +414,118 @@ async def fetch_models(auth: dict) -> tuple[bool, list | str]:
     只暴露 id / context_length / max_output_tokens。要做「模型中心」这类
     带显示名与能力的展示，只能照上游约定直连腾讯接口（同一路径、同一信封）。
 
-    口径与上游 FetchModels 保持一致：
-      - 只取 agents 里名为 `cli` 的模型 id 列表（那才是对 CLI 暴露的）
-      - `disabled` 的条目不收录
-      - **过滤非对话模型**（上游 2026-09-14 新增）：见 `_non_chat_model`。
-        不过滤的话，模型中心会列出嵌入/补全/图片生成这类模型，用户选中后
-        聊天直接报 `code=11102`（上游明确说「选了报错」）。
-    路径按版本分派：国际版 `/v2/enterprises/personal/models` 优先、
-    `/console/...` 回落；国内版直接 `/console/...`。
+    **模型目录是两级取数**（照官方客户端，上游 2026-09-15 commit 0adc345 修的同
+    一件事）：企业端点（国内 `/console/...`、国际 `/v2/...` → `/console/...`）**加上**
+    `/v3/config`。只探测企业端点会丢掉 `/v3/config` 独有的模型——实测国际版少了
+    `deepseek-v4.1-flash`、`gpt-6-astra`、`hy4-preview-f`、`kimi-k2.8-preview`
+    四个（用户报的「国际版没有 DeepSeek」即此）。两路**并发**，任一路失败降级用
+    另一路（都失败才算失败）。
+
+    两域口径各自保留（上游两域各走各的解析）：
+      - 国内版（上游 FetchModels）：企业端点按 agents 的 `cli` 列表过滤；
+      - 国际版（上游 parseGlobalModelNames）：企业端点取 `data.models` **全量**，
+        不看 agents——国际版模型目录不由国内版的 `cli` 白名单定义；
+      - `/v3/config` 两域都是**全量**（它没有 agents），但要过非对话过滤。
+      - `disabled` 的条目不收录，跳过无 id 的条目。
+
+    合并口径与上游一致：`/v3/config` 条目为主（同 id 时字段以它为准），企业端点
+    只补它没有的模型；输出顺序稳定（v3 在前、企业端点补充项在后）。
+
     返回 (ok, models 或错误信息)。不含任何凭据。
     """
     access_token = str(auth.get('access_token') or '')
     if not access_token:
         return False, '该账号无有效 accessToken'
     realm = realm_of(auth)
-    paths = (
+    uid = str(auth.get('uid') or '')
+    enterprise_paths = (
         ['/v2/enterprises/personal/models', '/console/enterprises/personal/models']
         if realm == GLOBAL
         else ['/console/enterprises/personal/models']
     )
-    try:
-        data = None
+
+    async def _probe(paths: list[str]) -> tuple[object | None, str]:
+        """按候选路径顺序取第一个成功响应，返回 (data, 错误说明)。"""
         last_code = -1
-        async with config.http_client(config.TENCENT_TIMEOUT, connect=5) as client:
-            for path in paths:
-                resp = await client.get(
-                    f'{chat_base(realm)}{path}', headers=_hdr(realm, access_token)
-                )
-                code, body = _envelope(resp)
-                last_code = code
-                if code == 0 and isinstance(body, dict):
-                    data = body
-                    break
-        if not isinstance(data, dict):
-            return False, f'模型接口返回 code={last_code}'
-    except Exception as exc:  # noqa: BLE001
-        return False, f'模型接口异常: {exc}'
+        try:
+            async with config.http_client(config.TENCENT_TIMEOUT, connect=5) as client:
+                for path in paths:
+                    resp = await client.get(
+                        f'{chat_base(realm)}{path}',
+                        headers=_hdr(realm, access_token, uid),
+                    )
+                    code, body = _envelope(resp)
+                    last_code = code
+                    if code == 0 and isinstance(body, (dict, list)):
+                        return body, ''
+            return None, f'code={last_code}'
+        except Exception as exc:  # noqa: BLE001
+            return None, f'异常: {exc}'
+
+    # 两路并发：串行会把模型中心的等待时间翻倍，而两路互不依赖。
+    ent_res, v3_res = await asyncio.gather(
+        _probe(enterprise_paths),
+        _probe([V3_CONFIG_PATH]),
+    )
+    ent_data, ent_err = ent_res
+    v3_data, v3_err = v3_res
+    if ent_data is None and v3_data is None:
+        return False, f'模型接口返回 {ent_err}（/v3/config 亦失败：{v3_err}）'
+
+    # 各自解析成「id → 条目」再合并。解析函数与 order 分离，是为了让合并
+    # 能按「主路原序在前、补缺项在后」输出，而不是依赖字典的插入序。
+    ent_items, ent_order = _parse_model_payload(ent_data, realm)
+    v3_items, v3_order = _parse_model_payload(v3_data, realm)
+    if not ent_items and not v3_items:
+        return False, '模型接口未返回任何可用模型'
+
+    merged: dict[str, dict] = {}
+    order: list[str] = []
+    for items, ids in ((v3_items, v3_order), (ent_items, ent_order)):
+        for mid in ids:
+            if mid in merged:
+                continue
+            merged[mid] = items[mid]
+            order.append(mid)
+    out = [merged[i] for i in order]
+    if not out:
+        return False, '模型接口未返回任何可用模型'
+    return True, out
+
+
+def _parse_model_payload(data: object, realm: Realm) -> tuple[dict[str, dict], list[str]]:
+    """把一路响应解析成「id → 条目」与输出顺序。
+
+    容忍两种形态：对象列表（常规）与字符串数组（窄表，只有模型名）。
+    国内版的企业端点按 agents 的 `cli` 列表过滤；国际版与 /v3 全量。
+    """
+    # 窄表形态：data 直接是模型名字符串数组（上游 parseGlobalModelNames 兼容）。
+    if isinstance(data, list):
+        items: dict[str, dict] = {}
+        order: list[str] = []
+        for raw in data:
+            mid = str(raw).strip()
+            if mid and mid not in items:
+                items[mid] = {'id': mid}
+                order.append(mid)
+        return items, order
+
+    if not isinstance(data, dict):
+        return {}, []
 
     raw_models = data.get('models') if isinstance(data.get('models'), list) else []
     agents = data.get('agents') if isinstance(data.get('agents'), list) else []
 
+    # 国内版才用 agents 的 `cli` 白名单；国际版取全量。窄表的 v3 响应没有 agents，
+    # 自然走全量。
     cli_ids: list[str] = []
-    for ag in agents:
-        if isinstance(ag, dict) and ag.get('name') == 'cli':
-            ids = ag.get('models')
-            if isinstance(ids, list):
-                cli_ids = [str(x) for x in ids if x]
-            break
+    if realm != GLOBAL:
+        for ag in agents:
+            if isinstance(ag, dict) and ag.get('name') == 'cli':
+                ids = ag.get('models')
+                if isinstance(ids, list):
+                    cli_ids = [str(x) for x in ids if x]
+                break
 
     info: dict[str, dict] = {}
     for m in raw_models:
@@ -387,13 +547,34 @@ async def fetch_models(auth: dict) -> tuple[bool, list | str]:
             'default_effort': str(reasoning.get('defaultEffort') or '').strip(),
             # 多模态能力：官方 /v1/models 也透出该字段（supports_images）
             'supports_images': bool(m.get('supportsImages')),
-            '_non_chat': _non_chat_model(mid, _as_int(m.get('maxOutputTokens')), tags),
+            # ── 以下为上游 2026-09-15 补齐的模型目录字段（我们直连腾讯，本就能取到）──
+            # 说明：字段名照上游 dynModelEntry 的 JSON 标签（descriptionZh / credits /
+            # tags / vendor …），那是它从同一接口解析出来的实测结果，不是猜的。
+            'description': str(m.get('descriptionZh') or '').strip(),
+            # 积分倍率原文（如 "x0.05"）：同一个 prompt 在不同模型上的扣费倍率，
+            # 用户据此挑更省的模型。仅展示，不参与选号（与上游口径一致）。
+            'credits': str(m.get('credits') or '').strip(),
+            'vendor': str(m.get('vendor') or '').strip(),
+            'tags': [str(t) for t in tags if t],
+            'is_default': bool(m.get('isDefault')),
+            'supports_reasoning': bool(m.get('supportsReasoning')),
+            'supports_tool_call': bool(m.get('supportsToolCall')),
+            'only_reasoning': bool(m.get('onlyReasoning')),
+            # 推理摘要模式（如 "auto"）；与 supportedEfforts 不同源
+            'reasoning_summary': str(reasoning.get('summary') or '').strip(),
+            # 非对话过滤（nes- / 输出≤256 / text-to-image）：**国内版全域**适用
+            # （上游在 CN 的 console 与 v3 两路都做）。国际版不做——那套规则源自
+            # 国内版 harness，套到国际版会重犯「用国内版口径裁剪国际版」的错误。
+            '_non_chat': realm != GLOBAL and _non_chat_model(
+                mid, _as_int(m.get('maxOutputTokens')), tags),
         }
 
-    # cli 列表为空时退回全部未禁用模型：上游此时直接报错，但管理端只是展示，
-    # 给个可用列表比整页空白更有用（来源会在 UI 上如实标注）。
+    # 国内版：cli 列表为空时退回全部未禁用模型（上游此时直接报错，但管理端只是
+    # 展示，给个可用列表比整页空白更有用，来源会在 UI 上如实标注）。
+    # 国际版与 /v3：未取 cli_ids（空）→ 天然走全量。
     ids = cli_ids or list(info.keys())
-    out: list[dict] = []
+    items = {}
+    order = []
     for i in ids:
         item = info.get(i)
         if not item or item['disabled']:
@@ -401,10 +582,9 @@ async def fetch_models(auth: dict) -> tuple[bool, list | str]:
         # 内部标记一律去掉（无论是否命中过滤）——否则它会随 API 响应漏到前端
         if item.pop('_non_chat', False):
             continue
-        out.append(item)
-    if not out:
-        return False, '模型接口未返回任何可用模型'
-    return True, out
+        items[i] = item
+        order.append(i)
+    return items, order
 
 
 def _non_chat_model(mid: str, max_output_tokens: int, tags: list) -> bool:
@@ -456,18 +636,64 @@ def _extract_resource_accounts(data: object) -> list | None:
     return None
 
 
-def _package_remain(item: dict) -> float:
-    """单个套餐的剩余额度，口径与上游 UserResource 一致。"""
-    def num(key: str) -> float:
-        v = item.get(key)
-        return float(v) if isinstance(v, (int, float)) else 0.0
+def _num(item: dict, key: str) -> float:
+    """取数值字段，非数值（含 null / 布尔 / 字符串）一律按 0。"""
+    v = item.get(key)
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return 0.0
+    return float(v)
 
-    cycle_size = num('CycleCapacitySize')
-    cycle_remain = num('CycleCapacityRemain')
-    cycle_used = num('CycleCapacityUsed')
-    if cycle_size > 0 or cycle_remain > 0 or cycle_used > 0:
-        return cycle_remain
-    return num('CapacityRemain')
+
+def _round_credits(v: float) -> int | float:
+    """积分的对外形态：整数去掉小数尾（1000.0 → 1000），否则保留两位。"""
+    return int(v) if float(v).is_integer() else round(float(v), 2)
+
+
+def _package_remain(item: dict) -> float:
+    """单个套餐的剩余额度，口径与上游 packageRemainUsed 逐条对齐。
+
+    两段：有周期额度（CycleCapacitySize>0）时只看 Cycle 三字段，且把 remain 钳进
+    [0, size]、再用 used 反修正一次；没有周期额度时回退 Capacity 三字段。
+
+    钳位不是洁癖：腾讯偶发 `CycleCapacityRemain > CycleCapacitySize` 的脏数据，
+    只钳负值会**高估**余额（上游为此把双份逻辑合并到了这一个函数）。
+    """
+    size = _num(item, 'CycleCapacitySize')
+    if size > 0:
+        remain = min(max(_num(item, 'CycleCapacityRemain'), 0.0), size)
+        used = size - remain
+        cycle_used = _num(item, 'CycleCapacityUsed')
+        if cycle_used > used:
+            used = cycle_used
+            if size >= used:
+                remain = size - used
+        return remain
+    return _num(item, 'CapacityRemain')
+
+
+# 套餐到期时刻：布局与时区都取上游同款（packageEndLayout / softRateResetLoc）。
+# 腾讯给的是 **UTC+8 墙钟**，与容器时区无关——必须显式带 +08:00 解析；若按本机
+# 时区解析（mktime / fromtimestamp），西半球或 UTC 容器上算出的到期时刻会整体
+# 偏移数小时，倒计时跟着错。上游用 time.ParseInLocation(layout, s, UTC+8)，
+# 这里等价。
+_PACKAGE_END_LAYOUT = '%Y-%m-%d %H:%M:%S'
+_PACKAGE_END_TZ = timezone(timedelta(hours=8))
+
+
+def _package_expiry(item: dict) -> int | None:
+    """套餐到期时刻（epoch 秒，绝对时刻）。字段缺失/空/解析失败 → None。
+
+    解析失败返回 None 而不是抛错：到期时间是锦上添花的展示字段，不能因为它
+    让整次积分查询失败（上游对解析失败也是保守忽略）。
+    """
+    raw = item.get('CycleEndTime')
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        naive = datetime.strptime(raw.strip(), _PACKAGE_END_LAYOUT)
+    except ValueError:
+        return None
+    return int(naive.replace(tzinfo=_PACKAGE_END_TZ).timestamp())
 
 
 async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
@@ -496,7 +722,7 @@ async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
     # 账号自带的 domain 若已是完整 URL，说明部署方指定了 base，优先采用
     base = domain if domain.startswith('http') else chat_base(realm)
 
-    headers = _hdr(realm, access_token)
+    headers = _hdr(realm, access_token, uid)
     # chat 是流式路径：Accept 覆盖为流式形态（对齐上游 D6 —— 非流式默认收紧为
     # application/json，只有 chat 才声明 text/event-stream）
     headers['Accept'] = 'application/json, text/event-stream'
@@ -537,14 +763,16 @@ async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
     }
 
     started = _time.time()
+    # 两个版本的路径现在都是恒定的 `/v2/chat/completions`（上游 #119 统一，见
+    # chat_paths 注释）。这里仍按「候选路径」逐个尝试，是因为 chat_paths 返回的
+    # 就是列表、且将来可能再加候选；但**不能**因此以为现在有回落保护 ——
+    # 列表只有一个元素时，404/405 会直接走下面的报错分支。
     try:
         async with config.http_client(config.TENCENT_TIMEOUT, connect=5) as client:
             for path in chat_paths(realm):
                 async with client.stream(
                     'POST', f'{base}{path}', json=payload, headers=headers,
                 ) as resp:
-                    if resp.status_code in (404, 405) and path != chat_paths(realm)[-1]:
-                        continue  # 换下一条候选路径（上游同此回落逻辑）
                     if resp.status_code >= 400:
                         raw = (await resp.aread()).decode('utf-8', errors='replace')
                         code, msg = _parse_error_body(raw, resp.status_code)

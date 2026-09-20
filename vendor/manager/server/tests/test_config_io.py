@@ -144,16 +144,39 @@ class UpstreamConfigRoundTrip(unittest.TestCase):
             wb2api.save_upstream_config({'prompt': {'file': '/a\nb'}})
 
     def test_both_prompt_modes_still_accepted(self) -> None:
-        """两种模式都必须能写入 —— 上游只是改了**缺省值**，没有删掉 custom。
+        """三种模式都必须能写入 —— 上游两次扩过这个枚举，我们都跟上了。
 
-        上游 2026-09-14 把 prompt.mode 缺省从 custom 改成 passthrough（透传
-        客户端原始 system），显式配 custom 仍受支持。管理端不该因为默认值
-        变了就拒绝其中任何一个。
+        上游 2026-09-14 把缺省从 custom 改成 passthrough（透传客户端 system），
+        显式配 custom 仍受支持；2026-09-17 又新增 `append`（开头连续
+        system/developer 块之后插网关 system，既有消息逐字不动，其 issue #129）。
+
+        为什么这条重要：管理端的白名单是**独立于上游**的一份校验，上游加了新取值
+        而这里没跟，用户填合法值会被面板拒掉（「上游支持、面板说不合法」）；反过来
+        若面板放行了上游不认的值，用户会存进一份让上游**启动即失败**的配置
+        （上游 normalizePrompt 对非法值是 fail fast），表现为「保存成功然后上游挂了」。
         """
-        for mode in ('passthrough', 'custom'):
+        for mode in ('passthrough', 'custom', 'append'):
             write_cfg(self.cfg_path, {'prompt': {'mode': 'passthrough'}})
             wb2api.save_upstream_config({'prompt': {'mode': mode}})
             self.assertEqual(read_cfg(self.cfg_path)['prompt']['mode'], mode)
+        # 大小写/空白仍归一化
+        write_cfg(self.cfg_path, {'prompt': {'mode': 'passthrough'}})
+        wb2api.save_upstream_config({'prompt': {'mode': ' Append '}})
+        self.assertEqual(read_cfg(self.cfg_path)['prompt']['mode'], 'append')
+
+    def test_prompt_mode_whitelist_matches_upstream(self) -> None:
+        """白名单必须与上游 `normalizePrompt` 的取值集**逐项一致**。
+
+        上游源码（cmd/server/config.go）的 switch 只认这三个；多一个或少一个
+        都会造成上面说的两种故障。写成显式断言，便于上游再扩时一眼看到要改哪里。
+        """
+        upstream_values = {'', 'passthrough', 'custom', 'append'}  # 空串 = 缺省 passthrough
+        for value in sorted(upstream_values - {''}):
+            write_cfg(self.cfg_path, {'prompt': {'mode': 'passthrough'}})
+            wb2api.save_upstream_config({'prompt': {'mode': value}})  # 不抛错即通过
+        for bogus in ('replace', 'degraded', 'none', 'appendx'):
+            with self.assertRaises(ValueError, msg=bogus):
+                wb2api.save_upstream_config({'prompt': {'mode': bogus}})
 
     def test_empty_prompt_section_is_not_invented(self) -> None:
         """配置里没有 prompt 段时，不该被管理端凭空造出来。
@@ -414,6 +437,194 @@ class ExpiryFallback(unittest.TestCase):
         a = self._acct('3')
         self.assertIsNone(a['ttl_seconds'])
         self.assertIsNone(a['issued_at'])
+
+
+class GlobalInFlightTierTest(unittest.TestCase):
+    """国际版在途上限分档（上游 2680f4c 新增 `pool.max_in_flight_global`）。
+
+    上游给 global 域单独的并发上限（官方默认 2），因为国际版风控更严。
+    面板要能设置它 —— 两个容易忽略的点：
+
+      1. **保存别的 pool 字段时不能把它弄丢**。`save_upstream_config` 是逐字段
+         update（`cfg[field].update(clean)`），看着安全，但那是实现的偶然性质
+         而非契约；钉住它，免得将来改成整体替换时静默丢字段。
+      2. **要享受区间校验**。不登记进 `_INT_RANGES` 的话未知键被原样透传，
+         用户填个 -1 也能写进上游配置。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cfg_path = Path(self._tmp.name) / 'config.json'
+        self._orig = config.UPSTREAM_CONFIG
+        config.UPSTREAM_CONFIG = self.cfg_path
+
+    def tearDown(self) -> None:
+        config.UPSTREAM_CONFIG = self._orig
+        try:
+            self._tmp.cleanup()
+        except PermissionError:
+            pass
+
+    def _write(self, data: dict) -> None:
+        self.cfg_path.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+
+    def _read(self) -> dict:
+        return json.loads(self.cfg_path.read_text(encoding='utf-8'))
+
+    def test_field_is_writable(self) -> None:
+        self._write({'pool': {'max_in_flight': 3, 'max_in_flight_global': 2}})
+        wb2api.save_upstream_config({'pool': {'max_in_flight_global': 4}})
+        self.assertEqual(self._read()['pool']['max_in_flight_global'], 4)
+
+    def test_not_lost_when_saving_sibling_field(self) -> None:
+        """改 max_in_flight 时不能把分档字段弄丢。"""
+        self._write({'pool': {'max_in_flight': 3, 'max_in_flight_global': 2}})
+        wb2api.save_upstream_config({'pool': {'max_in_flight': 5}})
+        pool = self._read()['pool']
+        self.assertEqual(pool['max_in_flight'], 5)
+        self.assertEqual(pool['max_in_flight_global'], 2, '分档字段被弄丢了')
+
+    def test_range_is_validated(self) -> None:
+        """与 max_in_flight 同区间；非法值必须拒绝而不是透传。"""
+        self._write({'pool': {'max_in_flight_global': 2}})
+        for good in (0, 2, 64):
+            wb2api.save_upstream_config({'pool': {'max_in_flight_global': good}})
+            self.assertEqual(self._read()['pool']['max_in_flight_global'], good)
+        for bad in (-1, 65, 'x', True, None):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                wb2api.save_upstream_config({'pool': {'max_in_flight_global': bad}})
+
+
+class DegradeConfigTest(unittest.TestCase):
+    """连败降权参数（上游 cf1e7e5 新增，issue #114）。
+
+    上游对 ErrClient / 传输层这类「只换号不罚」的失败累计计数，连续达阈就把账号
+    **临时出池**（默认 5 次 / 10m，封顶 2h）。三个新键：`degrade_threshold`（整数）、
+    `degrade_cooldown` 与 `degrade_cooldown_max`（时长字符串）。
+
+    面板暂未提供输入框，但**手写在 config.json 里的值必须原样留住** ——
+    保存设置页其它字段时把它弄丢，用户的调参会静默失效（这类「看着保存成功、
+    实际丢字段」最难查）。另外 `degrade_threshold` 要享区间校验（同 breaker_threshold），
+    时长键则靠既有的 `_cooldown` 后缀规则覆盖。
+
+    注意上游把降权账号的 `/status.cooling` 置为 **true**（其 Cooling 口径含
+    degradeUntil），所以界面无需改动就会显示「冷却中」——这里只钉配置读写。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cfg_path = Path(self._tmp.name) / 'config.json'
+        self._orig = config.UPSTREAM_CONFIG
+        config.UPSTREAM_CONFIG = self.cfg_path
+
+    def tearDown(self) -> None:
+        config.UPSTREAM_CONFIG = self._orig
+        try:
+            self._tmp.cleanup()
+        except PermissionError:
+            pass
+
+    def _write(self, data: dict) -> None:
+        self.cfg_path.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+
+    def _read(self) -> dict:
+        return json.loads(self.cfg_path.read_text(encoding='utf-8'))
+
+    def _seed(self) -> None:
+        self._write({'pool': {
+            'max_in_flight': 3, 'degrade_threshold': 5,
+            'degrade_cooldown': '10m', 'degrade_cooldown_max': '2h',
+        }})
+
+    def test_all_three_keys_survive_sibling_save(self) -> None:
+        """改 max_in_flight 时三个降权键都不能丢。"""
+        self._seed()
+        wb2api.save_upstream_config({'pool': {'max_in_flight': 5}})
+        pool = self._read()['pool']
+        self.assertEqual(pool['max_in_flight'], 5)
+        self.assertEqual(pool['degrade_threshold'], 5)
+        self.assertEqual(pool['degrade_cooldown'], '10m')
+        self.assertEqual(pool['degrade_cooldown_max'], '2h')
+
+    def test_threshold_writable_and_range_validated(self) -> None:
+        self._seed()
+        wb2api.save_upstream_config({'pool': {'degrade_threshold': 8}})
+        self.assertEqual(self._read()['pool']['degrade_threshold'], 8)
+        for bad in (-1, 0, 101, 'x', True, None):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                wb2api.save_upstream_config({'pool': {'degrade_threshold': bad}})
+
+    def test_duration_keys_reject_bad_format(self) -> None:
+        """时长键由既有的 `_cooldown` 后缀规则兜底 —— 确认它真的管到这两个新键。
+
+        写错格式（例如中文「10分钟」）会让上游按 0 处理，表现为「降权不生效」，
+        而界面上看不出任何异常。
+        """
+        self._seed()
+        wb2api.save_upstream_config({'pool': {'degrade_cooldown': '30s'}})
+        self.assertEqual(self._read()['pool']['degrade_cooldown'], '30s')
+        for bad in ('十分钟', '10', '', 'abc'):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                wb2api.save_upstream_config({'pool': {'degrade_cooldown': bad}})
+
+
+class CostExploreIntervalTest(unittest.TestCase):
+    """`pool.cost_explore_interval`（上游 2026-09-17 新增）的校验与会话。
+
+    这个键有个别的时长键没有的**危险形态**：上游对它是
+    `time.ParseDuration` 失败即**启动报错**（`cmd/server/config.go:383`），
+    而它既不匹配按 `_cooldown`/`_rate` 后缀的那条规则，也不在任何区间表里 ——
+    不单独登记就等于「保存成功，然后上游起不来」，比当场拒绝难查得多。
+    可达路径是 `POST /api/settings/upstream` 直接透传 body，不经过前端表单。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = config.UPSTREAM_CONFIG
+        self.cfg_path = Path(self._tmp.name) / 'config.json'
+        config.UPSTREAM_CONFIG = self.cfg_path
+        self.cfg_path.write_text(json.dumps({'pool': {}}, ensure_ascii=False), encoding='utf-8')
+
+    def tearDown(self) -> None:
+        config.UPSTREAM_CONFIG = self._orig
+        self._tmp.cleanup()
+
+    def _read(self) -> dict:
+        return json.loads(self.cfg_path.read_text(encoding='utf-8'))
+
+    def test_valid_durations_accepted(self) -> None:
+        for good in ('30m', '1h', '45s', '2d'):
+            with self.subTest(good=good):
+                wb2api.save_upstream_config({'pool': {'cost_explore_interval': good}})
+                self.assertEqual(self._read()['pool']['cost_explore_interval'], good)
+
+    def test_zero_disables_instead_of_being_rejected(self) -> None:
+        """`"0"` 是**合法值**（关停该特性），不能当格式错误拒掉。
+
+        上游显式支持它（`CostExploreIntervalDur = 0` 表示关停，回到旧行为），
+        把它拒掉等于用户没法关掉这个特性。
+        """
+        wb2api.save_upstream_config({'pool': {'cost_explore_interval': '0'}})
+        self.assertEqual(self._read()['pool']['cost_explore_interval'], '0')
+
+    def test_empty_falls_back_to_upstream_default(self) -> None:
+        """留空 = 用上游默认（30m），与上游「空值回落默认」的行为一致。"""
+        wb2api.save_upstream_config({'pool': {'cost_explore_interval': ''}})
+        self.assertEqual(self._read()['pool']['cost_explore_interval'], '')
+
+    def test_bad_format_rejected(self) -> None:
+        """格式错误必须**当场拒绝** —— 放行会让上游启动失败。"""
+        for bad in ('not-a-duration', '30', '-5m', '十分钟', '1.5h'):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                wb2api.save_upstream_config({'pool': {'cost_explore_interval': bad}})
+
+    def test_survives_sibling_save(self) -> None:
+        """改同节其它键时不能把它丢掉。"""
+        wb2api.save_upstream_config({'pool': {'cost_explore_interval': '1h'}})
+        wb2api.save_upstream_config({'pool': {'max_in_flight': 5}})
+        pool = self._read()['pool']
+        self.assertEqual(pool['cost_explore_interval'], '1h')
+        self.assertEqual(pool['max_in_flight'], 5)
 
 
 if __name__ == '__main__':

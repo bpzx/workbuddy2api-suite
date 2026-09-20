@@ -81,23 +81,116 @@ def _load_token(filename: str) -> str:
     return str((raw.get('auth') or {}).get('accessToken') or '')
 
 
-def _decorate(items: list[dict]) -> list[dict]:
-    return [
-        {
-            'id': m.get('id', ''),
+# ── 推理档位静态兜底表（按版本分表，镜像上游 effort_catalog.go）──
+#
+# 来源：上游 2026-09-15 PR #92 引入的产品级兜底表（其注释注明照抄官方参考仓库
+# 的 CODEBUDDY_FALLBACK_MODELS / WORKBUDDY_FALLBACK_MODELS）。腾讯接口对部分
+# 模型不返回 supportedEfforts，而官方客户端确实支持多档强度——只依赖远端会让
+# 模型中心显示「不支持推理」，与真实能力不符（用户报的 issue #8）。
+#
+# **两个版本的表绝不混用**：同一模型在两个版本下的档位可能不同
+# （deepseek-v4.1-flash：国内版 low/high/max，国际版仅 high）。
+# 这张表是「远端没给时的兜底」，远端给了就以远端为准（见 _decorate）。
+_EFFORT_FALLBACK: dict[str, dict[str, dict]] = {
+    'cn': {
+        'deepseek-v4-flash': {'efforts': ['low', 'high', 'max']},
+        'deepseek-v4.1-flash': {'efforts': ['low', 'high', 'max'], 'default': 'high'},
+        'deepseek-v4-pro': {'efforts': ['low', 'high', 'xhigh'], 'default': 'high'},
+        'hy4-preview': {'efforts': ['high'], 'default': 'high'},
+        'hy4-preview-x': {'efforts': ['high']},
+        'hy3': {'efforts': ['low', 'high'], 'default': 'high'},
+        'hy3-x': {'efforts': ['low', 'high'], 'default': 'high'},
+        'glm-5.3': {'efforts': ['low', 'high', 'max'], 'default': 'high'},
+        'glm-5.3-flash': {'efforts': ['low', 'high', 'max'], 'default': 'high'},
+        'glm-5.2': {'efforts': ['high', 'xhigh'], 'default': 'high'},
+        'glm-5.1': {'efforts': ['medium']},
+        'glm-5v-turbo': {'efforts': ['medium']},
+        'kimi-k3-1': {'efforts': ['medium']},
+        'kimi-k2.7': {'efforts': ['medium']},
+        'kimi-k2.6': {'efforts': ['medium']},
+        'minimax-m3': {'efforts': ['medium']},
+    },
+    'global': {
+        'fast-model': {'efforts': ['medium']},
+        'balanced-model': {'efforts': ['medium']},
+        'primary-model': {'efforts': ['high']},
+        'hy4-preview-f': {'efforts': ['high'], 'default': 'high'},
+        'hy3': {'efforts': ['low', 'high'], 'default': 'high'},
+        'deepseek-v4.1-flash': {'efforts': ['high']},
+        'gpt-6-astra': {'efforts': ['low', 'medium', 'high', 'xhigh', 'max'], 'default': 'high'},
+        'gpt-5.6-sol': {'efforts': ['low', 'medium', 'high', 'xhigh', 'max'], 'default': 'high'},
+        'gpt-5.6-terra': {'efforts': ['low', 'medium', 'high', 'xhigh', 'max'], 'default': 'high'},
+        'gpt-5.6-luna': {'efforts': ['low', 'medium', 'high', 'xhigh', 'max'], 'default': 'high'},
+        'gpt-5.5': {'efforts': ['low', 'medium', 'high', 'xhigh'], 'default': 'high'},
+        'gpt-5.4': {'efforts': ['low', 'medium', 'high', 'xhigh'], 'default': 'high'},
+        'gpt-5.3-codex': {'efforts': ['medium']},
+        'gemini-3.5-flash': {'efforts': ['medium']},
+        'glm-5.3': {'efforts': ['low', 'high', 'max'], 'default': 'high'},
+        'glm-5.2': {'efforts': ['high', 'xhigh'], 'default': 'high'},
+        'kimi-k3': {'efforts': ['medium']},
+        'kimi-k2.6': {'efforts': ['medium']},
+    },
+}
+
+
+def _decorate(items: list[dict], realm: str = 'cn') -> list[dict]:
+    """规范化模型条目，并按三级规则补齐推理档位。
+
+    三级（镜像上游 `EffortListing`，2026-09-15 PR #92 引入）：
+      1. 远端返回了档位 → 用它（权威）；
+      2. 远端没有 → 用**产品级静态兜底表**（按 realm 分表，见 _EFFORT_FALLBACK）；
+      3. 两者皆无 → 空数组（界面显示「—」，不编造）。
+
+    为什么必须有第 2 级：腾讯接口对部分模型（如 deepseek-v4.1-flash）不返回
+    supportedEfforts，而官方客户端确实支持多档强度。只依赖远端会让模型中心
+    显示「不支持推理」，与真实能力不符（用户报的 issue #8 即此）。
+
+    兜底表**按版本分表且不混用**：同一模型在两个版本下的档位可能不同
+    （deepseek-v4.1-flash：国内版三档、国际版仅 high），混用会把国际版
+    显示成支持国内版的档位。
+    """
+    out = []
+    for m in items:
+        mid = str(m.get('id') or '')
+        if not mid:
+            continue
+        remote = [str(x) for x in (m.get('efforts') or []) if x]
+        default = str(m.get('default_effort') or '').strip()
+        if remote:
+            efforts, eff_default = remote, default
+        else:
+            cap = _EFFORT_FALLBACK.get(realm, {}).get(mid)
+            efforts = list(cap['efforts']) if cap else []
+            eff_default = str(cap.get('default') or '') if cap else ''
+        # 默认档必须在支持列表内才有效（镜像上游的 containsEffort 校验）
+        if eff_default and eff_default not in efforts:
+            eff_default = ''
+        out.append({
+            'id': mid,
             'name': m.get('name') or '',
             'context_length': int(m.get('context_length') or 0),
             'max_output_tokens': int(m.get('max_output_tokens') or 0),
-            'efforts': list(m.get('efforts') or []),
-            'series': series_of(str(m.get('id') or '')),
-            # 上游解析出并用于 thinking 决策的默认推理档位；空 = 未声明
-            'default_effort': str(m.get('default_effort') or ''),
+            'efforts': efforts,
+            'series': series_of(mid),
+            # 默认推理档位；空 = 未声明（由上游自行回退到硬编码默认）
+            'default_effort': eff_default,
             # 多模态能力（官方 /v1/models 也透出 supports_images）
             'supports_images': bool(m.get('supports_images')),
-        }
-        for m in items
-        if m.get('id')
-    ]
+            # ── 上游 2026-09-15 补齐的目录字段 ──
+            # 模型描述（腾讯的 descriptionZh，中文）
+            'description': str(m.get('description') or ''),
+            # 积分倍率（如 "x0.05"）：同一 prompt 在不同模型上的扣费倍率，
+            # 用户据此挑更省的模型。仅展示，不参与选号（与上游口径一致）。
+            'credits': str(m.get('credits') or ''),
+            'vendor': str(m.get('vendor') or ''),
+            'tags': list(m.get('tags') or []),
+            'is_default': bool(m.get('is_default')),
+            'supports_reasoning': bool(m.get('supports_reasoning')),
+            'supports_tool_call': bool(m.get('supports_tool_call')),
+            'only_reasoning': bool(m.get('only_reasoning')),
+            'reasoning_summary': str(m.get('reasoning_summary') or ''),
+        })
+    return out
 
 
 async def catalog(realm: str = 'cn', force: bool = False) -> dict:
@@ -152,7 +245,7 @@ async def _build(realm: str, force: bool = False) -> dict:
                                                'domain': acct.get('domain', '')})
         if ok and isinstance(data, list) and data:
             return {
-                'models': _decorate(data),
+                'models': _decorate(data, realm),
                 'source': 'tencent',
                 'source_label': '腾讯模型接口（含显示名与推理档位）',
                 'via': acct.get('nickname') or acct.get('uid') or '',
@@ -170,12 +263,12 @@ async def _build(realm: str, force: bool = False) -> dict:
         )
         if isinstance(items, list) and items:
             picked = [_strip_realm_prefix(m) for m in items if _belongs(m, realm)]
-            picked = [m for m in picked if m.get('id')]
+            picked = [_map_upstream_model_fields(m) for m in picked if m.get('id')]
             if picked:
                 return {
-                    'models': _decorate(picked),
+                    'models': _decorate(picked, realm),
                     'source': 'upstream',
-                    'source_label': '上游 /v1/models（字段有限：无显示名与推理档位）',
+                    'source_label': '上游 /v1/models（无显示名；推理档位取上游透出值）',
                     'via': 'workbuddy2api',
                     'errors': errors,
                 }
@@ -190,6 +283,39 @@ async def _build(realm: str, force: bool = False) -> dict:
         'via': '',
         'errors': errors,
     }
+
+
+# 上游 /v1/models 的字段名 → 我们内部统一的字段名。
+# 上游 2026-09-15 起大幅补齐了这些字段（PR 见其 commit 318182a/31e3b45/b67f061），
+# 此前 /v1/models 只有 id/context_length/max_output_tokens，所以我们才要直连腾讯。
+_UPSTREAM_FIELD_MAP = {
+    'reasoning_supported_efforts': 'efforts',
+    'reasoning_default_effort': 'default_effort',
+    'reasoning_summary': 'reasoning_summary',
+}
+
+
+def _map_upstream_model_fields(m: dict) -> dict:
+    """把上游 `/v1/models` 的字段名映射成我们内部统一的形状。
+
+    两处来源不同、名字不同，必须在入口处收敛，否则 _decorate 要认两套命名：
+      * 推理档位：上游叫 `reasoning_supported_efforts`（它的命名），
+        腾讯接口叫 `reasoning.supportedEfforts`（我们直连时解析出来的）；
+      * 其余字段（name/description/credits/tags/vendor/能力标志）**两边同名**，
+        直接透传即可。
+
+    历史上这里只映射了档位字段——那时上游 /v1/models 里没有别的字段可映射。
+    """
+    out = dict(m)
+    for src, dst in _UPSTREAM_FIELD_MAP.items():
+        if src in m:
+            if dst == 'efforts':
+                out[dst] = [str(x) for x in (m.get(src) or []) if x]
+            else:
+                out[dst] = str(m.get(src) or '')
+    if 'supports_images' in m:
+        out['supports_images'] = bool(m.get('supports_images'))
+    return out
 
 
 def _strip_realm_prefix(m: dict) -> dict:

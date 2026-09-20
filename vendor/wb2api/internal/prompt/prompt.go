@@ -41,6 +41,66 @@ func Load(mode, file string) (string, error) {
 	return string(raw), nil
 }
 
+// Append 解析 OpenAI 请求体并在"开头连续 system/developer 块"之后插入一条
+// 网关自有 system 提示词（issue #129 append 模式）：
+//   - 开头连续块 = 从 messages[0] 起向后 role 为 system/developer（精确字符串
+//     匹配，与 Rewrite 删除口径一致）的消息；遇第一条非 system/developer
+//     消息（含非 map 消息、无 role 消息）即停；
+//   - 插入点 = 连续块末尾之后（块长 0 时即 messages 最前）；
+//   - 所有既有消息（含开头块、中途 system、user/assistant/tool）逐字不动
+//     ——客户端项目规范/工具约定与网关提示词并用。
+//
+// 守卫与 Rewrite 逐条一致：空 body / 空 systemPrompt / 坏 JSON → 原样返回
+// （绝不失败）；无 messages 字段 → messages=[网关 system]，其余字段原样。
+//
+// 边界判定须显式同时匹配 system 与 developer：归一（developer→system）在
+// 下游 prepareBody 的 normalizeRoles，Append 执行时开头块里的 developer
+// 还是 developer。网关消息角色用 system 而非 developer——上游 role 白名单
+// 不含 developer，插 developer 等于制造一次必然归一与多余的 11128 风险窗口。
+func Append(body []byte, systemPrompt string) []byte {
+	if len(body) == 0 || systemPrompt == "" {
+		return body
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body
+	}
+	msgs, ok := obj["messages"].([]any)
+	if !ok {
+		// 无 messages 字段或类型不符 → 插入单条 system 后原样保留其余字段。
+		obj["messages"] = []any{map[string]any{"role": "system", "content": systemPrompt}}
+		if out, err := json.Marshal(obj); err == nil {
+			return out
+		}
+		return body
+	}
+	// 扫描开头连续 system/developer 块，遇第一条非 system/developer 即停。
+	insertAt := 0
+	for _, m := range msgs {
+		mm, ok := m.(map[string]any)
+		if !ok {
+			break
+		}
+		role, _ := mm["role"].(string)
+		if role != "system" && role != "developer" {
+			break
+		}
+		insertAt++
+	}
+	gw := map[string]any{"role": "system", "content": systemPrompt}
+	// 已有消息逐字不动：只在插入点拼接，不重排、不改写任何元素。
+	rewritten := make([]any, 0, len(msgs)+1)
+	rewritten = append(rewritten, msgs[:insertAt]...)
+	rewritten = append(rewritten, gw)
+	rewritten = append(rewritten, msgs[insertAt:]...)
+	obj["messages"] = rewritten
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
 // Rewrite 解析 OpenAI 请求体并替换系统提示词：
 //   - 删除 messages 中所有 role 为 system/developer 的消息；
 //   - 在 messages 头部插入一条 {"role":"system","content":systemPrompt}；

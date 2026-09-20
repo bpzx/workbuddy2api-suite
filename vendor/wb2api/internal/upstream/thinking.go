@@ -48,19 +48,25 @@ func isDeepSeekModel(model string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "deepseek")
 }
 
-// backfillReasoningContent DeepSeek 多轮一致性：历史 assistant 消息带 reasoning 痕迹时，
-// 上游要求后续请求所有 assistant 消息都带 reasoning_content 字段（string，可为空串）
-// ——即 requiresReasoningContentOnAssistantMessages（官方客户端 matches 规则）。
+// backfillReasoningContent DeepSeek 多轮一致性：保证每条 assistant 消息带
+// reasoning_content 字段且值为 string——即 requiresReasoningContentOnAssistantMessages
+// （官方客户端 matches 规则，issue #165 对齐官方 apply 门控）。
 //
-// 规则（对齐官方客户端逻辑）：
-//   - 会话内任一 assistant 消息带非空 reasoning（string）或已有 reasoning_content 字段
-//     → 所有 assistant 消息确保有 reasoning_content（string）：
-//   - reasoning 非空且无 reasoning_content → 复制 reasoning 值
-//   - 已有 reasoning_content → 原样保留（不覆盖）
-//   - 两者皆无 → 补空串 ""
-//   - 任何 assistant 均无 reasoning 痕迹 → 零改动（不白白加字段）。
+// 门控（对齐官方 ReasoningContentBackfillRule：thinkingEnabled || hasTrace），
+// thinkingEnabled 取自注入后请求体的 thinking.type == "enabled"（injectThinking 先行，
+// payload.go 管线顺序已保证；本网关对 deepseek 无条件注入 enabled，等价于非 disabled 一律补）：
+//   - 非 deepseek 模型 → 零改动（isDeepSeekModel 闸不动）。
+//   - deepseek + enabled（含 L1 注入后）→ 每条 assistant 保证 reasoning_content 是
+//     string：已有 string 原样保留（不覆盖）；reasoning 是非空 string 且 rc 非 string →
+//     复制 reasoning 值；两者皆无 → 补空串 ""。第三方客户端丢推理回传（零痕迹）形态
+//     下官方本就补，网关此前只移植了 hasTrace 半边（issue #165 修复点）。
+//   - deepseek + disabled + 无痕迹 → 零改动（官方 thinkingEnabled=false 且 ec=false → 不补）。
+//   - deepseek + disabled + 有痕迹 → 照补（官方 hasTrace 半边，双方一致）。
 //
-// 仅 deepseek 模型生效（thinkingFormat:deepseek + requiresReasoningContent）。
+// 归一化对齐官方 "string"!=typeof 语义：reasoning_content 为 null/数字等非 string
+// 值时不算「已有」，落补 ""/复制分支（旧代码键存在即跳过，null 会被当「已有」漏补）。
+// hasTrace = 会话内任一消息带非空 reasoning（string）或已有 reasoning_content 字段
+// （比官方仅扫 assistant 的口径宽，只影响 disabled 分支，装饰性差异）。
 func backfillReasoningContent(obj map[string]any) {
 	model, _ := obj["model"].(string)
 	if !isDeepSeekModel(model) {
@@ -70,7 +76,14 @@ func backfillReasoningContent(obj map[string]any) {
 	if !ok || len(msgs) == 0 {
 		return
 	}
-	// 第一遍：检测是否有任何 reasoning 痕迹（非空 reasoning 或已有 reasoning_content）。
+	// thinkingEnabled 半边：读注入后的 thinking.type（与官方 el.thinkingEnabled 对应）。
+	thinkingEnabled := false
+	if th, ok := obj["thinking"].(map[string]any); ok {
+		if typ, _ := th["type"].(string); strings.EqualFold(strings.TrimSpace(typ), "enabled") {
+			thinkingEnabled = true
+		}
+	}
+	// hasTrace 半边：检测是否有任何 reasoning 痕迹（非空 reasoning 或已有 reasoning_content）。
 	hasTrace := false
 	for _, mm := range msgs {
 		msg, ok := mm.(map[string]any)
@@ -86,10 +99,19 @@ func backfillReasoningContent(obj map[string]any) {
 			break
 		}
 	}
-	if !hasTrace {
+	if !thinkingEnabled && !hasTrace {
 		return
 	}
-	// 第二遍：所有 assistant 消息补/复制 reasoning_content 字段。
+	// 第二遍：所有 assistant 消息补/复制 reasoning_content 字段，并镜像保证
+	// reasoning 字段存在且非空（issue #165 追评——部分账号/租户对 thinking 形态
+	// 校验 len(reasoning)>0：缺失/null/空串 400，空白串 200；官方 CLI 本就给
+	// assistant 挂上一轮 reasoning 文本，见 itemsToMessages 的 applyPendingReasoning）。
+	// 跳过条件只认 string（官方 "string"!=typeof 才动手）：null/数字归一化。
+	//   - reasoning 已是非空 string → 不动；
+	//   - rc 是非空 string → 镜像写入 rc 值（两字段最终都存在且非空）；
+	//   - 两者皆无/皆空 → 补单个空格 " "（上游 len>0 不 trim：空白串过闸、空串
+	//     不过——空白串占位有官方 Moonshot 规则 "-" 同款先例，且对模型上下文
+	//     无语义影响：该字段是透传校验位非内容消费位）。
 	for _, mm := range msgs {
 		msg, ok := mm.(map[string]any)
 		if !ok {
@@ -99,13 +121,24 @@ func backfillReasoningContent(obj map[string]any) {
 		if role != "assistant" {
 			continue
 		}
-		if _, ok := msg["reasoning_content"]; ok {
-			continue // 已有 → 不覆盖
-		}
-		if r, ok := msg["reasoning"].(string); ok {
-			msg["reasoning_content"] = r
+		rc, hasRC := msg["reasoning_content"].(string)
+		if hasRC {
+			// rc 已有 string → 不覆盖（原有语义保留）。
+		} else if r, ok := msg["reasoning"].(string); ok {
+			rc = r
+			msg["reasoning_content"] = rc
 		} else {
-			msg["reasoning_content"] = ""
+			rc = ""
+			msg["reasoning_content"] = rc
+		}
+		// 镜像：reasoning 缺失/null/空串 → 归一化（非空 rc 优先，皆无补 " "）。
+		if r, ok := msg["reasoning"].(string); ok && r != "" {
+			continue // 已非空 → 不覆盖
+		}
+		if rc != "" {
+			msg["reasoning"] = rc
+		} else {
+			msg["reasoning"] = " "
 		}
 	}
 }

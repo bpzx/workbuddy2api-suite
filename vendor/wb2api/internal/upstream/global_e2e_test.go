@@ -464,11 +464,18 @@ func TestGlobalE2EFetchModels(t *testing.T) {
 		captureNonZeroCodes(t, "models:"+p, status, body)
 		if status == 200 {
 			logResp(t, "GlobalModels "+p, status, body, 1200)
-			names, _, _, perr := parseGlobalModelNames(body)
+			names, infos, _, _, perr := parseGlobalModelNames(body)
 			if perr != nil {
 				t.Logf("结论#5: %s 200 但解析失败: %v", p, perr)
 			} else {
 				t.Logf("结论#5: %s 200 返回 %d 个模型名: %v", p, len(names), names)
+				if len(infos) > 0 {
+					mi := infos[0]
+					t.Logf("  富字段样本[0]: id=%s name=%s desc=%.40s credits=%s tags=%v vendor=%s toolCall=%v onlyReasoning=%v maxAllowed=%d reasoning(effort=%s summary=%s) ctx=%d maxout=%d",
+						mi.ID, mi.Name, mi.Description, mi.Credits, mi.Tags, mi.Vendor, mi.SupportsToolCall, mi.OnlyReasoning, mi.MaxAllowedSize, mi.ReasoningEffort, mi.ReasoningSummary, mi.ContextWindow, mi.MaxTokens)
+				} else {
+					t.Logf("  对象形态未命中（窄表）→ infos nil")
+				}
 				probed = true
 				if len(names) == len(GlobalModelNames) {
 					t.Logf("  数量恰等于静态名单 %d → 探测独有=0，overlay 无新增", len(GlobalModelNames))
