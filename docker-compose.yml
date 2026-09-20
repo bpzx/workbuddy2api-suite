@@ -183,6 +183,67 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  # ── updater 侧车（一键更新）────────────────────────────
+  # 本套件**唯一**持有 docker socket 的组件。
+  #
+  # 为什么单独一个侧车，而不是把 socket 也给 manager：
+  # 「一键更新」要拉新镜像并重建容器，必然需要 socket 的拉取/创建能力。
+  # manager 是经 Cloudflare Tunnel **对外**的那一个，攻击面最大，不该拿这种
+  # 能力（等价于宿主机 root）。因此把它收敛到这个只做一件事、约 200 行、
+  # **不发布端口**的最小侧车；manager 只能向它发一个带 token 的固定触发请求。
+  #
+  # 它做的事：收到请求 → 派生一个一次性 helper 容器（不属本项目，避免
+  # `up -d` 重建到自己）→ helper 在宿主机侧执行 compose pull && up -d。
+  #
+  # ⚠️ 启用一键更新需要在 .env 里设置 SUITE_UPDATER_TOKEN（随机值）。
+  #    未设置时侧车照常启动但**拒绝一切更新请求**，面板会显示原因并给出
+  #    可在宿主机直接执行的命令 —— 属于可用的降级，不是故障。
+  #    不想要这个组件时，把整段注释掉即可（面板会退化成同样形态）。
+  updater:
+    image: ${SUITE_IMAGE:-ghcr.io/bpzx/workbuddy2api-suite:latest}
+    container_name: workbuddy-updater
+    restart: unless-stopped
+    command: ["/opt/suite/entrypoint-updater.sh"]
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      WB_SUITE_DATA_DIR: /data
+      # 与 manager 用**同一个** WB_DATA_DIR：这样两边对状态文件路径的理解
+      # 天然一致（都是 /data/manager/suite-update-status.json），不需要再约定
+      # 一个额外的变量，也就不存在"配错路径导致界面读不到进度"的故障。
+      WB_DATA_DIR: /data/manager
+      WB_UPDATER_PORT: "7865"
+      # 空值 = 拒绝所有更新请求（安全默认）。要启用一键更新就在这里给个随机值：
+      #   openssl rand -hex 24
+      SUITE_UPDATER_TOKEN: ${SUITE_UPDATER_TOKEN:-}
+      # 侧车派生的 helper 用哪个镜像。正常情况下侧车自查容器信息就够了，
+      # 这里只是兜底。
+      SUITE_IMAGE: ${SUITE_IMAGE:-ghcr.io/bpzx/workbuddy2api-suite:latest}
+    volumes:
+      # 直连 socket，**不走 dockerproxy**：重建容器需要 pull/创建等一大堆
+      # 代理白名单里刻意关闭的 API，把它们全放开等于让代理失去意义。
+      # 安全边界改为"谁持有它"——只有这个最小侧车持有。
+      - /var/run/docker.sock:/var/run/docker.sock
+      # 套件目录（compose 文件与 .env）。挂到**同一个绝对路径**下是必须的：
+      # 侧车要读回它的宿主机路径交给 helper，而 compose 解析 `./data` 这类
+      # 相对路径时以 --project-directory 为基准 —— 路径一致才能算出正确的
+      # 宿主机路径。只读即可，compose 不需要写它。
+      # 好处：用户不需要配置 SUITE_DIR，也就没有"路径填错"这种故障。
+      - .:/suite:ro
+      # 写更新进度（manager 也从这里读）
+      - ${WB_DATA_PATH:-./data}:/data
+    # 不发布端口：只在内部网络暴露，供 manager 调用
+    expose:
+      - "7865"
+    networks: [suite]
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:7865/healthz >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
 networks:
   suite:
     driver: bridge

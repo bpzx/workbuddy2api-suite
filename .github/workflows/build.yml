@@ -61,18 +61,36 @@ jobs:
             /tmp/patched/manager/server/config.py \
             || { echo "::error::补丁 1 未生效（config.py 缺少 mounts 逻辑）"; exit 1; }
 
-          # 反向断言：这两处补丁**只应**改动代理相关代码。
-          # 若上游前端/更新器被本脚本改动，说明有人又加了脆弱的文案补丁 ——
-          # 那类补丁每次上游改字都会失效，且收益仅是措辞更贴切（见 UPSTREAMS.md）。
-          if grep -q "集成补丁" /tmp/patched/manager/web/components/common/settings/UpdatePanel.tsx; then
-            echo "::error::前端被打了补丁 —— 本发行版不对上游前端做任何改动"
-            exit 1
-          fi
+          # 反向断言：更新器**不得**被补丁改动。
+          # 上游已用 can_update_upstream 做能力驱动判定，我们改用上游的能力，
+          # 不再自己改它的更新逻辑（见 UPSTREAMS.md「曾经打过、现已删除的补丁」）。
           if grep -q "集成补丁" /tmp/patched/manager/server/services/updater.py; then
             echo "::error::更新器被打了补丁 —— 应改用上游的 can_update_upstream 能力驱动"
             exit 1
           fi
-          echo "补丁校验通过（2 处，均在代理相关代码）"
+
+          # 正向断言：overlay 必须真的落位。
+          # 更新面板是**整文件覆写**而不是打补丁，所以这里验证"我们的文件在"，
+          # 而不是验证"没有补丁标记" —— 后者对覆写文件毫无意义。
+          PANEL=/tmp/patched/manager/web/components/common/settings/UpdatePanel.tsx
+          grep -q "SUITE-OVERLAY" "$PANEL" \
+            || { echo "::error::更新面板未被覆写 —— overlay 没落位"; exit 1; }
+          # 上游 test_docker_deploy::test_frontend_uses_capability_flag 断言本文件
+          # 必须出现该标志（用意：界面要把能力边界透出来）。覆写时丢掉它会让 CI 红。
+          grep -q "can_update_upstream" "$PANEL" \
+            || { echo "::error::更新面板丢了 can_update_upstream 能力标志"; exit 1; }
+          for f in server/services/suite.py server/routers/suite.py; do
+            test -f "/tmp/patched/manager/$f" \
+              || { echo "::error::套件更新后端缺失：$f"; exit 1; }
+          done
+          grep -q "suite_router" /tmp/patched/manager/server/main.py \
+            || { echo "::error::main.py 未注册套件路由"; exit 1; }
+          # i18n：新增命名空间必须落到**全部**语系（漏一个，上游 i18n 测试就红）
+          for loc in zh-CN zh-TW en ja ko; do
+            grep -q '"suiteUpdate"' "/tmp/patched/manager/web/lib/i18n/locales/$loc.json" \
+              || { echo "::error::$loc.json 缺少 suiteUpdate 文案"; exit 1; }
+          done
+          echo "补丁校验通过（文本补丁 + 面板覆写 + 新增后端 + i18n 均已落位）"
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -124,7 +142,25 @@ jobs:
         working-directory: /tmp/patched/manager
         run: |
           python -m pip install --quiet -r server/requirements.txt
+          # 先建好 data/：deploy/update.py 把数据目录默认取成 <install_dir>/data，
+          # 并在那里写 upstream-local-changes.patch 备份；而
+          # ComposeCommandTest::test_missing_compose_raises_actionable_error 用的是
+          # **假 Reporter**，不会像真实流程那样 mkdir。
+          #
+          # 上游仓库并不跟踪 data/（已核实），所以**干净检出上这条测试必然
+          # FileNotFoundError** —— 上游自己的 CI 能过，只是因为开发者的工作区里
+          # 恰好有这个目录。这里按"已安装"的布局先把目录建好：这是补上测试预设
+          # 的前提，不是绕过测试（断言本身照常执行）。
+          mkdir -p data
           python -m unittest discover -s server/tests -t . -v
+
+      # 本发行版自己的测试（套件版本语义、tag 挑选、侧车鉴权、状态契约）。
+      # 跑在**打过补丁**的树上，因为被测的 server/services/suite.py 与
+      # server/routers/suite.py 正是由 apply.py 落位进去的。
+      - name: Suite tests (our own overlay code)
+        env:
+          PYTHONPATH: /tmp/patched/manager
+        run: python -m unittest discover -s tests -t tests -v
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -133,8 +169,12 @@ jobs:
           cache: npm
           cache-dependency-path: vendor/manager/web/package-lock.json
 
-      - name: Frontend static export
-        working-directory: vendor/manager/web
+      # ⚠️ 必须构建**打过补丁**的那份前端，而不是 vendor/manager/web。
+      # 更新面板（整文件覆写）与新 i18n 文案都在补丁后的树里：构建未打补丁的树
+      # 等于没有校验我们的 TSX —— 类型错误会一路漏到 Docker 构建才炸，
+      # 而那时报错信息离原因更远。
+      - name: Frontend static export (patched)
+        working-directory: /tmp/patched/manager/web
         run: |
           npm ci
           npm run build:export

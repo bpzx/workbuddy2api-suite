@@ -30,6 +30,10 @@ FROM python:3.11-slim-bookworm AS vpatch
 WORKDIR /src
 COPY vendor/ /src/vendor/
 COPY docker/patches/apply.py /src/patches/apply.py
+# overlay/ 放「本发行版自己写、或整文件覆写」的文件，由 apply.py 在构建期落进
+# vendor 树（新增：套件更新后端；覆写：更新面板 UI）。
+# 必须放在与 patches/ 同级的位置：apply.py 用 __file__ 的上级目录定位它。
+COPY docker/overlay/ /src/overlay/
 RUN python /src/patches/apply.py /src/vendor
 
 # ── 阶段 1：构建前端静态导出 ──────────────────────────────
@@ -39,8 +43,9 @@ WORKDIR /src/web
 COPY --from=vpatch /src/vendor/manager/web/package.json /src/vendor/manager/web/package-lock.json ./
 RUN npm ci
 # 再拷源码构建。build:export = NEXT_OUTPUT_EXPORT=1 next build → out/
-# ⚠️ 必须取自 vpatch：manager/web 的「更新」面板文案带集成补丁（补丁 3），
-# 从构建上下文拷会丢掉补丁，界面上就会继续显示裸机部署的误导文案。
+# ⚠️ 必须取自 vpatch：更新面板（UpdatePanel.tsx）与 i18n 文案都由 apply.py
+# 在 vpatch 阶段落位，从构建上下文拷会丢掉它们 —— 界面会退回上游的
+# 「3 个更新目标」旧面板，且缺少本套件区块的文案。
 COPY --from=vpatch /src/vendor/manager/web/ ./
 RUN npm run build:export \
  && test -f out/index.html
@@ -102,6 +107,36 @@ RUN groupadd -g 10001 app \
 # 而不是直接挂 /var/run/docker.sock。
 COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
 
+# ── docker compose 插件 ───────────────────────────────────
+# 为什么必须自己装：docker 官方那个静态包**不含 compose 插件**
+# （实测 `tar -tzf docker-27.3.1.tgz` 只有 docker/dockerd/ctr/containerd*），
+# 上游 manager 也因此吃过 issue #28（容器内 `up --build` 报 exit 127）。
+# 我们把 CLI 从 docker:29-cli 取出来，同样不带 compose，所以这里补装。
+#
+# 谁需要它：updater 侧车派生的一次性 helper 容器，靠 `docker compose pull`
+# + `up -d` 在宿主机侧重拉镜像并重建全部服务。没有它「一键更新」直接不可用。
+#
+# 装在官方约定的插件目录，文件名必须是连字符 `docker-compose`，
+# `docker compose` 子命令才认得它。
+#
+# **必须停在 compose v2，不要升到 v5**（上游实测记录，见其 ComposeCommandTest）：
+# v5 移除了内置 builder，`up --build` 改为调用外部 buildx 插件且**没有回退
+# 分支**，而本镜像只装 CLI + compose、没有 buildx。v2 有内置 builder 作回退。
+ARG COMPOSE_VERSION=v2.40.3
+RUN set -eux; \
+    case "${TARGETARCH:-$(uname -m)}" in \
+        amd64 | x86_64)  COMPOSE_ARCH=x86_64 ;; \
+        arm64 | aarch64) COMPOSE_ARCH=aarch64 ;; \
+        arm | armv7l)    COMPOSE_ARCH=armv7 ;; \
+        *) echo "compose 插件不支持的架构：${TARGETARCH:-$(uname -m)}" >&2; exit 1 ;; \
+    esac; \
+    mkdir -p /usr/local/lib/docker/cli-plugins; \
+    curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
+        "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-${COMPOSE_ARCH}" \
+        -o /usr/local/lib/docker/cli-plugins/docker-compose; \
+    chmod +x /usr/local/lib/docker/cli-plugins/docker-compose; \
+    docker compose version
+
 # ── wb2api ────────────────────────────────────────────────
 COPY --from=gobuild /out/ /opt/wb2api/
 # 自带脚本与它们 import 的 Python 模块（登录、签到、积分、开学季、夜猫）
@@ -147,7 +182,7 @@ ARG WB2API_COMMIT=unknown
 ARG MANAGER_COMMIT=unknown
 ARG SUITE_VERSION=dev
 LABEL org.opencontainers.image.title="workbuddy2api-suite" \
-      org.opencontainers.image.description="workbuddy2api + workbuddy-manager 容器化整合发行版" \
+      org.opencontainers.image.description="基于 workbuddy2api + workbuddy-manager 构建的容器化发行版" \
       org.opencontainers.image.source="https://github.com/${GITHUB_REPOSITORY}" \
       org.opencontainers.image.version="${SUITE_VERSION}" \
       io.workbuddy2api-suite.upstream.wb2api.repo="Sliverkiss/workbuddy2api" \
@@ -155,9 +190,28 @@ LABEL org.opencontainers.image.title="workbuddy2api-suite" \
       io.workbuddy2api-suite.upstream.manager.repo="ithtelab/workbuddy-manager" \
       io.workbuddy2api-suite.upstream.manager.commit="${MANAGER_COMMIT}"
 
-COPY docker/entrypoint-wb2api.sh docker/entrypoint-manager.sh /opt/suite/
+# ── 套件版本（构建期从 git tag 写入）───────────────────────
+# SUITE_VERSION 由 CI 计算：打了 v* tag 是 v1.2.3，日常 push main 是 sha-xxxxxxx。
+# 它此前**只**进 OCI 标签，运行中的容器无从知道自己是什么版本 —— 而「一键更新」
+# 必须先能比较"当前版本 vs 最新版本"。所以同时写一份文件 + 一个环境变量：
+# 后端 server/services/suite.py 优先读环境变量，回退读文件。
+# 放在 /opt/suite，与 upstreams.json 一起构成镜像自带的血统信息。
+#
+# WB_SUITE_REPO 复用 GITHUB_REPOSITORY（CI 已注入），后端用它查「最新正式版」
+# tag。这样**不需要用户额外配置**套件仓库地址。
+RUN printf '%s' "${SUITE_VERSION}" > /opt/suite/version
+ENV WB_SUITE_VERSION=${SUITE_VERSION} \
+    WB_SUITE_REPO=${GITHUB_REPOSITORY}
+
+COPY docker/entrypoint-wb2api.sh docker/entrypoint-manager.sh \
+     docker/entrypoint-updater.sh /opt/suite/
+# updater 侧车的两个 Python 文件。update_runner.py 会被侧车派生的 helper
+# 容器当 entrypoint 直接执行，所以必须有可执行位（见下面的 chmod）。
+COPY docker/overlay/suite_updater.py docker/overlay/update_runner.py /opt/suite/
 COPY docker/wb2api.config.template.json /opt/suite/
-RUN sed -i 's/\r$//' /opt/suite/*.sh && chmod 755 /opt/suite/*.sh
+# 去 CRLF（Windows 检出可能）：容器内脚本以 \r 结尾会导致 shebang 失效
+RUN sed -i 's/\r$//' /opt/suite/*.sh /opt/suite/*.py \
+ && chmod 755 /opt/suite/*.sh /opt/suite/*.py
 
 # ── Python 依赖 ───────────────────────────────────────────
 # manager 的 requirements 是依赖来源；装完即删清单，不留在镜像里。
@@ -179,8 +233,10 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt \
 # 写不进自己的目录（表现：manager 的版本自愈写 .version 静默失败）。
 # 这与上游 wb2api 镜像的做法一致（先 COPY 再 chown -R app:app /app）。
 #
-# 有意不预置 .version：套件版本由 OCI 标签表达；manager 会按代码里的
-# app.version 显示自己的版本（当前 1.0.25），这正是它设计的行为。
+# 有意不预置 manager 的 .version：那是**上游 manager 自己的**版本痕迹文件，
+# 上游 current_version() 会按代码里的 app.version 自愈它（第一次打开面板就会
+# 写入 /opt/manager/.version）。套件版本是另一条线，由上面的
+# WB_SUITE_VERSION 环境变量 + /opt/suite/version 表达，两者不要混淆。
 RUN mkdir -p /data/auths \
  && chown -R app:app /opt/wb2api /opt/manager /opt/suite /data
 
@@ -197,21 +253,29 @@ RUN ln -s /data/auths /opt/wb2api/auths \
 
 # ── 运行时约定 ────────────────────────────────────────────
 #
-# 版本检测：面板「系统更新」页显示的是上游 manager 的**版本号**变化
-# （如「管理端：v1.0.31 → v1.0.35」），由 manager 的 `current_version()`
-# 读代码里的 app.version（vendored 快照带来的**上游**版本号）与 GitHub 上
-# 上游仓库的最新 Release 比较得出。
+# 版本信息现在有**三条独立的线**，别混淆（面板上分三段显示）：
 #
-# 该提示的用途是**提醒"上游发新版了、该去同步快照"**，不是"本镜像该更新了"
-# （后者走 docker compose pull，由用户手动做）。因此这里**有意不注入任何
-# 覆盖版本的环境变量**，让上游原行为生效。
-# 详见 UPSTREAMS.md 的「构建期补丁登记」。
+#   1. 本套件（WB_SUITE_VERSION，上面写入）：本镜像的版本，来自 CI 的 git tag。
+#      「一键更新」比的就是它 —— 拉新镜像、重建容器。
+#   2. 上游网关 workbuddy2api：固定 commit（/opt/suite/upstreams.json）
+#      对比远端默认分支 HEAD。只报告，不提供更新动作。
+#   3. 上游管理端 workbuddy-manager：快照自带的上游 app.version
+#      （由 manager 的 current_version() 读出）对比上游最新 Release。
+#      也只报告。**注意这个数字是上游的版本号，不是本套件的版本号** ——
+#      历史上它就被误读过（"管理端 v1.0.57 是本项目吗？"），所以新版面板
+#      把它明确放在「上游依赖」区块里。
+#
+# 上游两块之所以只报告不更新：容器里既没有上游 git 仓库，也不该由运行中的
+# 容器去改自己的代码。上游更新一律走宿主机
+# `./scripts/sync-upstreams.sh` → 重建镜像 → `docker compose pull && up -d`。
+# 详见 UPSTREAMS.md。
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     TZ=Asia/Shanghai \
     WB_SUITE_DATA_DIR=/data
 WORKDIR /opt/manager
-EXPOSE 7863 7864
+# 7863 wb2api（不在 compose 里发布到宿主）／7864 管理端／7865 updater 侧车
+EXPOSE 7863 7864 7865
 
 # ⚠️ 这里**故意不写 USER app**，容器以 root 启动，由入口脚本在 chown 数据目录
 # 之后立刻 gosu 降权到 uid 10001，服务进程本身仍是非 root。
