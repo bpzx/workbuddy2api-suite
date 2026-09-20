@@ -82,9 +82,40 @@ jobs:
 
       # 在**打过补丁**的副本上编译与测试：镜像里跑的就是这份代码，
       # 测未打补丁的 vendor/ 会漏掉补丁引入的编译问题。
+      #
+      # ── 为什么固定 TZ=Asia/Shanghai ──
+      # 上游 `cmd/stats` 的标题渲染用 `t.Local()`（见 cmd/stats/main.go），
+      # 而它的测试把期望值硬编码成了 UTC+8 的渲染结果
+      # （`自 09-14 20:43`，对应时间戳 2026-09-14T20:43:52+08:00）。
+      # GitHub runner 默认 UTC → 渲染成 12:43 → 该测试必挂。
+      #
+      # 固定为 Asia/Shanghai 有两个作用：
+      #   1. 与测试的期望一致；
+      #   2. **与本发行版容器内的时区一致**（见 docker/Dockerfile 的 TZ），
+      #      因此 CI 验证的环境更贴近实际运行环境。
+      #
+      # 注：这是上游测试的缺陷（测试未冻结时区），不是本项目的改动。
+      # 上游修好后本设置仍可保留 —— 固定时区本身是好事，
+      # 避免测试结果随 runner 的默认时区变化。
+      #
+      # 实现细节：Linux 上 Go 的 initLocal() 读 $TZ 并到
+      # /usr/share/zoneinfo/<TZ> 找时区文件（见 Go 源码 zoneinfo_unix.go），
+      # 因此**必须有 tzdata**。runner 通常自带，这里显式安装以防万一。
+      - name: Install tzdata (for TZ in tests)
+        run: |
+          if [ ! -f /usr/share/zoneinfo/Asia/Shanghai ]; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq tzdata
+          fi
+          ls -l /usr/share/zoneinfo/Asia/Shanghai
+
       - name: Go build / vet / test (patched)
         working-directory: /tmp/patched/wb2api
+        env:
+          TZ: Asia/Shanghai
         run: |
+          # 留一行时区证据：若将来 tzdata 或 TZ 传递出问题，
+          # 失败的会是 cmd/stats 的时区断言，届时看这里就能定位。
+          echo "runner 时区：$(date '+%Z %z')"
           go build ./...
           go vet ./...
           go test ./...

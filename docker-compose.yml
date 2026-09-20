@@ -15,7 +15,7 @@ name: workbuddy2api-suite
 services:
   # ── 上游网关 ─────────────────────────────────────────────
   wb2api:
-    image: ${SUITE_IMAGE:-ghcr.io/OWNER/workbuddy2api-suite:latest}
+    image: ${SUITE_IMAGE:-ghcr.io/bpzx/workbuddy2api-suite:latest}
     # 容器名必须与 manager 的 WB2API_CONTAINER 一致：manager 用 `docker restart
     # <名字>` 重载账号，经 socket 代理按名字找到本容器。
     container_name: workbuddy2api
@@ -58,7 +58,7 @@ services:
 
   # ── 管理控制台 + 对外网关 ────────────────────────────────
   manager:
-    image: ${SUITE_IMAGE:-ghcr.io/OWNER/workbuddy2api-suite:latest}
+    image: ${SUITE_IMAGE:-ghcr.io/bpzx/workbuddy2api-suite:latest}
     container_name: workbuddy-manager
     restart: unless-stopped
     # 默认 CMD 就是 manager 入口，无需覆盖

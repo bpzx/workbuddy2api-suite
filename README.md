@@ -1,14 +1,32 @@
 # workbuddy2api-suite
 
-把 [workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 与
+基于 [workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 与
 [workbuddy-manager](https://github.com/ithtelab/workbuddy-manager)
-整合为**一个镜像、一条 compose 命令**的发行版。
+构建的**发行版**：把两者锁定到确定的版本、打包成一个预构建镜像，
+并补上它们在容器化部署下缺的几块能力。
 
 - **workbuddy2api**（Go）— 把 CodeBuddy 账号池包装成 OpenAI 兼容接口的反代网关
 - **workbuddy-manager**（FastAPI + Next.js）— 配套的 Web 管理控制台 + 对外多密钥网关
 
-本仓库负责的是**容器化与集成**：镜像构建、compose 编排、容器入口、上游同步。
-两个上游的代码以未修改的快照内置于 `vendor/`，其来源 commit 完整记录于
+## 与直接用上游的区别
+
+两个上游**各自都自带 Dockerfile 与 compose**，所以"能容器化"不是本项目的价值。
+本项目提供的是它们没有的那些：
+
+| 本项目的做法 | 上游的做法 | 为什么要这样 |
+|---|---|---|
+| **出口代理支持**（HTTP/SOCKS5，含鉴权） | ❌ 都没有 | 上游的 Go transport 不读代理环境变量；manager 配了代理后连自己的上游也会绕代理。两处都靠构建期补丁修（见 [`UPSTREAMS.md`](UPSTREAMS.md)） |
+| **单镜像、ghcr 预构建** | 各自 `build: .` 本地构建 | 一次构建、一处版本号；部署机不需要 Go/Node 工具链，`docker compose pull` 即可 |
+| **socket 代理隔离** | 直接挂 `/var/run/docker.sock` | 上游的 manager 需要它来重启/读日志上游容器。裸挂等于把宿主 root 交给该容器；本项目用 `docker-socket-proxy` 只放行所需 API |
+| **版本锁定 + 同步机制** | 跟随各自分支 | `upstreams.json` 记录确切 commit，`sync-upstreams.sh` 一条命令同步，每日漂移检测开 issue。好处是"上游某次更新坏了"时你能明确回退到可用版本 |
+| **三容器一键起** | 各自 compose，需手工组网 | 本项目 compose 把网关、管理端、socket 代理一次编排好 |
+
+> **设计取舍**：上游更新很快（manager 曾从 v1.0.35 到 v1.0.57 跨 50+ 提交），
+> 因此本项目**刻意不去改上游的界面与文案** —— 那类补丁上游一重构就失效，
+> 收益又仅是措辞更贴切。目前只保留 2 处补丁，都在代理相关代码上（上游很少动）。
+> 详见 [`UPSTREAMS.md`](UPSTREAMS.md) 的「曾经打过、现已删除的补丁」。
+
+两个上游的代码以**未修改的快照**内置于 `vendor/`，来源 commit 完整记录于
 [`upstreams.json`](upstreams.json) 与 [`UPSTREAMS.md`](UPSTREAMS.md)。
 
 > ⚠️ **合规须知**：这是**非官方**项目，以上游 CodeBuddy 账号作为服务上游，
@@ -111,6 +129,15 @@ wb2api 只在进程启动时读取 `config.json` 与扫描 `auths/`（无 SIGHUP
 （可 exec 进任意容器、挂载宿主目录）。所以改用 `docker-socket-proxy`，
 只放行 `CONTAINERS`、`POST`、`ALLOW_RESTARTS` 三项，
 并把 `EXEC` / `IMAGES` / `VOLUMES` / `BUILD` / `SECRETS` 等全部显式关闭。
+
+**能力边界（刻意如此）**：这套白名单足以让 manager 重启上游与读日志
+（这正是它需要的），但 **`docker info` 会失败** —— 因为 `/info`
+端点在 `INFO` 段（已关闭）。上游 manager 用 `docker info` 判断"能否操作
+docker"，因此面板上的「更新上游」按钮会显示为**不可用**并提示到宿主机操作。
+
+这是符合本项目预期的：更新走 `docker compose pull`，由你在宿主机执行
+（见 [更新镜像](#更新镜像)）。若你确实想启用面板内更新，需要打开 `INFO` 段
+并放宽容器操作权限 —— 但那会显著扩大该容器的权限，**不建议**。
 
 ---
 

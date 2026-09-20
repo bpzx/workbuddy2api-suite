@@ -2,8 +2,12 @@ MIT License
 
 Copyright (c) 2026 workbuddy2api-suite contributors
 
-本项目（workbuddy2api-suite）是 workbuddy2api 与 workbuddy-manager 的容器化
-整合发行版。它自身只包含容器化与集成层代码（Dockerfile、compose、入口脚本、
+本项目（workbuddy2api-suite）是**基于** workbuddy2api 与 workbuddy-manager
+构建的发行版：把两个上游锁定到确定的版本、打包为一个 ghcr 预构建镜像，
+并补上它们在容器化部署下缺失的能力（出口代理支持、socket 权限隔离、
+版本锁定与同步机制）。
+
+它自身只包含集成层代码（Dockerfile、compose、入口脚本、构建期补丁、
 同步脚本、CI 工作流与文档）；两个上游的代码以**未经修改的快照**形式内置于
 `vendor/` 下，各自的版权归其原作者所有，完整许可证随快照一并保留：
 

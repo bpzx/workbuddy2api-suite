@@ -117,6 +117,42 @@ internal/prompt/prompt.go:17:12: pattern defaultprompt.md: no matching files fou
 > 验证方法（可复现）：起一个 TCP listener 冒充代理，分别用
 > 「只设 Proxy」与「Proxy + DialContext」两个 Transport 发请求，
 > 看 listener 是否收到。两者都收到 → 可共存。
+### 已知的上游测试时区缺陷（CI 固定 TZ 规避）
+
+上游 `cmd/stats` 的标题渲染用 `t.Local()`（`cmd/stats/main.go`），
+而它的测试把期望值**硬编码**成了 UTC+8 的渲染结果：
+
+```go
+// cmd/stats/main_test.go
+Since: "2026-09-14T20:43:52+08:00"   // 测试数据
+if !strings.Contains(frame[0], "自 09-14 20:43")   // 期望：UTC+8 渲染
+```
+
+`t.Local()` 取决于**运行机器时区**，因此：
+
+| 环境 | 渲染结果 | 结果 |
+|---|---|---|
+| GitHub runner（UTC） | `自 09-14 12:43` | **失败** |
+| 本发行版容器 / 国内机器（UTC+8） | `自 09-14 20:43` | 通过 |
+
+**应对**：CI 的 Go 测试步骤固定 `TZ=Asia/Shanghai`
+（并确保 runner 装了 tzdata —— Go 在 Linux 上读 `$TZ` 并到
+`/usr/share/zoneinfo/<TZ>` 找时区文件，见 `zoneinfo_unix.go`）。
+
+选这个方案而非跳过该包或改测试，理由：
+
+* 固定时区与**本发行版容器内的时区一致**（Dockerfile 已设 `TZ=Asia/Shanghai`），
+  CI 验证的环境更贴近实际运行环境；
+* 不改上游代码（跳过测试包会掩盖真实回归，改测试则违反 vendor 不改约定）。
+
+> 影响面已核实：全仓库只有 `cmd/stats` 这一处把 `Local()` 输出写死进断言；
+> 其他时区相关测试（如 `scheduler_test.go`）都用 `time.Local` 做**相对**断言
+> （自己构造、自己比较），与机器时区无关。
+>
+> 另注：`cmd/stats` **未被本发行版的镜像编译**（Dockerfile 只构建 6 个二进制，
+> 不含 stats），它是上游给用户本地用的终端统计工具，因此这个测试缺陷不影响
+> 镜像功能 —— 但因为它住在 `go test ./...` 里，会挡住 CI 构建。
+
 ### 补丁是 fail-fast 的
 
 补丁脚本先断言「锚点文本存在且只出现一次」，不满足就**让构建失败**，
