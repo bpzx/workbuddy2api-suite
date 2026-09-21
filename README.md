@@ -8,6 +8,58 @@
 - **workbuddy2api**（Go）— 把 CodeBuddy 账号池包装成 OpenAI 兼容接口的反代网关
 - **workbuddy-manager**（FastAPI + Next.js）— 配套的 Web 管理控制台 + 对外多密钥网关
 
+## 部署机要求与建议配置
+
+### 必须满足
+
+| 项 | 要求 | 说明 |
+|---|---|---|
+| Docker | Engine + **Compose v2**（即 `docker compose`，不是旧的 `docker-compose`） | compose 文件用了顶层 `name:`（需 Compose v2.3+） |
+| CPU 架构 | `linux/amd64` 或 `linux/arm64` | CI 只构建这两个平台，其余架构需自行构建 |
+| 出网 | 能访问 ghcr.io（拉镜像）、GitHub API（版本检测）、腾讯（网关上游） | 全程不通外网时需配 `WB_HTTP_PROXY`（支持 http/socks5） |
+| 数据目录 | **本地文件系统**，且可 `chown` | 入口脚本以 root 修正属主后降权到 uid 10001。**NFS / 只读挂载会失败**（`.env.example` 里有手工修复说明） |
+| 时钟 | 宿主时间准确 | 镜像内固定 `TZ=Asia/Shanghai`；签到、夜猫等定时任务按本地时区判定 |
+
+### 建议配置（经验值，按账号数与并发调）
+
+| 资源 | 最低 | 建议 | 受什么影响 |
+|---|---|---|---|
+| CPU | 1 核 | 2 核 | 大部分时间在等 I/O（转发 SSE、等上游）；并发上去才吃 CPU |
+| 内存 | 512 MB | 1–2 GB | manager（uvicorn + SQLite）、wb2api（Go，账号池随账号数增长）、前端静态托管 |
+| 磁盘 | 2 GB 可用 | 5 GB 以上 | 镜像本身预计数百 MB 量级（内含 Python 运行时、6 个静态 Go 二进制、docker CLI 与 compose 插件、前端产物）；再加数据目录里日志与用量记录的持续增长 |
+
+> 上面的磁盘数字是**预期值，未在本仓库实测**（本项目没有实跑过镜像构建）。
+> 部署后自己量一下更准：
+>
+> ```bash
+> # 镜像大小（解压后）
+> docker image inspect ghcr.io/bpzx/workbuddy2api-suite:latest --format '{{.Size}}' \
+>   | numfmt --to=iec
+> # 各容器实时 CPU / 内存
+> docker stats --no-stream
+> ```
+
+### 不建议这样部署
+
+- **不要把 7864 直接暴露到公网**。它是唯一对外入口，但应经 Cloudflare Tunnel 或
+  反向代理，并把 `MANAGER_BIND` 设为 `127.0.0.1` —— 否则 IP 白名单、登录失败锁定
+  这些管控会失去意义。配置写法见 [`.env.example`](.env.example) 的
+  「用 Cloudflare Tunnel 上线」一节。
+- **不要把数据目录放在 NFS / 网络盘上**：属主修正会失败，而账号凭证与 SQLite
+  对文件锁与延迟也敏感。
+
+### 平台说明
+
+**Linux 是目标环境**（CI 构建、测试与本文档均以 Linux 为准）。
+macOS / Windows 的 Docker Desktop 可以跑，但有两处请注意，其中一键更新在
+Windows 上**未实测**：
+
+- 一键更新的 helper 会把套件目录按**同一个绝对路径**挂进容器（compose 靠这个
+  才能解析相对路径）。Docker Desktop 在 Windows 上要做 WSL 路径转换，这条路径
+  转换没有实测过。
+- 数据目录的属主由 entrypoint 修正；Docker Desktop 的绑定挂载语义与 Linux 不同，
+  可能在日志里看到属主告警（功能不受影响）。
+
 ## 与直接用上游的区别
 
 两个上游**各自都自带 Dockerfile 与 compose**，所以"能容器化"不是本项目的价值。
@@ -45,7 +97,7 @@
 
 ### 前置条件
 
-- Docker 与 Docker Compose v2
+- 一台满足 [部署机要求与建议配置](#部署机要求与建议配置) 的机器
 - 一个或多个已注册的 CodeBuddy 账号（用于 OAuth 登录）
 
 ### 部署

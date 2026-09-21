@@ -1,10 +1,13 @@
 # workbuddy2api-suite — Docker Compose 部署
 #
-# 三个容器：
+# 四个容器：
 #   wb2api      Go 反代网关（账号池）。**不发布端口**，只在内部网络被 manager 调用。
 #   manager     管理控制台 + 对外多密钥网关。发布 7864，这是唯一对外入口。
 #   dockerproxy socket 代理。让 manager 能 `docker restart/logs wb2api`，
 #               又不把宿主 /var/run/docker.sock 直接交给它。
+#   updater     更新侧车。本套件**唯一**直连 docker socket 的组件，负责
+#               「一键更新」（拉镜像 + 重建容器）。不发布端口，见 README
+#               「一键更新与安全边界」。
 #
 # 为什么 wb2api 不发布 7863：manager 的 /v1 才是对外的正式入口，它带密钥鉴权、
 # 每密钥配额、IP 管控与用量统计。若同时暴露上游 7863，任何人都能用一个共享
