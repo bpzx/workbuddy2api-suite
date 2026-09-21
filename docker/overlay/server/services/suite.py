@@ -53,11 +53,37 @@ UPDATER_TOKEN = os.environ.get('SUITE_UPDATER_TOKEN') or ''
 # 状态文件被认为"仍在进行中"的最长时间，超过即视为异常遗留
 RUNNING_TTL = 3600
 
+# 上游 commit 展示用的缩写长度。**必须与 upstreams.json 的 commit_short 一致** ——
+# 否则面板会同时显示「固定提交 d1023f3 / 远端最新 d1023f37」这种同一个提交的
+# 两种写法，看起来就像"有更新"（已真实发生过，见下面的 same_commit）。
+SHORT_LEN = 7
+
 _SEMVER = re.compile(r'^v?(\d+(?:\.\d+)*)$')
 _GH_HEADERS = {
     'Accept': 'application/vnd.github+json',
     'User-Agent': 'workbuddy2api-suite',
 }
+
+
+def same_commit(a: str, b: str) -> bool:
+    """两个 commit 缩写是否指向**同一个提交**。
+
+    用**前缀**比较，而不是全等：拿到的缩写长度未必一致（我们的
+    upstreams.json 是 7 位，GitHub API 可能给 8 位或完整 40 位），而同一个
+    提交的任意长度前缀必然互为前缀。
+
+    这条曾经写错成 `a != b`，后果是**同一个提交被判成"有更新"**：
+    upstreams.json 里的 `d1023f3`（7 位）与 API 返回后截断的 `d1023f37`（8 位）
+    不相等，于是面板一直提示上游有更新 —— 而它其实已经是最新。
+    上游 updater.py 的判据正是前缀比较
+    （`u_latest.startswith(local_head) or local_head.startswith(u_latest)`），
+    这里与它保持一致。
+    """
+    x = str(a or '').strip().lower()
+    y = str(b or '').strip().lower()
+    if not x or not y:
+        return False
+    return x.startswith(y) or y.startswith(x)
 
 
 # ── 版本工具 ─────────────────────────────────────────────
@@ -138,9 +164,11 @@ def pinned_upstreams() -> dict:
     for name, info in (data.get('upstreams') or {}).items():
         if not isinstance(info, dict):
             continue
+        commit = str(info.get('commit') or '')
         out[name] = {
-            'commit': str(info.get('commit') or ''),
-            'short': str(info.get('commit_short') or (info.get('commit') or '')[:7]),
+            'commit': commit,
+            # 与 API 侧用同一个缩写长度，避免同一个提交显示成两种写法
+            'short': str(info.get('commit_short') or commit[:SHORT_LEN])[:SHORT_LEN],
             'subject': str(info.get('subject') or ''),
             'date': str(info.get('commit_date') or ''),
             'repo': str(info.get('repo') or ''),
@@ -207,7 +235,8 @@ async def _fetch_head_commit(slug: str) -> dict:
             c = commits[0]
             commit = c.get('commit') or {}
             return {
-                'latest': str(c.get('sha') or '')[:8],
+                # 截断到与 upstreams.json 相同的长度（见 SHORT_LEN 的注释）
+                'latest': str(c.get('sha') or '')[:SHORT_LEN],
                 'date': str((commit.get('committer') or {}).get('date') or ''),
                 'subject': str(commit.get('message') or '').split('\n')[0][:120],
             }
@@ -303,8 +332,9 @@ async def check(force: bool = False) -> dict:
     gw = fresh.get('wb2api') or {}
     gw_pin = (pins.get('wb2api') or {}).get('short') or ''
     gw_latest = str(gw.get('latest') or '')
-    # 两边都有值且不同即视为有更新（上游用 commit 比对，没有大小之分）
-    gw_has = bool(gw_pin and gw_latest and gw_pin != gw_latest)
+    # 用前缀比较（same_commit），不能用全等：两边缩写长度可能不同，
+    # 全等会把同一个提交判成"有更新" —— 这个假阳性真实出现过。
+    gw_has = bool(gw_pin and gw_latest) and not same_commit(gw_pin, gw_latest)
 
     mg = fresh.get('manager') or {}
     mg_cur = updater.current_version()

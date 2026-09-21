@@ -65,6 +65,36 @@ class SemverTest(unittest.TestCase):
         self.assertFalse(suite.version_newer('', ''))
 
 
+class SameCommitTest(unittest.TestCase):
+    """commit 缩写比较必须容忍长度不同 —— 这里曾出过一个真实假阳性。"""
+
+    def test_same_commit_across_abbreviation_lengths(self) -> None:
+        """7 位与 8 位缩写是同一个提交。
+
+        真实事故：面板同时显示「固定提交 d1023f3 / 远端最新 d1023f37」并标
+        「有新版本可更新」—— 因为 upstreams.json 的 commit_short 是 7 位，
+        而 API 返回值被截成了 8 位，全等比较判定为不同。
+        """
+        self.assertTrue(suite.same_commit('d1023f3', 'd1023f37'))
+        self.assertTrue(suite.same_commit('d1023f37', 'd1023f3'))
+        # 与完整 40 位 sha 比也要成立
+        self.assertTrue(suite.same_commit('b08f518c9bb21cdf90f93fb671fe99a0637c8e8b', 'b08f518'))
+        self.assertTrue(suite.same_commit('b08f518', 'b08f518c9bb21cdf90f93fb671fe99a0637c8e8b'))
+
+    def test_different_commits_are_not_same(self) -> None:
+        self.assertFalse(suite.same_commit('b08f518', 'fc9ae1a7'))
+        self.assertFalse(suite.same_commit('d1023f3', 'd1023f4'))
+
+    def test_empty_never_matches(self) -> None:
+        """拿不到值时不能算"同一个提交"（否则会漏报真实更新）。"""
+        self.assertFalse(suite.same_commit('', 'd1023f3'))
+        self.assertFalse(suite.same_commit('d1023f3', ''))
+        self.assertFalse(suite.same_commit('', ''))
+
+    def test_case_and_whitespace_tolerated(self) -> None:
+        self.assertTrue(suite.same_commit(' D1023F3 ', 'd1023f37'))
+
+
 class HighestReleaseTagTest(unittest.TestCase):
     def test_picks_max_not_first(self) -> None:
         """GitHub 的 /tags 按提交时间倒序，不是按版本号，所以必须逐个比。"""
@@ -202,6 +232,18 @@ class CheckTest(unittest.TestCase):
         out = self._run('v1.2.3', self._fetch())
         self.assertEqual(out['wb2api']['current'], '')
         self.assertFalse(out['wb2api']['has_update'])
+
+    def test_upstream_gateway_same_commit_shorter_abbrev(self) -> None:
+        """端到端复现那个假阳性：固定提交 7 位、远端 8 位、其实是同一个提交。
+
+        修复前这里会返回 True（面板显示"有新版本可更新"）。
+        """
+        self._pin('d1023f3')
+        out = self._run('v1.2.3', self._fetch(wb2api={'latest': 'd1023f37'}))
+        self.assertFalse(out['wb2api']['has_update'],
+                         '同一个提交的不同长度缩写被误判成"有更新"')
+        self.assertEqual(out['wb2api']['current'], 'd1023f3')
+        self.assertEqual(out['wb2api']['latest'], 'd1023f37')
 
     def test_upstream_manager_uses_its_own_version(self) -> None:
         self._pin('b08f518')

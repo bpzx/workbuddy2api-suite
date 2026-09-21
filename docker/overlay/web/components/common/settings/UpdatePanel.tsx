@@ -253,6 +253,14 @@ export function UpdatePanel() {
             ) : null}
           </div>
           <div className="flex items-center gap-2">
+            {/* 只留「检测更新」一个按钮。
+                这里原本还有一个「刷新」，已删除 —— 它和心跳重复：
+                状态由 useHeartbeat 自动刷新（空闲 20s、更新中 2s，切回标签页
+                立即刷一次），而版本号即便点刷新也走服务端 6 小时缓存、数字不会变。
+                于是它唯一的作用只是"不等那最多 20 秒"，用户也无法从两个几乎
+                一样的刷新图标上分辨差别。
+                而「检测更新」是有真实差别的：它 force=true **绕过缓存**真去查
+                GitHub，并弹提示给出结果 —— 这是它不可替代的地方。 */}
             <Button
               variant="outline"
               size="sm"
@@ -262,10 +270,6 @@ export function UpdatePanel() {
             >
               <RefreshCw className={checking ? 'animate-spin' : ''} />
               {t('suiteUpdate.checkNow')}
-            </Button>
-            <Button variant="outline" size="sm" className="rounded-full" onClick={load} disabled={running}>
-              <RefreshCw className={running ? 'animate-spin' : ''} />
-              {t('common.refresh')}
             </Button>
           </div>
         </div>
