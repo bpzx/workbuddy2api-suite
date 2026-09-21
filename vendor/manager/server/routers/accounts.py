@@ -280,7 +280,7 @@ def _auth_dict(raw: dict) -> dict:
 
 def _load(filename: str) -> dict:
     try:
-        return wb2api.read_account_file(filename)
+        return wb2api.read_account_file_any(filename)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
@@ -838,11 +838,54 @@ async def account_test(filename: str, user: dict = Depends(security.require_admi
 
 @router.post('/accounts/{filename}/refresh')
 async def account_refresh(filename: str, user: dict = Depends(security.require_admin)) -> dict:
+    """刷新该账号的 accessToken（issue #40）。
+
+    **这里真的去续期了**。此前这个端点只是 `reload.restart_now()`——触发一次
+    上游容器重载，而重载既不会刷新 token、也不会改变任何凭证。用户以为按钮会
+    续期、实际什么也没发生（issue #40 报的正是这个），属于**承诺与行为不符**。
+
+    上游没有对外暴露刷新接口（其路由表见 `tencent.refresh_token` 的说明），
+    刷新只发生在它自己的保活排程与选号路径里。所以这里直接实现协议本身。
+
+    流程：读账号 → 调腾讯刷新接口 → **原子写回**新 token（保留 device_token
+    等未知字段）→ 触发一次上游重载让新凭证立刻生效（不重载的话上游要等
+    auths 热加载轮询，旧上游甚至要等重启）。
+    """
     raw = _load(filename)
-    if not (raw.get('auth') or {}).get('accessToken'):
+    auth = raw.get('auth') or {}
+    acct = raw.get('account') or {}
+    if not auth.get('accessToken'):
         return {'ok': False, 'message': '该账号无有效 accessToken'}
-    ok, message = await reload.restart_now()
-    return {'ok': ok, 'message': '已触发上游重载以刷新 Token' if ok else message}
+    if not str(auth.get('refreshToken') or '').strip():
+        return {'ok': False, 'message': '该账号没有 refreshToken —— 只能重新扫码或登录'}
+
+    ok, message, fields = await tencent.refresh_token({
+        'access_token': auth.get('accessToken', ''),
+        'refresh_token': auth.get('refreshToken', ''),
+        'uid': acct.get('uid', ''),
+        'enterprise_id': acct.get('enterpriseId', ''),
+        'domain': auth.get('domain', ''),
+        'realm': auth.get('realm'),
+        'device_token': str(raw.get('device_token') or ''),
+    })
+    if not ok:
+        return {'ok': False, 'message': message}
+
+    try:
+        tencent.update_auth_tokens(filename, fields)
+    except (ValueError, FileNotFoundError, OSError) as exc:
+        # 刷新成功但写不进去：如实说清。**不能报成功**——用户以为续期了，
+        # 而磁盘上还是旧 token，重启后又变回过期状态，比直接失败更难查。
+        return {'ok': False,
+                'message': f'{message}，但写入账号文件失败：{exc}（有效期未保存）'}
+
+    reloaded = await reload.restart_now()
+    return {
+        'ok': True,
+        'message': message + ('，上游已重载生效' if reloaded else '；请手动重启上游以生效'),
+        'reload_triggered': reloaded,
+        'expires_at': fields.get('expires_at'),
+    }
 
 
 @router.delete('/accounts/{filename}')
@@ -869,37 +912,111 @@ async def account_set_disabled(
     body: dict = Body(...),
     user: dict = Depends(security.require_admin),
 ) -> dict:
-    """临时禁用 / 启用一个账号（issue #21）。
+    """临时停用 / 启用一个账号（issue #21、#45）。
 
-    实现是**改文件名**（加/去 `.disabled` 后缀）——上游只加载 `workbuddy*.json`，
-    所以改名后它就不再被加载、从池里消失（详见 `wb2api.set_account_disabled`
-    的说明：上游没有对外暴露禁用接口，改 state.json 也会被 5 秒一次的上位机覆盖）。
+    两种机制，**优先用上游状态位**：
 
-    body: {disabled: bool, reload: bool}。`reload` 默认 true ——
-    旧上游不监听文件变化，不重载就不会生效，而用户点「禁用」时期待的是
-    **立即生效**；新上游（2026-09-18 起）有 5 秒热加载，重载只是为了不等那 5 秒。
-    要批量操作时可以先传 false，最后一次统一重载。
+      · `manual_disabled`（上游 2026-09-19 起的新接口）——语义是「对话流量摘除」
+        而非「账号冻结」：不被选中转发，但**签到 / token 保活 / 猫猫旅行照常执行**，
+        凭证与积分都是活的。这才是「先停一会儿」想要的语义。
+      · **改文件名**（加 `.disabled` 后缀，本面板旧实现）——账号完全退出账号池，
+        连排程任务都不再跑。副作用过大：积分不再增长、token 不再续期，回来时
+        可能已经过期。仅作为回退。
+
+    为什么必须保留回退：上游那组接口**默认不注册**（`admin.enabled` 默认 false，
+    关闭时一律 404——其注释写明是「不向外暴露管理面」的有意设计），旧版本更是
+    根本没有。没有回退的话，这些部署上「停用」按钮会直接失效。
+
+    body: {disabled: bool, reload: bool, reason: str}。
+    `reload` 默认 true，**只对回退的改名路径有意义**（旧上游不监听文件变化，
+    不重载就不生效；新上游有 5 秒热加载，重载只是为了不等那 5 秒）。
+    状态位路径不需要重载——它走的是上游自己的接口。要批量操作时可先传 false。
     """
     if not isinstance(body.get('disabled'), bool):
         raise HTTPException(status_code=400, detail='disabled 必须是布尔值')
     disabled = bool(body['disabled'])
+    reason = str(body.get('reason') or '').strip() or '面板手动停用'
+
+    # uid 用于调上游的状态位接口。用 any 版本读：用户手里的文件名可能与磁盘
+    # 形态不一致（刚停用/刚启用时界面仍持旧名），只按一个名字读会解析不出 uid，
+    # 于是状态位那条路被静默跳过——「点了启用但没恢复」正是这么来的。
+    uid = ''
     try:
-        result = wb2api.set_account_disabled(filename, disabled)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        uid = str((wb2api.read_account_file_any(filename).get('account') or {}).get('uid') or '')
+    except Exception:  # noqa: BLE001
+        uid = ''
 
     reloaded = False
-    if result['changed'] and body.get('reload', True) is not False:
-        reloaded = reload.request_restart()
+    bit_msg = ''
+    bit_code = 'skipped'
+
+    if disabled:
+        # 停用：先试状态位（语义更精确，且不影响任务）；不行再改名。
+        if uid:
+            ok, bit_msg, bit_code = await wb2api.set_manual_disabled(uid, True, reason)
+            if ok:
+                return {
+                    'ok': True,
+                    'file': filename,
+                    'disabled': True,
+                    'changed': True,
+                    'via': 'manual_disabled',
+                    'reload_triggered': False,  # 状态位由上游自己管，无需重载
+                    'message': f'已停用该账号（{bit_msg}）',
+                }
+        try:
+            result = wb2api.set_account_disabled(filename, True)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if result['changed'] and body.get('reload', True) is not False:
+            reloaded = reload.request_restart()
+    else:
+        # 启用：两条路都要清。先解掉改名标记（本地、幂等），再清状态位——
+        # 两种机制理论上不会同时命中同一个账号，但手工改过文件、或跨版本
+        # 升级后就可能出现叠加态，一起清掉才能保证「点了启用就真的启用」。
+        try:
+            result = wb2api.set_account_disabled(filename, False)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        renamed_back = bool(result['changed'])
+        if renamed_back and body.get('reload', True) is not False:
+            reloaded = reload.request_restart()
+        if uid:
+            ok, bit_msg, bit_code = await wb2api.set_manual_disabled(uid, False)
+            if ok:
+                return {
+                    'ok': True,
+                    'file': result['file'],
+                    'disabled': False,
+                    'changed': True,
+                    'via': 'manual_disabled',
+                    'reload_triggered': reloaded,
+                    'message': f'已启用该账号（{bit_msg}）'
+                               + ('，正在重载上游使其生效' if reloaded else ''),
+                }
 
     return {
         'ok': True,
         **result,
+        # 生效方式：manual_disabled = 上游状态位（任务照常）；rename = 改名（回退）
+        'via': 'rename',
+        # 状态位没走通的原因码（no_route / not_found / error / skipped），
+        # 前端据此区分「上游没开管理接口」（给开启提示）与真失败。
+        'bit_code': bit_code,
+        'bit_message': bit_msg,
         # 是否已触发上游重载。未触发时调用方要自己重启，否则改名不生效。
         'reload_triggered': reloaded,
         'message': (
-            f"已{'禁用' if disabled else '启用'}该账号"
+            f"已{'停用' if disabled else '启用'}该账号"
+            # 回退路径要如实说清代价：这条路会让账号退出账号池，任务也停。
+            # 回退路径要如实说清代价，并给出**可操作的下一步**：「该上游未启用管理
+            # 接口」只说了现状，用户不知道去哪儿开（实测反馈正是这个——看到提示后
+            # 只能来问）。所以带上开关位置与生效条件。
+            + ('（该上游未启用管理接口，已改用改名方式：账号将完全退出账号池，'
+               '签到与保活也会一并停止。若要保留签到与保活，请到「设置 → 账号管理'
+               '接口」开启后重启上游容器，再重新停用）'
+               if bit_code == 'no_route' else '')
             + ('，正在重载上游使其生效' if reloaded
-               else ('；请手动重启上游以生效' if result['changed'] else ''))
+               else ('；请手动重启上游以生效' if result.get('changed') else ''))
         ),
     }

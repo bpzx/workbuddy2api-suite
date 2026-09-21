@@ -17,14 +17,25 @@
 
 | 上游 | 仓库 | 分支 | Commit | 提交时间 | 快照位置 |
 |---|---|---|---|---|---|
-| wb2api | [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) | `master` | [`b08f518`](https://github.com/Sliverkiss/workbuddy2api/commit/b08f518c9bb21cdf90f93fb671fe99a0637c8e8b) | 2026-09-19 16:44 | `vendor/wb2api` |
-| manager | [ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) | `main` | [`8bc9b0d`](https://github.com/ithtelab/workbuddy-manager/commit/8bc9b0d959752448f187836a3c05478249b8df85) | 2026-09-19 11:41 | `vendor/manager` |
+| wb2api | [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) | `master` | [`d1023f3`](https://github.com/Sliverkiss/workbuddy2api/commit/d1023f37) | 2026-09-21 09:52 | `vendor/wb2api` |
+| manager | [ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) | `main` | [`3fb56bd`](https://github.com/ithtelab/workbuddy-manager/commit/3fb56bd0) | 2026-09-20 19:48 | `vendor/manager` |
 
-- wb2api：`prompt: 默认提示词换用 GLM5.3 适配版小码酱 spec`
-  （期间含 WAF 403 软冷却 + 轮转退避、global 域并发分档、成长任务链补全）
-- manager：`chore(release): v1.0.57`
-  （面板显示版本 **v1.0.57**；从 v1.0.35 起跨 20+ 版本：i18n 重构、
-  `can_update_upstream` 能力驱动、Windows 原生部署、DeepSeek 多轮修复等）
+- wb2api：`Merge pull request #184 from .../fix/image-url-`（+764/−21，15 个文件）
+  含图片 URL 修复、积分口径、成长任务链、WAF 403 处理等
+- manager：`docs: issue 回复的写法——与更新日志同一条规矩，配自检脚本与守卫`
+  （+6528/−269，55 个文件）**面板显示版本 v1.0.60**；期间跨 v1.0.58 / v1.0.59 /
+  v1.0.60 三个发版，含 `/v1/models` 按模型白名单裁剪、账号管理接口开关、
+  Responses API custom 工具桥接、token 续期、i18n 补齐（新增一条机械检查
+  `test_setting_field_concats_have_translations`）等
+
+> 本次同步顺带修掉一处**配置模板漂移**（此前一直存在，非本次引入）：
+> 上游已 BREAKING 移除 `server.max_body_mb`（请求体改为无上限），而我们的
+> `docker/wb2api.config.template.json` 仍留着它 —— 生成的 `config.json` 会
+> **声称一个不存在的 8MB 限制**（上游容忍旧键，所以不报错、只是说错话）。
+> 现已改为**从上游 example 重新生成**模板，并新增
+> `tests/test_config_template.py` 按**递归键路径**比对，防止再次漂移。
+> 同时补上了模板里缺的 `admin` 段与 `pool` 的 5 个新字段
+> （后者因上游对缺字段套默认值而未造成行为问题，但漏着是隐患）。
 
 > 记录的是**分支 + commit**，不是 Release tag：上游的 CHANGELOG 常滞后于
 > 代码（manager 打完 v1.0.25 后仍有未发版提交），按 tag 记录会失真。

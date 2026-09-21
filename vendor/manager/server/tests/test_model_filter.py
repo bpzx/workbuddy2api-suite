@@ -502,13 +502,21 @@ class UpstreamFallbackPathTest(unittest.TestCase):
 
     def setUp(self) -> None:
         modelcatalog.invalidate()
+        # **`addCleanup` 要传 patcher 本身，不能传 `pat.start()` 的返回值**：
+        # patch 的 start() 返回的是**被装上去的 mock 对象**，它的 `.stop` 是个
+        # 自动生成的 MagicMock 属性——调用它什么都不做。写成
+        # `p = pat.start(); self.addCleanup(p.stop)` 会让 patch **永不撤销**。
+        #
+        # 后果不止本类：`wb2api` 是全局单例模块，那个 mock 会一直留着，后面所有
+        # 依赖 `list_auth_accounts` 的用例都静默拿到 mock 值而走偏（实测：
+        # test_token_renew 单独跑全绿、全量跑 6 红；二分才定位到这里）。
         for pat in (
             mock.patch.object(modelcatalog.wb2api, 'list_auth_accounts',
                               return_value=[self.AUTH]),
             mock.patch.object(modelcatalog, '_load_token', return_value='tok'),
         ):
-            p = pat.start()
-            self.addCleanup(p.stop)
+            pat.start()
+            self.addCleanup(pat.stop)
 
     def tearDown(self) -> None:
         modelcatalog.invalidate()

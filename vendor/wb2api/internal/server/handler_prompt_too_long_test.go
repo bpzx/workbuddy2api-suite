@@ -70,6 +70,52 @@ func TestChatPromptTooLongPassesThroughUpstreamBody(t *testing.T) {
 	}
 }
 
+// TestChatImageInvalidPassesThroughWithoutRotation 上游图片错误是请求级确定性
+// 错误：多账号池只调用一次，不冷却/禁用/累计失败，并逐字透传上游原文。
+func TestChatImageInvalidPassesThroughWithoutRotation(t *testing.T) {
+	const raw = `{"code":11101,"msg":"Parse message failed: invalid image_url content at index 2: json: cannot unmarshal string into Go value of type v2.ImageContent","requestId":"req-image-abc"}`
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		return http.StatusBadRequest, raw, false
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "img-a1", AccessToken: "at-img-1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "img-a2", AccessToken: "at-img-2", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"cn:deepseek-v4.1-flash","messages":[{"role":"user","content":[{"type":"image_url","image_url":"data:image/png;base64,QUJD"}]}]}`)))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s want 400", rec.Code, rec.Body)
+	}
+	var e struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
+		t.Fatalf("resp not json: %v body=%s", err, rec.Body)
+	}
+	if e.Error.Code != "image_invalid" {
+		t.Errorf("code=%q want image_invalid", e.Error.Code)
+	}
+	if e.Error.Message != raw {
+		t.Errorf("message=%q want raw upstream body passthrough %q", e.Error.Message, raw)
+	}
+	if calls["Bearer at-img-1"]+calls["Bearer at-img-2"] != 1 {
+		t.Errorf("upstream calls=%v want exactly 1 (no rotation for invalid image)", calls)
+	}
+	for _, uid := range []string{"img-a1", "img-a2"} {
+		st, _ := p.Status(uid)
+		if st.Cooling || st.Disabled || st.ErrTotal != 0 || st.BreakerFails != 0 {
+			t.Errorf("%s must not be penalized for request-level image error: %+v", uid, st)
+		}
+	}
+}
+
 // TestChatPromptTooLongSingleAccount 413/404 状态码上的 11115 同样走透传分支
 // （promptTooLongRule 认请求级 4xx 家族）。
 func TestChatPromptTooLongSingleAccount(t *testing.T) {

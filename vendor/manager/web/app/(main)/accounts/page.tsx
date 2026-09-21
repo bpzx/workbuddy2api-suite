@@ -21,7 +21,13 @@ import {notify} from '@/lib/toast';
 import {accountApi, upstreamApi, errText} from '@/lib/api';
 import type {Account, CreditExpiry, CreditsMeta, UpstreamStatus} from '@/lib/types';
 import {expiryBarPercent, expiryVisual, fmtAgo, fmtDateTime, fmtNumber, fmtRemain} from '@/lib/format';
-import {availabilityLabelKey, availabilityOf, isDegraded, mergePoolStatus} from '@/lib/account-status';
+import {
+  availabilityLabelKey,
+  availabilityOf,
+  isDegraded,
+  mergePoolStatus,
+  rateLimitedModels,
+} from '@/lib/account-status';
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {EmptyState} from '@/components/common/layout/EmptyState';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
@@ -244,12 +250,28 @@ export default function AccountsPage() {
       );
     }
     if (tier === 'disabledByPanel') {
-      // 面板主动禁用：中性灰而不是告警红——这是用户自己的选择，不是故障。
+      // 面板主动停用（改名）：中性灰而不是告警红——这是用户自己的选择，不是故障。
       return (
         <Badge
           variant="secondary"
           className="rounded-full text-muted-foreground"
           title={t('accounts.badgeDisabledByPanelTitle')}
+        >
+          {label}
+        </Badge>
+      );
+    }
+    if (tier === 'manualDisabled') {
+      // 上游状态位停用（issue #45）：同样中性灰，但提示文案不同——这条是
+      // 「还在池里、签到与保活照常」，与上一条「完全退出账号池」差别很大，
+      // 用户看不出机制差别，必须写清楚。停用原因也一并带上。
+      const reason = String(a.manual_reason || '');
+      const nl = String.fromCharCode(10);
+      return (
+        <Badge
+          variant="secondary"
+          className="rounded-full text-muted-foreground"
+          title={t('accounts.badgeManualDisabledTitle') + (reason ? nl + reason : '')}
         >
           {label}
         </Badge>
@@ -360,6 +382,46 @@ export default function AccountsPage() {
     );
   }
 
+  /** 模型级限流标记（issue #43）。
+   *
+   *  为什么单独做一个徽章、而不是并进状态列：**账号本身是在线的**，只是某个
+   *  模型暂时被腾讯限流（6004）。用户的实际观察是「换个模型就能继续用」，
+   *  但状态列显示「在线」，于是「这个模型用不了」这件事在面板上完全不可见
+   *  —— 有人只能进容器翻 state.json 才知道。
+   *
+   *  所以它与状态徽章**并列**展示（不是替代）：账号确实可用，只是有模型受限。
+   *  悬停给出每个受限模型与预计恢复时间——上游台账里带权威的重置时刻。 */
+  function renderModelLimit(a: Account) {
+    const limited = rateLimitedModels(a);
+    if (!limited.length) return null;
+    const sep = t('common.listSeparator');
+    const lines = limited.map((m) => {
+      const until = a.rate_limited_models?.find((x) => x.model === m.model)?.until;
+      const at = until ? new Date(until).toLocaleTimeString() : '';
+      // 11102（该账号没有这个模型）与 6004（限流）含义不同：前者等多久都不会好，
+      // 该换模型；后者等一会儿就恢复。上游的 reason 前缀就是判据。
+      const why = m.reason.startsWith('11102')
+        ? t('accounts.modelMissing')
+        : at
+          ? t('accounts.modelLimitUntil', {at})
+          : t('accounts.modelLimited');
+      return `${m.model} · ${why}`;
+    });
+    const first = limited[0];
+    const shown = limited.length === 1
+      ? first.model
+      : t('accounts.modelsCount', {count: limited.length, n: limited.length});
+    return (
+      <Badge
+        variant="secondary"
+        className="rounded-full text-amber-600 dark:text-amber-400"
+        title={[t('accounts.modelLimitTitle'), ...lines].join(String.fromCharCode(10))}
+      >
+        {t('accounts.modelLimitBadge', {models: shown})}
+      </Badge>
+    );
+  }
+
   /** 积分余额 + 数据来源标注。
    *  明确区分「实时」与「缓存 x 秒前」，避免把滞后的数字当成刚查到的。 */
   function renderCredits(a: Account) {
@@ -442,20 +504,26 @@ export default function AccountsPage() {
     // 国际版没有签到体系（上游对 global 账号直接过滤，不发请求）。
     // 这一行的「签到」按钮对国际版账号只会返回「已跳过」，属误导，故不显示。
     const canCheckin = (a.realm ?? 'cn') === 'cn';
+    // 本面板改名停用（issue #21）：账号已完全退出账号池，签到等任务也随之停掉，
+    // 所以隐藏其它操作（它们对这个号已无意义）。
     const paused = a.disabled_by_panel === true;
+    // 上游状态位停用（issue #45）：**任务照常执行**是这条路的重点，所以签到 /
+    // 测试 / 刷新 Token 这些操作仍然可用、也必须仍然可见——否则用户会以为
+    // 「停用把签到也停了」，正好把这条路与改名那条的区别抹掉了。
+    const viaBit = a.manual_disabled === true;
+    const off = paused || viaBit;
     return (
       <div className="flex justify-end gap-1">
-        {/* 临时禁用 / 启用（issue #21）。放在最前：它是最轻的「止血」动作——
+        {/* 临时停用 / 启用（issue #21、#45）。放在最前：它是最轻的「止血」动作——
             某个号在拖后腿（一直失败、触发风控）时，先停用它比删掉更合适
-            （删除会丢凭证、只能重新扫码；禁用是可逆的）。
-            禁用后签到也要停掉，所以禁用时不显示其它操作。 */}
-        {!paused && canCheckin && (
+            （删除会丢凭证、只能重新扫码；停用是可逆的）。 */}
+        {(!off || viaBit) && canCheckin && (
           <Button variant="ghost" size="icon" className="h-7 w-7 rounded-md" title={t('accounts.checkin')} disabled={busy}
             onClick={() => run(a.file, () => accountApi.checkin(a.file), t('accounts.opDone'))}>
             <Gift className="h-3.5 w-3.5" />
           </Button>
         )}
-        {!paused && (
+        {(!off || viaBit) && (
           <>
             <Button variant="ghost" size="icon" className="h-7 w-7 rounded-md" title={t('accounts.test')} disabled={busy}
               onClick={() => run(a.file, () => accountApi.test(a.file), t('accounts.testDone'))}>
@@ -472,17 +540,19 @@ export default function AccountsPage() {
           size="icon"
           className={
             'h-7 w-7 rounded-md ' +
-            (paused ? 'text-emerald-600 hover:text-emerald-600' : 'text-amber-600 hover:text-amber-600')
+            (off ? 'text-emerald-600 hover:text-emerald-600' : 'text-amber-600 hover:text-amber-600')
           }
-          title={paused ? t('accounts.enableTitle') : t('accounts.disableTitle')}
+          title={off ? t('accounts.enableTitle') : t('accounts.disableTitle')}
           disabled={busy}
           onClick={() => run(
             a.file,
-            () => accountApi.setDisabled(a.file, !paused),
-            paused ? t('accounts.enabled') : t('accounts.disabled'),
+            () => accountApi.setDisabled(a.file, !off),
+            // 文案如实反映用的是哪种机制：状态位停用后任务照常，改名停用则全停。
+            off ? t('accounts.enabled')
+                : (viaBit ? t('accounts.manualDisabled') : t('accounts.disabled')),
           )}
         >
-          {paused ? <Play className="h-3.5 w-3.5" /> : <Pause className="h-3.5 w-3.5" />}
+          {off ? <Play className="h-3.5 w-3.5" /> : <Pause className="h-3.5 w-3.5" />}
         </Button>
         <ConfirmDialog
           title={t('accounts.deleteTitle', {name: a.nickname || a.uid})}
@@ -597,7 +667,10 @@ export default function AccountsPage() {
                     <div className="truncate font-mono text-[10px] text-muted-foreground">{a.uid}</div>
                   </div>
                 </div>
-                {renderStatus(a)}
+                <div className="flex flex-wrap items-center justify-end gap-1.5">
+                  {renderStatus(a)}
+                  {renderModelLimit(a)}
+                </div>
               </div>
 
               <div className="flex items-center justify-between gap-3">
@@ -655,7 +728,12 @@ export default function AccountsPage() {
                   </div>
                 </TableCell>
                 <TableCell className="font-mono text-xs text-muted-foreground">{a.uid}</TableCell>
-                <TableCell>{renderStatus(a)}</TableCell>
+                <TableCell>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {renderStatus(a)}
+                    {renderModelLimit(a)}
+                  </div>
+                </TableCell>
                 <TableCell>{renderCredits(a)}</TableCell>
                 <TableCell>{renderExpiry(a)}</TableCell>
                 {isAdmin && <TableCell className="pr-4">{renderActions(a)}</TableCell>}

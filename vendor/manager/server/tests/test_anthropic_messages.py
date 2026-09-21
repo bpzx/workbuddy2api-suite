@@ -63,20 +63,22 @@ class RequestTranslationTest(unittest.TestCase):
         self.assertEqual(out['messages'][0]['role'], 'assistant')
         self.assertEqual(out['messages'][0]['reasoning_content'], '只有思考')
 
-    def test_empty_thinking_does_not_set_field(self) -> None:
-        """thinking 块里没有可用内容时**不挂字段**（而不是挂空串）。
+    def test_empty_thinking_gets_placeholder(self) -> None:
+        """thinking 块里没有可用内容时补**一个空格**（不是空串、也不是不挂）。
 
-        社区实测（issue #37）称请求侧的 `reasoning` 为空串会被拒、非空才过。
-        本仓复现不出那个开关，但挂空串在"会被拒"时有害、在"不会拒"时又无收益
-        （上游兜底本就会补空串），所以不值得留 —— 改为不挂，并记 WARN。
+        判据来自上游 2026-09-19 的 commit 5657229（采纳社区 issue #37 的判定表
+        并复验）：部分账号/租户校验 `len(reasoning) > 0` 且**不做 trim** ——
+        空白串过闸、空串不过。所以无内容时补空格占位；该字段是转发校验位、
+        不是内容消费位，占位不影响模型上下文。
         """
         out = to_openai_request({'model': 'x', 'max_tokens': 10, 'messages': [
             {'role': 'assistant',
              'content': [{'type': 'thinking', 'thinking': ''}, {'type': 'text', 'text': '答'}]},
         ]})
         msg = out['messages'][0]
-        self.assertNotIn('reasoning', msg)
-        self.assertNotIn('reasoning_content', msg)
+        self.assertEqual(msg.get('reasoning'), ' ', '空 thinking 应补空格占位')
+        self.assertEqual(msg.get('reasoning_content'), ' ')
+        self.assertGreater(len(msg['reasoning']), 0, '上游校验 len>0')
 
     def test_redacted_thinking_carries_ciphertext(self) -> None:
         """`redacted_thinking` 只有密文：带上它（字段存在即触发补丁），不能丢。"""
@@ -257,7 +259,14 @@ class ResponseTranslationTest(unittest.TestCase):
         self.assertEqual(out['content'], [{'type': 'text', 'text': '你好'}])
         self.assertEqual(out['stop_reason'], 'end_turn')
         # 字段名必须换：Anthropic 用 input/output_tokens
-        self.assertEqual(out['usage'], {'input_tokens': 12, 'output_tokens': 3})
+        # 缓存两段是 Anthropic 规范里的并列字段（上游没给时为 0）——
+        # 见 anthropic._usage_fields：input_tokens **不含**缓存，客户端会相加。
+        self.assertEqual(out['usage'], {
+            'input_tokens': 12,
+            'cache_read_input_tokens': 0,
+            'cache_creation_input_tokens': 0,
+            'output_tokens': 3,
+        })
 
     def test_tool_call_becomes_tool_use(self) -> None:
         out = to_anthropic_response({

@@ -256,17 +256,15 @@ class RequestConversionTest(unittest.TestCase):
             {'role': 'user', 'content': 'q2'},
         ])
 
-    def test_reasoning_without_text_does_not_set_field(self) -> None:
-        """推理项里**没有可用文本**时不挂字段（而不是挂空串）。
+    def test_reasoning_without_text_gets_placeholder(self) -> None:
+        """推理项里**没有可用文本**时补一个空格（不是空串、也不是不挂）。
 
-        这是判断修正。早先这里挂空串，理由是「上游按字段存在判断有无痕迹」。
-        但社区实测（issue #37 的取值矩阵）表明 `reasoning` **为空串会被拒**、
-        非空才过 —— 若成立，挂空串把「没痕迹」变成「有痕迹但内容为空」，更糟；
-        若不成立（本仓复现不出那个开关），挂空串与不挂又没差别（上游兜底本就会
-        补空串）。两种情况都指向：**挂空串是无收益的风险**，故不挂。
+        判据来自上游 2026-09-19 的 commit 5657229：校验是 `len(reasoning) > 0`
+        且不 trim —— 空白串过闸、空串与缺失都不行。所以畸形输入（客户端回了
+        空的推理项）下补空格占位。
 
-        注意区分「没有文本」与「没有这个项」：后者本来就不挂任何字段，
-        本测试覆盖的是前者（客户端发了空的推理项 —— 畸形输入）。
+        注意区分「没有文本」与「没有这个项」：后者本来就不挂任何字段
+        （没有痕迹就没什么可占位的），本测试覆盖的是前者。
         """
         out = R.to_chat_request({'model': 'm', 'input': [
             {'type': 'reasoning', 'id': 'rs_2', 'summary': []},
@@ -274,8 +272,9 @@ class RequestConversionTest(unittest.TestCase):
              'content': [{'type': 'output_text', 'text': 'a'}]},
         ]})
         msg = out['messages'][0]
-        self.assertNotIn('reasoning', msg, '空推理不该挂 reasoning（会被上游拒）')
-        self.assertNotIn('reasoning_content', msg)
+        self.assertEqual(msg.get('reasoning'), ' ', '空推理应补空格占位')
+        self.assertEqual(msg.get('reasoning_content'), ' ')
+        self.assertGreater(len(msg['reasoning']), 0, '上游校验 len>0')
 
     def test_reasoning_attached_to_tool_call_message(self) -> None:
         """工具调用回合的推理同样要保留（模型先思考再调工具）。"""
@@ -376,21 +375,51 @@ class RequestConversionTest(unittest.TestCase):
         self.assertEqual(out['tools'][0]['function']['name'], 'get')
 
     def test_openai_only_fields_not_passed_upstream(self) -> None:
-        """store/include/prompt_cache_key/reasoning 是 OpenAI 专有，透过去就 400。
+        """store/include/reasoning 是 OpenAI 专有，上游不认识，丢掉。
 
         `stream` **不在此列**：它必须转告上游（上游据此决定回 SSE 还是 JSON）。
         这条断言是 E2E 试出来的——早先把 stream 一并"过滤"掉，流式请求会静默
         变成空回答。
+
+        `prompt_cache_key` 也**不在此列**，见下一条（上游支持并依赖它）。
         """
         out = R.to_chat_request({
             'model': 'm', 'input': 'x', 'store': True,
             'include': ['reasoning.encrypted_content'],
-            'prompt_cache_key': 'k', 'prompt_cache_retention': '24h',
+            'prompt_cache_retention': '24h',
             'reasoning': {'effort': 'high'},
         })
-        for leaked in ('store', 'include', 'prompt_cache_key',
-                       'prompt_cache_retention', 'reasoning'):
+        for leaked in ('store', 'include', 'prompt_cache_retention', 'reasoning'):
             self.assertNotIn(leaked, out, f'{leaked} 不该透给上游')
+
+    def test_prompt_cache_key_forwarded(self) -> None:
+        """`prompt_cache_key` 要透传——它是上游的**费用优化开关**（约 17 倍差价）。
+
+        上游 `cache_key.go` 的实测：同一段 8k token 前缀，不带该键
+        `prompt_cache_hit_tokens=0`、扣费≈0.34；带键命中 7808、扣费≈0.02。
+        其 `InjectPromptCacheKey` 的优先级 1 就是「客户端已带则原值保留」，
+        并有测试钉住——所以下游客户端**主动提供**的键必须原样送到上游。
+
+        这条修正了一条错的旧注释：它写着「prompt_cache_key 透过去只会换来 400」。
+        实际上游是 `json.Unmarshal` 到 map（非严格模式），未知字段天然忽略，
+        它自己的测试注释也这么写。照旧丢弃等于白丢一次费用优化。
+        """
+        out = R.to_chat_request({'model': 'm', 'input': 'x',
+                                 'prompt_cache_key': 'client-key'})
+        self.assertEqual(out.get('prompt_cache_key'), 'client-key')
+
+    def test_prompt_cache_key_not_fabricated(self) -> None:
+        """客户端没给就不要凭空造一个：键的取值语义（复用哪个前缀）只有客户端知道。
+
+        上游在两源都空时仍会注入它自己按账号派生的键，那是它的职责；我们造一个
+        只会覆盖掉它（优先级 1 是「客户端已带则原值保留」）。
+        脏值（数字 / 空串）同样不透传。
+        """
+        for body in ({'model': 'm', 'input': 'x'},
+                     {'model': 'm', 'input': 'x', 'prompt_cache_key': 123},
+                     {'model': 'm', 'input': 'x', 'prompt_cache_key': ''}):
+            out = R.to_chat_request(body)
+            self.assertNotIn('prompt_cache_key', out, f'{body} 不该产出缓存键')
 
     def test_stream_flag_forwarded_to_upstream(self) -> None:
         """`stream` 必须转告上游：漏掉它，上游回 JSON，网关按 SSE 解析 →
@@ -403,6 +432,42 @@ class RequestConversionTest(unittest.TestCase):
                                  'tool_choice': {'type': 'function', 'name': 'get'}})
         self.assertEqual(out['tool_choice'],
                          {'type': 'function', 'function': {'name': 'get'}})
+
+    def test_custom_tool_is_wrapped_and_history_roundtrips(self) -> None:
+        patch = '*** Begin Patch\n*** Add File: probe.txt\n+ok\n*** End Patch'
+        body = {
+            'model': 'm',
+            'reasoning': {'effort': 'max', 'summary': 'ignored'},
+            'tools': [{
+                'type': 'custom',
+                'name': 'apply_patch',
+                'description': 'Apply a patch',
+                'format': {'type': 'grammar', 'definition': 'start: /[\\\\s\\\\S]+/'},
+            }],
+            'input': [
+                {'type': 'custom_tool_call', 'call_id': 'c1',
+                 'name': 'apply_patch', 'input': patch},
+                {'type': 'custom_tool_call_output', 'call_id': 'c1', 'output': 'ok'},
+            ],
+            'tool_choice': {'type': 'custom', 'name': 'apply_patch'},
+        }
+        out = R.to_chat_request(body)
+        self.assertEqual(out['reasoning_effort'], 'max')
+        self.assertEqual(out['tools'][0]['function']['parameters']['required'], ['input'])
+        self.assertIn('Requested grammar', out['tools'][0]['function']['description'])
+        self.assertEqual(out['messages'][0]['tool_calls'][0]['function']['arguments'],
+                         json.dumps({'input': patch}, ensure_ascii=False))
+        self.assertEqual(out['messages'][1]['role'], 'tool')
+        self.assertEqual(out['tool_choice'],
+                         {'type': 'function', 'function': {'name': 'apply_patch'}})
+
+    def test_custom_tool_history_requires_string_input(self) -> None:
+        with self.assertRaises(R.CustomToolArgumentsError):
+            R.to_chat_request({
+                'model': 'm',
+                'input': [{'type': 'custom_tool_call', 'name': 'apply_patch',
+                           'input': {'not': 'raw text'}}],
+            })
 
 
 class NonStreamingResponseTest(unittest.TestCase):
@@ -450,6 +515,29 @@ class NonStreamingResponseTest(unittest.TestCase):
         self.assertEqual(item['name'], 'get')
         self.assertEqual(item['arguments'], '{"a":1}')
         self.assertTrue(item['id'].startswith('fc_'))
+
+    def test_custom_tool_call_is_restored(self) -> None:
+        patch = '*** Begin Patch\n*** Add File: probe.txt\n+ok\n*** End Patch'
+        obj = R.to_responses_object({
+            'choices': [{
+                'message': {
+                    'content': None,
+                    'tool_calls': [{
+                        'id': 'call_1',
+                        'type': 'function',
+                        'function': {
+                            'name': 'apply_patch',
+                            'arguments': json.dumps({'input': patch}),
+                        },
+                    }],
+                },
+                'finish_reason': 'tool_calls',
+            }],
+        }, 'm', 'resp_1', {'apply_patch'})
+        item = obj['output'][0]
+        self.assertEqual(item['type'], 'custom_tool_call')
+        self.assertEqual(item['input'], patch)
+        self.assertNotIn('arguments', item)
 
 
 class StreamContractTest(unittest.TestCase):
@@ -501,6 +589,61 @@ class StreamContractTest(unittest.TestCase):
         self.assertEqual(len(tools), 1)
         self.assertEqual(tools[0]['name'], 'get')
         self.assertEqual(tools[0]['arguments'], '{"a":1}', '参数分片没被拼回')
+
+    def test_custom_tool_stream_uses_raw_input_events(self) -> None:
+        t = R._StreamTranslator('m', 'resp_1', {'apply_patch'})
+        chunks: list[bytes] = []
+        chunks += t.feed(delta(tool={
+            'index': 0,
+            'id': 'call_1',
+            'function': {
+                'name': 'apply_',
+                'arguments': '{"input":"patch"}',
+            },
+        }))
+        chunks += t.feed(delta(tool={
+            'index': 0,
+            'function': {'name': 'patch'},
+        }))
+        chunks += t.feed(delta(finish='tool_calls'))
+        events = [
+            json.loads(line[5:].strip())
+            for chunk in chunks
+            for line in chunk.decode().splitlines()
+            if line.startswith('data:')
+        ]
+        custom = [event for event in events
+                  if event['type'] == 'response.custom_tool_call_input.delta']
+        done = [event for event in events
+                if event['type'] == 'response.custom_tool_call_input.done']
+        output = [event for event in events
+                  if event['type'] == 'response.output_item.done'][-1]['item']
+        self.assertEqual([event['delta'] for event in custom], ['patch'])
+        self.assertEqual(done[0]['input'], 'patch')
+        self.assertEqual(output['type'], 'custom_tool_call')
+        self.assertEqual(output['input'], 'patch')
+
+    def test_malformed_custom_stream_fails_without_executable_call(self) -> None:
+        t = R._StreamTranslator('m', 'resp_1', {'apply_patch'})
+        chunks = t.feed(delta(tool={
+            'index': 0,
+            'id': 'call_1',
+            'function': {
+                'name': 'apply_patch',
+                'arguments': '{"input": 1}',
+            },
+        }))
+        chunks += t.feed(delta(finish='tool_calls'))
+        events = [
+            json.loads(line[5:].strip())
+            for chunk in chunks
+            for line in chunk.decode().splitlines()
+            if line.startswith('data:')
+        ]
+        self.assertEqual(events[-1]['type'], 'response.failed')
+        self.assertFalse(any(event['type'] == 'response.output_item.done'
+                             and event.get('item', {}).get('type') == 'custom_tool_call'
+                             for event in events))
 
     def test_parallel_tool_calls_keep_separate_slots(self) -> None:
         """并发工具各自编号：混进一个槽位会让两个调用互相污染参数。"""

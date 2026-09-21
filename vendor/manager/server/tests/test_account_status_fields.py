@@ -18,6 +18,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+_ROOT = Path(__file__).resolve().parents[2]
+
 from server.services import wb2api  # noqa: E402
 
 
@@ -226,3 +228,85 @@ class NotInPoolTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class RateLimitedModelsTest(unittest.TestCase):
+    """模型级限流（6004）要能在面板上单独看出来（issue #43）。
+
+    现场：用户发现某个模型报限流（腾讯 6004），**换个模型就能继续用**，但面板上
+    那个账号显示「在线」，完全看不出「这个模型被限流了」——只能进容器翻
+    state.json 才知道。
+
+    根因是前端只把模型明细挂在「冷却中」那一档下，而 6004 是**模型级**的：
+    账号本身健康、仍会被选中转发，所以 `cooling` 是 false，那一档根本走不到。
+
+    上游为此单独给了一本台账（`rate_limited_models`，其注释写明用途就是让运维
+    看到「账号 A 的模型 X 还在限额中，预计 Z 时间恢复」）。本测试锁住：
+      1. 台账在未来 → 算作受限；
+      2. 台账已过期 → **不算**（快照可能过时，字段还在但窗口已过）；
+      3. 缺 until / 非字符串 → 保守不算（宁可不报，也别报一个说不清时间的）。
+    """
+
+    def _src(self) -> str:
+        return (_ROOT / 'web' / 'lib' / 'account-status.ts').read_text(encoding='utf-8')
+
+    def _helper_body(self) -> str:
+        src = self._src()
+        seg = src[src.index('export function rateLimitedModels'):]
+        return seg[:seg.index('\n}')]
+
+    def test_helper_exists(self) -> None:
+        self.assertIn('export function rateLimitedModels', self._src(),
+                      'account-status.ts 里没有 rateLimitedModels')
+
+    def test_judged_by_deadline_not_field_presence(self) -> None:
+        """**按截止时间判**，不是「字段存在就算受限」。
+
+        前端拿到的可能是几十秒前的快照：字段还在、窗口早过了。只看字段就会把
+        已经恢复的模型一直标成「受限」（与 isDegraded 同一口径的坑）。
+        """
+        body = self._helper_body()
+        self.assertIn('Date.parse', body, '没用时间解析 —— 过期的条目也会被算成受限')
+        self.assertIn('> now', body, '没有「截止在未来」的比较')
+
+    def test_requires_until_string(self) -> None:
+        """缺 until / 非字符串 → 不算（保守：宁可不报，也别报个说不清时间的）。"""
+        body = self._helper_body()
+        self.assertIn("typeof until !== 'string'", body)
+        self.assertIn('return false', body)
+
+    def test_reads_upstream_ledger_not_account_cooling(self) -> None:
+        """读的是上游那本台账字段（rate_limited_models），不是账号级 cooling。
+
+        6004 是**模型级**的：账号健康、仍会被选中转发，所以 `cooling` 是 false ——
+        用它当判据永远判不出「某个模型被限流」（这正是 issue #43 的现场）。
+        """
+        body = self._helper_body()
+        self.assertIn('rate_limited_models', body,
+                      '没有读上游台账 —— 账号级状态判不出模型级限流')
+        self.assertNotIn('a.cooling', body,
+                         '用账号级 cooling 判模型级限流是错的：账号健康、只是某模型受限')
+
+    def test_badge_is_separate_from_status(self) -> None:
+        """模型受限徽章必须与状态徽章**并列**，不能替代它。
+
+        账号确实在线（其它模型能用），把状态改成「冷却中」是错的；
+        但完全不提又会让用户看不出某个模型不可用。
+        """
+        page = (_ROOT / 'web' / 'app' / '(main)' / 'accounts' / 'page.tsx').read_text(
+            encoding='utf-8')
+        self.assertIn('renderModelLimit', page, '账号页没有模型受限的展示')
+        # 两者在同一个容器里并列渲染
+        # 两处渲染（桌面表格 / 移动端卡片）都必须并排带上
+        count = page.count('{renderModelLimit(a)}')
+        self.assertGreaterEqual(count, 2,
+                                f'模型受限徽章只在 {count} 处渲染（桌面与移动端都要有）')
+
+    def test_only_shown_when_actually_limited(self) -> None:
+        """没有受限模型时不能渲染任何东西（否则每行都挂个空徽章）。"""
+        page = (_ROOT / 'web' / 'app' / '(main)' / 'accounts' / 'page.tsx').read_text(
+            encoding='utf-8')
+        seg = page[page.index('function renderModelLimit'):]
+        seg = seg[:seg.index('\n  }')]
+        self.assertIn('if (!limited.length) return null', seg,
+                      '没有「无受限模型则不渲染」的保护')

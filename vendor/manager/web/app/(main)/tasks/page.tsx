@@ -20,7 +20,7 @@ import {useI18n, useT} from '@/lib/i18n/provider';
 import {checkinResultText, taskLogResultText} from '@/lib/tasklog-text';
 import {accountApi, errText} from '@/lib/api';
 import type {CheckinLog, TaskLog, TaskLogResponse} from '@/lib/types';
-import {fmtDateTime, fmtNumber} from '@/lib/format';
+import {fmtDateTimeMarked, fmtNumber} from '@/lib/format';
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
 import {TaskRunnerPanel} from '@/components/common/tasks/TaskRunnerPanel';
@@ -384,7 +384,7 @@ export default function TasksPage() {
                       </span>
                     </div>
                     <div className="mt-0.5 flex items-center justify-between gap-2 text-[10px] text-muted-foreground">
-                      <span className="truncate tabular-nums">{fmtDateTime(l.ts)}</span>
+                      <span className="truncate tabular-nums">{fmtDateTimeMarked(l.ts)}</span>
                       <span className="shrink-0">{sourceLabel(l.source)}</span>
                     </div>
                   </div>
@@ -405,7 +405,7 @@ export default function TasksPage() {
                     {checkinLogs.map((l) => (
                       <TableRow key={l.id} className="border-b border-border/40">
                         <TableCell className="pl-4 text-xs tabular-nums text-muted-foreground">
-                          {fmtDateTime(l.ts)}
+                          {fmtDateTimeMarked(l.ts)}
                         </TableCell>
                         <TableCell className="max-w-[120px] truncate text-xs">{l.nickname || l.uid || '—'}</TableCell>
                         <TableCell className="text-xs text-muted-foreground">
@@ -622,7 +622,7 @@ export default function TasksPage() {
                     <span className="truncate" title={l.uid}>
                       {accountLabel(l)}
                     </span>
-                    <span className="shrink-0 tabular-nums">{fmtDateTime(l.ts)}</span>
+                    <span className="shrink-0 tabular-nums">{fmtDateTimeMarked(l.ts)}</span>
                   </div>
                 </div>
               ))}
@@ -643,7 +643,7 @@ export default function TasksPage() {
                   {filteredTasks.map((l) => (
                     <TableRow key={l.id} className="border-b border-border/40">
                       <TableCell className="pl-4 text-xs tabular-nums text-muted-foreground">
-                        {fmtDateTime(l.ts)}
+                        {fmtDateTimeMarked(l.ts)}
                       </TableCell>
                       <TableCell className="text-xs">{kindLabel(l.kind, kindLabels[l.kind])}</TableCell>
                       <TableCell className="max-w-[180px] truncate text-xs" title={l.uid}>

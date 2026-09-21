@@ -196,6 +196,16 @@ export const keyApi = {
   update: (id: number, body: Partial<ApiKey>) => patch<ApiKey>(`/api/keys/${id}`, body),
   remove: (id: number) => del<{ok: boolean}>(`/api/keys/${id}`),
   resetUsage: (id: number) => post<{ok: boolean}>(`/api/keys/${id}/reset-usage`),
+  /**
+   * 检查模型白名单里哪些名字匹配不到已知模型（issue #46）。
+   *
+   * 判据在后端（与调用侧同一份），前端只负责显示——不然就是第二份事实来源。
+   * `checked: false` 表示拿不到模型清单（缓存未就绪），此时**不能**把空
+   * `unknown` 当成「全部正确」展示。
+   */
+  checkModels: (models: string[], realm: string) =>
+    post<{checked: boolean; unknown: string[]; reason?: string}>(
+      '/api/keys/check-models', {models, realm}),
 };
 
 /* ── 日志 ───────────────────────────────────────────── */

@@ -52,6 +52,18 @@ func TestClassify(t *testing.T) {
 		{400, `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF"}`, ErrBadParams},
 		{400, `Unmarshal chat params failed`, ErrBadParams},
 		{400, `{"code":11101,"msg":"x"}`, ErrBadParams},
+		// 图片格式/数据错误是确定性请求错误，分类后不轮转、不罚号。
+		{400, `{"code":11101,"msg":"Parse message failed: invalid image_url content at index 2: json: cannot unmarshal string into Go value of type v2.ImageContent"}`, ErrImageInvalid},
+		{400, `{"code":11135,"msg":"invalid_image_data"}`, ErrImageInvalid},
+		{400, `invalid_image_data`, ErrImageInvalid},
+		// code 11135 的 JSON 空白容差（Copilot review #184 finding）：字面量 marker
+		// 只能命中紧凑形态，带空格的合法 body 会退化成 ErrClient 并继续轮转。
+		// 与 hint.go 的 isInvalidImageData / codeMarker 同口径。
+		{400, `{"code": 11135, "msg": "image rejected"}`, ErrImageInvalid},
+		{400, `{"code": "11135", "msg": "image rejected"}`, ErrImageInvalid},
+		{400, `{"error": {"code": 11135, "message": "image rejected"}}`, ErrImageInvalid},
+		// 其他 code 不得被 11135 口径误伤（防过宽）。
+		{400, `{"code": 11133, "msg": "other business error"}`, ErrClient},
 		{200, `quota exceeded`, ErrHardCredit},
 		// 账号级授权/配额故障（与 429 一起纳入轮换）：11140 request illegal = auth_forbidden
 		// 风控（需重登），14017 = quota_not_activated（试用未激活，需完成 register）。修复前
@@ -92,6 +104,12 @@ func TestClassify(t *testing.T) {
 		// 落到 status==429 兜底会误归 soft_rate，账号级故障等不来自愈。
 		{429, `{"code":14017,"msg":"trial not activated"}`, ErrAccountFault},
 		{429, `{"error":{"data":{"code":11140,"msg":"request illegal"}}}`, ErrAccountFault},
+		// Issue #175：14018 明确表示账号积分耗尽，即使 HTTP 状态是 429 也必须
+		// 走硬积分冷却；仅有相同文案而无该业务码的普通 429 仍保持软限流。
+		{429, `{"code":14018,"msg":"Credits exhausted"}`, ErrHardCredit},
+		{429, `{"error":{"data":{"code":"14018","msg":"Credits exhausted"}}}`, ErrHardCredit},
+		{429, `{"requestId":"14018","msg":"Credits exhausted"}`, ErrSoftRate},
+		{429, `{"code":1,"msg":"Credits exhausted"}`, ErrSoftRate},
 		// WAF 403（P0-1）：403 + 无业务信封（无 "code":/"msg": 字段）→ ErrWafBlock。
 		// 空体 / HTML 拦截页 / 纯文本 / 非信封 JSON 均命中。
 		{403, ``, ErrWafBlock},

@@ -43,6 +43,42 @@ export function fmtDate(ts: number | null | undefined): string {
   return new Date(ms).toLocaleDateString(intlLocale());
 }
 
+/**
+ * 日期时间 + 相对「今天」的标记：`2026/09/20 14:03:11`。
+ *
+ * 为什么需要（issue #44）：任务页与日志页都有「近 24 小时」这个范围，它**必然跨天**
+ * ——这时候列表里今天的 14:03 与昨天的 14:03 长得一模一样，扫一眼分不出哪条是
+ * 今天的，只能挨个去数字段里的日期。用户的原话是「翻看 24 小时的时候会翻到前一天
+ * 的记录，不方便观察各个账号运行状态」。
+ *
+ * 所以对**非今天**的行把日期顶到最前面并标注「昨天 / 更早」，今天的行保持简短。
+ * 不直接写死「今天」的原因：列表里绝大多数行都是今天的，逐行标一遍只是噪音；
+ * 真正需要区分的是那几条**不是今天**的。
+ *
+ * 跨天（今天/昨天）按**本地日历日**判，不是「距今 24 小时内」——用户看的是日历，
+ * 凌晨 1 点看 23 小时前的记录会认为那是「昨天」，按日历判才与直觉一致。
+ */
+export function fmtDateTimeMarked(ts: number | null | undefined): string {
+  if (!ts) return '—';
+  const ms = ts > 1e12 ? ts : ts * 1000;
+  const d = new Date(ms);
+  const full = fmtDateTime(ts);
+  const dayDiff = calendarDaysAgo(d);
+  if (dayDiff === 0) return full;
+  if (dayDiff === 1) return `${t('format.yesterday')} ${full}`;
+  return full;
+}
+
+/** 目标时间距「今天」的本地日历天数（今天=0，昨天=1，未来=负数）。 */
+function calendarDaysAgo(d: Date): number {
+  const now = new Date();
+  // 用 Date.UTC 把两个本地日期归一到 UTC 零点再相减：这样得到的是**日历天**之差，
+  // 不受夏令时（某些时区一天是 23/25 小时）与具体时刻影响。
+  const a = Date.UTC(d.getFullYear(), d.getMonth(), d.getDate());
+  const b = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate());
+  return Math.round((b - a) / 86400000);
+}
+
 /** 千分位数字 */
 export function fmtNumber(n: number | null | undefined): string {
   if (n === null || n === undefined) return '0';

@@ -92,6 +92,26 @@ export default function KeysPage() {
   const [busy, setBusy] = useState(false);
   const [issued, setIssued] = useState<string | null>(null);
   /**
+   * 模型白名单里**匹配不到已知模型**的名字（issue #46）。
+   *
+   * 为什么要有：白名单是自由文本，填错不会报错，只会在下游表现为「模型列表是
+   * 空的」——而空列表看不出原因（少个连字符？填成了显示名？）。所以在编辑处
+   * 当场点出来。判据由后端给（与调用侧同一份），这里只负责显示。
+   *
+   * `null` = 还没查/查不了（拿不到模型清单）。**不能**把 null 当成「都没问题」——
+   * 那会把「暂时查不了」显示成「全部正确」。
+   */
+  const [unknownModels, setUnknownModels] = useState<string[] | null>(null);
+  /**
+   * 提示元素的 ref：它出现时要**滚进可视区**。
+   *
+   * 为什么需要：模型白名单是弹窗里最后一个字段，提示挂在它下面——实测在
+   * 常见窗口高度下，提示会落在弹窗内容区的**可视区之下**（被滚动容器裁掉），
+   * 用户看不到任何东西。而这条提示的全部价值就是「当场看见」，看不见等于没做。
+   * 用 `block:'nearest'`：只在需要时滚最小距离，不会把界面拽跑。
+   */
+  const unknownRef = useRef<HTMLParagraphElement | null>(null);
+  /**
    * 提交锁（同步生效，与 `busy` 的渲染状态无关）。
    *
    * 为什么状态不够：`setBusy(true)` 要等下一次渲染才反映到按钮的 disabled 上，
@@ -129,6 +149,13 @@ export default function KeysPage() {
     load();
   }, [load]);
 
+  // 提示出现时确保它在可视区内（见 unknownRef 的说明）
+  useEffect(() => {
+    if (unknownModels && unknownModels.length) {
+      unknownRef.current?.scrollIntoView({block: 'nearest'});
+    }
+  }, [unknownModels]);
+
   // 密钥状态可能被下游调用改变（配额用尽、过期），心跳刷新保持同步
   useHeartbeat(load, 60000);
 
@@ -136,6 +163,7 @@ export default function KeysPage() {
     setEditing(null);
     // 新建时默认跟随当前所在版本：在哪个版本的界面里建，就是哪个版本的密钥
     setForm({...emptyForm, realm});
+    setUnknownModels(null);
     setFormOpen(true);
   }
 
@@ -153,6 +181,7 @@ export default function KeysPage() {
       quotaCredit: String(k.quota_credit ?? 0),
       realm: k.realm || '',
     });
+    setUnknownModels(null);
     setFormOpen(true);
   }
 
@@ -594,9 +623,34 @@ export default function KeysPage() {
                 <Label className="text-[11px] text-muted-foreground">{t('keys.modelWhitelist')}</Label>
                 <Input
                   value={form.models}
-                  onChange={(e) => setForm({...form, models: e.target.value})}
+                  onChange={(e) => {
+                    setForm({...form, models: e.target.value});
+                    // 改了内容就作废上次结论，避免显示过期的「都对」
+                    setUnknownModels(null);
+                  }}
+                  // 失焦时查一次：不在每次按键时打接口（那是逐字请求），
+                  // 但要早于提交——提交时才发现就得重填一遍
+                  onBlur={async () => {
+                    const names = toLines(form.models);
+                    if (!names.length) {
+                      setUnknownModels([]);
+                      return;
+                    }
+                    try {
+                      const r = await keyApi.checkModels(names, form.realm || '');
+                      setUnknownModels(r.checked ? r.unknown : null);
+                    } catch {
+                      setUnknownModels(null);   // 查不了就不显示，不编造
+                    }
+                  }}
                   placeholder="glm-5.2, global:gpt-5.4"
                 />
+                {unknownModels !== null && unknownModels.length > 0 && (
+                  <p ref={unknownRef}
+                     className="text-[10px] leading-4 text-amber-600 dark:text-amber-400">
+                    {t('keys.modelsUnknown', {names: unknownModels.join(t('common.listSeparator'))})}
+                  </p>
+                )}
                 {/* 模型白名单与版本归属是**两道**检查，都要过：
                     版本归属由上面的选项控制（粗粒度，拦跨版本调用），
                     白名单在版本之内再收窄到具体几个模型（细粒度）。

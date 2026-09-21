@@ -250,6 +250,34 @@ class WebPhraseTest(unittest.TestCase):
         offenders = [key for key, value in self.phrases['en'].items() if _HAN.search(value)]
         self.assertEqual(offenders, [], f'en.phrases 里有 {len(offenders)} 条未翻译：{offenders[:5]}')
 
+    def test_setting_field_concats_have_translations(self) -> None:
+        """设置页里**用 `+` 拼接**的字段文案必须在短语表里有条目。
+
+        为什么单列一条：短语表是「按渲染后的整串」查的，而设置页有若干处
+        desc 用 `+` 把多行拼起来。拼接少打一个字、多一个标点，短语表就**静默
+        匹配不上**——非中文界面下直接显示中文原文（表现为「漏翻」），
+        不报错、不显示键名，只能靠人在英文界面里逐条肉眼比对。
+
+        实测就漏过一条（`请求体上限（旧版上游）`，随上游移除 max_body_mb 引入），
+        直到做这次多语言核对才发现。这里把它钉成机械检查。
+
+        本测试直接复用 `dev/check_phrase_concat.py` 的解析逻辑——两处各写一遍
+        迟早漂移，而它已经有自己的反证验证（改一个字即报出第几字不符）。
+        """
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            'check_phrase_concat', _ROOT / 'dev' / 'check_phrase_concat.py')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        src = (_ROOT / 'web/app/(main)/settings/page.tsx').read_text(encoding='utf-8')
+        concats = mod._concat_strings(src)
+        self.assertTrue(concats, '没解析到任何拼接文案 —— 解析器失效了（会假通过）')
+        for text in concats:
+            for code in ('en', 'ja', 'ko', 'zh-TW'):
+                self.assertIn(text, self.phrases[code],
+                              f'{code} 的短语表缺这条拼接文案（界面会漏翻）：{text[:40]}…')
+
 
 class AlwaysFailingBadgeTest(unittest.TestCase):
     """账号页「一直失败」徽章的判据（issue #14 第二点）。

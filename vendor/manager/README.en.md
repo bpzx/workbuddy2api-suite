@@ -81,8 +81,16 @@ ideas belong in [this repository](https://github.com/ithtelab/workbuddy-manager/
   - The bar also shows a **"last renewed"** timestamp: remaining days get reset by a
     refresh, so the raw number is easy to misread (`7 days` may be freshly renewed while
     `60 days` may never have been refreshed). The timestamp makes it unambiguous
+  - **Automatic renewal**: once under 3 days of validity remain, the panel obtains a new
+    token from Tencent in the background (the upstream only refreshes at its keep-alive
+    hour, or when the account is actively serving traffic — idle accounts would otherwise
+    run all the way to expiry). Results are recorded on the Tasks page
+  - The **refresh token** button now **actually renews and saves** the token instead of
+    just reloading the upstream; if the token can no longer be renewed, it says so and
+    tells you to sign in again
 - **Runtime status** — merged with the upstream pool state (online / cooling down /
-  disabled / expired)
+  disabled / expired); **per-model rate limiting** is flagged separately (the account is
+  still online, only one model is temporarily limited — hover for the reset time)
 - **Credit balance** — current spendable credits per account, colour-coded by level, and
   **queried live from Tencent** (the upstream `/status` value can lag by hours). Fetched on
   page load, updated right after check-in, plus a "Refresh credits" button. Each number is
@@ -92,6 +100,12 @@ ideas belong in [this repository](https://github.com/ithtelab/workbuddy-manager/
   countdown (e.g. `300 · expires in 8 days`, colour-coded by urgency); hover for every
   package's amount, exact expiry time and the total. The dashboard credit card also flags
   the nearest expiry and its amount, so credits don't quietly go to waste
+- **Temporary disable** — when an account is dragging the pool down, take it out instead of
+  deleting it (deleting loses the credentials and forces a re-scan). While disabled it is
+  **never picked for chat traffic, but check-in and token keep-alive keep running**, so its
+  credits and credentials stay alive and you can bring it back at any time. On older
+  upstream versions the panel falls back to fully removing the account from the pool and
+  says so in the message
 - **Credit change ledger** — every channel that increases the balance is recorded. The
   upstream only logs travel rewards; check-in and activity reports log nothing, so we
   compare balances after each credit query and record any increase

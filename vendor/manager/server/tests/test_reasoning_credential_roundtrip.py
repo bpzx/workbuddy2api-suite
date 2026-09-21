@@ -460,13 +460,12 @@ class OutboundFieldNameTest(unittest.TestCase):
         self.assertEqual(msg.get('reasoning'), '先思考')
         self.assertEqual(msg.get('reasoning_content'), '先思考')
 
-    def test_empty_reasoning_writes_no_field(self) -> None:
-        """拿不到文本时**不挂字段**（而不是挂空串）。
+    def test_empty_reasoning_gets_placeholder(self) -> None:
+        """拿不到文本时补一个空格占位。
 
-        社区实测（issue #37）称 `reasoning` 为空串会被拒、非空才过；本仓
-        复现不出那个开关，但两种情况都指向同一结论：挂空串在"会被拒"时有害、
-        在"不会拒"时又无收益（上游兜底本就会补空串）—— 无收益的风险不值得留。
-        改挂为不挂，并记一条 WARN 让这种畸形输入可见。
+        上游 2026-09-19 commit 5657229（采纳 issue #37 的判定表）确认校验是
+        `len(reasoning) > 0` 且不 trim：空白串过闸、空串与缺失都不行。所以
+        畸形输入下补空格；该字段是转发校验位、不影响模型上下文。
         """
         payload = R.to_chat_request({'input': [
             {'type': 'message', 'role': 'user', 'content': 'q'},
@@ -475,8 +474,8 @@ class OutboundFieldNameTest(unittest.TestCase):
              'content': [{'type': 'output_text', 'text': 'a'}]},
         ]})
         msg = self._assistant_msgs(payload)[0]
-        self.assertNotIn('reasoning', msg)
-        self.assertNotIn('reasoning_content', msg)
+        self.assertEqual(msg.get('reasoning'), ' ')
+        self.assertEqual(msg.get('reasoning_content'), ' ')
 
     def test_values_are_always_identical(self) -> None:
         """两个字段的值必须一致 —— 不一致会造出上游无法解释的组合。"""

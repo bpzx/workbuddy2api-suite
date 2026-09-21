@@ -354,6 +354,25 @@ def invalidate(realm: str | None = None) -> None:
     _cache.pop(realm, None)
 
 
+def cached_ids(realm: str) -> set[str] | None:
+    """**缓存里**的模型 id 集合；没有可用缓存时返回 None。
+
+    只读缓存、**不发网络请求**：调用方是「保存密钥」这类路径，不能因为要校验
+    模型名就等一次上游往返（上游慢或挂着时，保存会被拖住甚至超时）。
+    拿不到就返回 None，让调用方**跳过校验**——宁可这次不提示，也不要给假警报。
+
+    缓存里是 `_decorate` 之后的条目，id 形态与 `/v1/models` 一致（`global:`
+    前缀保留、`cn:` 已由上游侧归一）。判据的归一化交给 `keysvc._bare_model`，
+    这里只负责取值。
+    """
+    slot = _cache.get(realm)
+    payload = (slot or {}).get('payload')
+    models = (payload or {}).get('models') if isinstance(payload, dict) else None
+    if not models:
+        return None
+    return {str(m.get('id') or '') for m in models if isinstance(m, dict) and m.get('id')}
+
+
 def summarize(models: list[dict]) -> dict:
     """统计卡数据。全部由清单真实计算，不含推测项。
 

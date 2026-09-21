@@ -33,8 +33,16 @@
   * 「一键更新不可用」的原因与"也可以直接在宿主机执行"**拆成两行** ——
     此前拼成一句，读起来是"请在宿主机执行：未设置 SUITE_UPDATER_TOKEN"，语义不通；
     后端给的原因文案也改写为自带修复方法（"在 .env 里设置 SUITE_UPDATER_TOKEN 即可启用"）。
-  * 「本套件不更新上游」与「容器无法操作 docker」原来写成两句，实际在说同一件事，
-    已**合成一句**（能力标志仍被真实使用：无法操作 docker 时追加一句原因）。
+  * **删掉「上游更新需在宿主机执行：① … ② …」整行**，理由有两条：
+    ① 读者不匹配 —— 本套件由维护者发布并锁定上游快照，部署方（使用者）
+    无法也不应自行同步上游，把维护者的流程写在界面上只会让人以为
+    "我是不是该做点什么"；② 这两块本来就没有按钮，不需要解释"为什么不提供"。
+    同步流程保留在 README「同步上游更新」。
+    连带**不再读取**上游的 `can_update_upstream` 能力标志（本面板没有"更新上游"
+    按钮，要防的"点到做不到的操作"不存在），少一次按轮询周期发生的请求。
+    该标志只以注释形式留在面板文件里并说明这一决定 —— 上游
+    `test_docker_deploy::test_frontend_uses_capability_flag` 按字面量要求它存在；
+    我们的测试同时守住"别把它 wire 回组件状态"。
   * 没有日志时**整块隐藏**更新日志卡片 —— 首次部署满屏的"暂无日志"只是噪音。
   * 文案键从 30 个精简到 27 个，删掉三个没人引用的死键。
 
@@ -177,13 +185,37 @@ CI 新增一步运行它们。
 
 | 上游 | 分支 | Commit | 时间 |
 |---|---|---|---|
-| Sliverkiss/workbuddy2api | `master` | `b08f518` | 2026-09-19 16:44 |
-| ithtelab/workbuddy-manager | `main` | `8bc9b0d` | 2026-09-19 11:41 |
+| Sliverkiss/workbuddy2api | `master` | `d1023f3` | 2026-09-21 09:52 |
+| ithtelab/workbuddy-manager | `main` | `3fb56bd` | 2026-09-20 19:48 |
 
-- wb2api：默认提示词换 GLM5.3 适配版；期间含 WAF 403 软冷却 + 轮转退避、
-  global 域并发分档、成长任务链补全（11+ 提交 / +3387 行）
-- manager：**v1.0.35 → v1.0.57**（跨 20+ 版本 / 50+ 提交：i18n 重构、
-  `can_update_upstream` 能力驱动、Windows 原生部署、DeepSeek 多轮修复等）
+- wb2api：`b08f518 → d1023f3`（15 文件 / +764 −21）：图片 URL 拼接修复、
+  积分口径、成长任务链、WAF 403 处理、pass-through 字段扩充。
+- manager：`8bc9b0d → 3fb56bd`（55 文件 / +6528 −269），**v1.0.57 → v1.0.60**：
+  `/v1/models` 也按模型白名单裁剪（白名单填错当场提示）、账号管理接口开关
+  （让「临时停用」能走上游状态位）、Responses API 展开 namespace 子工具并
+  保留 custom 工具调用、token 续期、时间显示、限流可见性等六个 issue 修复；
+  i18n 补齐并新增一条机械检查。
+
+**本次同步顺带修掉一处存在已久的配置模板漂移**：
+
+- 上游已 **BREAKING 移除** `server.max_body_mb`（请求体改为无上限，见
+  `cmd/server/main.go` 注释与 `TestMaxBodyLegacyKeyIgnored`），而我们的
+  `docker/wb2api.config.template.json` 里还留着 `8` —— 生成的 `config.json`
+  会**声称一个不存在的 8MB 限制**。上游为兼容旧配置容忍该键，所以它不报错，
+  只是**静默地说错话**。
+- 模板还缺上游的 `admin` 段与 `pool` 的 5 个新字段（`max_in_flight_global`、
+  `degrade_threshold`、`degrade_cooldown`、`degrade_cooldown_max`、
+  `cost_explore_interval`）。后者当时没造成行为问题，是因为上游对缺字段会套
+  默认值（`cmd/server/config.go` 的 normalize）——**碰巧安全**，不是设计安全。
+
+处理方式是**不再人工维护这份键列表**：模板改为从上游 `config.example.json`
+生成，只覆盖 `api_key` 与两个数据卷路径；并新增
+`tests/test_config_template.py`（5 项）按**递归键路径**比对模板与上游 example，
+新增/删除/改名/挪层级都会让测试变红。
+
+> 上一轮的锁定值（属更早的版本，不属本条）：wb2api `b08f518`、
+> manager `8bc9b0d`（v1.0.57）。完整的锁定历史见
+> `git log --oneline -- upstreams.json`，权威值始终是 `upstreams.json`。
 
 ### 修复
 

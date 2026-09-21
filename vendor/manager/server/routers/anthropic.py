@@ -90,6 +90,49 @@ def _as_int(value: object) -> int:
         return 0
 
 
+def _usage_fields(usage: dict) -> dict:
+    """把上游 usage 映射成 **Anthropic 口径**的字段。
+
+    ## 两个口径的方向是相反的（这里踩过，务必看清）
+
+      · OpenAI / 上游：`prompt_tokens` **已包含**命中的缓存 token
+        （另在 `prompt_cache_hit_tokens` 里给出命中数，供你展示摊销）；
+      · Anthropic：`input_tokens` **不含**缓存——它把缓存拆成
+        `cache_read_input_tokens`（本次命中读取）与
+        `cache_creation_input_tokens`（本次写入缓存）两个独立字段，
+        客户端统计总量时会把 `input + cache_read + cache_creation` 相加。
+
+    所以**不能把 `prompt_tokens` 直接当 `input_tokens` 发出去**：那样客户端
+    相加时缓存会被算两遍（实测 1024 命中会被计成 2048）。必须减去命中/写入量。
+
+    这条口径差异是社区同学踩过之后反馈的（issue #39 的补充评论），
+    本仓 `responses.py` 的 `_usage_object` 是从相反方向处理同一件事
+    （OpenAI 语义要求 input **含**缓存，所以那边不减）——两处方向相反是**对的**，
+    不要顺手「统一」。
+
+    ## 字段名
+
+    上游给的缓存字段名是 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` /
+    `prompt_cache_write_tokens`；标准名 `cache_read_input_tokens` 在上游响应里
+    恒为 0（实测量过），所以不能读那个。
+
+    没给缓存字段时（多数国内版请求）退化为：input_tokens = prompt_tokens，
+    两个缓存字段为 0 —— 与旧行为一致。
+    """
+    prompt = _as_int(usage.get('prompt_tokens'))
+    completion = _as_int(usage.get('completion_tokens'))
+    hit = _as_int(usage.get('prompt_cache_hit_tokens'))
+    write = _as_int(usage.get('prompt_cache_write_tokens'))
+    # 钳到非负：上游若给了畸形的命中数（> prompt），相减会得到负数，
+    # 客户端拿到负的 input_tokens 会算出更离谱的上下文余量。
+    return {
+        'input_tokens': max(0, prompt - hit - write),
+        'cache_read_input_tokens': hit,
+        'cache_creation_input_tokens': write,
+        'output_tokens': completion,
+    }
+
+
 def _token_candidates(request: Request) -> list[str]:
     """列出请求里**所有**可能的令牌值（去重、保持优先级）。
 
@@ -232,6 +275,36 @@ def _text_of(content: object) -> str:
     return '\n'.join(p for p in out if p)
 
 
+def _estimate_tokens(text: str) -> int:
+    """按字符类别粗略估算 token 数（供 `count_tokens`，估不到上游分词器）。
+
+    分开算的理由见 `count_tokens` 的说明：统一「字符数 / 3」对中文是严重低估，
+    而低估会让客户端以为还能塞更多、真实请求却在发出时被上游以「上下文过长」
+    拒绝，且用户看不出是估算接口给了错数字。高估才是安全方向。
+
+      · CJK（汉字 / 假名 / 韩文）：约 1 字符 1 token（保守取整字符数）；
+      · 其余：约 4 字符 1 token。
+
+    只做数量级估算，**不追求精确**——它唯一的作用是让客户端留够余量。
+    """
+    if not text:
+        return 0
+    cjk = 0
+    other = 0
+    for ch in text:
+        cp = ord(ch)
+        # 汉字（含扩展 A/B）、日文假名、韩文音节与字母、CJK 标点与全角符号。
+        # 判据用码位区间而不是 `unicodedata.east_asian_width`：后者对全角标点
+        # 与韩文 Hangul Jamo 的分类在不同 Python 版本下有差异，区间判定稳定。
+        if (0x3000 <= cp <= 0x9FFF or 0xAC00 <= cp <= 0xD7AF
+                or 0xF900 <= cp <= 0xFAFF or 0xFF00 <= cp <= 0xFFEF
+                or 0x20000 <= cp <= 0x2FA1F):
+            cjk += 1
+        else:
+            other += 1
+    return cjk + (other + 3) // 4
+
+
 def _image_url(source: object) -> str | None:
     """Anthropic 图片块 → data URL。不认识的形态返回 None（由调用方跳过）。"""
     if not isinstance(source, dict):
@@ -367,16 +440,20 @@ def to_openai_request(body: dict) -> dict:
         # 同等对待，上游（workbuddy2api → CodeBuddy）实测能识别为视觉输入。
         parts = tool_images + parts
 
-        # 拿到了空的推理文本（客户端发了 thinking 块、但里面没有可用内容）时按
-        # 「无推理」处理，并记一条 WARN。理由与 responses.py 同名分支一致：
-        # 挂空串在「空串会被拒」的实测结论下有害、在结论不成立时又无收益，故不挂；
-        # 记日志是因为这条路径此前完全静默，真遇到 11155 时无从排查是哪个客户端。
+        # 客户端发了 thinking 块、但里面没有可用内容（畸形输入）时记一条 WARN，
+        # 值**保留**空串 —— 交给 attach_reasoning 补占位（口径见那里）。
         if thinking_text == '':
+            # 空值**保留**（不置回 None）：`attach_reasoning` 见到空值会补一个
+            # 空格交出去 —— 上游校验 len(reasoning)>0 且不 trim，空格过闸、
+            # 空串不过（口径与上游 2026-09-19 commit 5657229 一致）。
+            # 置 None 则整条推理字段都不挂，等于把「有痕迹」退回「没痕迹」。
+            #
+            # 记 WARN：畸形输入（客户端发来空的 thinking 块）此前完全静默，
+            # 真遇到 11155 时看不出是哪个客户端这么发的。
             logger.warning(
-                '客户端发来的 thinking 块无可提取内容 —— 该轮将不带推理内容，'
+                '客户端发来的 thinking 块无可提取内容 —— 将按上游口径补占位，'
                 '若上游报 11155 请把此日志一并提供',
             )
-            thinking_text = None
 
         if tool_calls:
             msg: dict = {'role': 'assistant', 'tool_calls': tool_calls}
@@ -409,6 +486,11 @@ def to_openai_request(body: dict) -> dict:
     for src, dst in (('temperature', 'temperature'), ('top_p', 'top_p')):
         if body.get(src) is not None:
             out[dst] = body[src]
+    # 推理档位（issue #39）：Anthropic 的 output_config.effort / thinking.budget_tokens
+    # → 上游的 reasoning_effort。不映射的话用户选了档位却拿到默认档，且无从自查。
+    effort = _reasoning_effort(body)
+    if effort:
+        out['reasoning_effort'] = effort
     if body.get('stop_sequences'):
         out['stop'] = body['stop_sequences']
     if isinstance(body.get('metadata'), dict) and body['metadata'].get('user_id'):
@@ -468,6 +550,70 @@ def _thinking_enabled(body: dict) -> bool:
     if not isinstance(think, dict):
         return False
     return str(think.get('type') or '').lower() == 'enabled'
+
+
+# Anthropic 的 `output_config.effort` → 上游 `reasoning_effort` 的档位映射。
+#
+# 上游的档位命名取自腾讯 CodeBuddy 官方客户端，其**从低到高**是
+# `off < minimal < low < medium < high < xhigh < max`（见 workbuddy2api 的
+# `payload.go: effortRank`，`effort_catalog.go` 里各模型声明的也正是这套）。
+# 也就是说 **`xhigh` 与 `max` 是两个不同的档**，`max` 更强。
+#
+# Anthropic 侧只用到 low/medium/high/max。名字重合的直接同名透传；`xhigh` 也接受
+# （它本就是上游的合法档，客户端可能直接给出）。
+#
+# **不要把 `max` 降成 `xhigh`**：那会让「选最高档」实际拿到次高档，正是这个映射
+# 要消除的「设了没用」。真正的「该模型支持哪些档」由上游自己的降级管线处理
+# （`normalizeReasoningEffort` 会按 `effortRank` 降到 ≤ 请求档的最高支持档），
+# 我们不重复实现那张表——重复就是两份事实来源。
+_EFFORT_MAP = {
+    'low': 'low',
+    'medium': 'medium',
+    'high': 'high',
+    'xhigh': 'xhigh',
+    'max': 'max',
+}
+
+
+def _reasoning_effort(body: dict) -> str | None:
+    """把 Anthropic 侧的推理档位映射成上游的 `reasoning_effort`（无则 None）。
+
+    两个来源，**优先级**：`output_config.effort`（显式档位）> `thinking.budget_tokens`
+    （按预算分档）。
+
+    为什么必须读它们（issue #39）：客户端（如 Claude Code）用它来控制思考深度，
+    而此前 `to_openai_request` 把 `thinking` 整个吃掉、只用于「要不要回 thinking
+    块」，`output_config` 更是**完全没读**。于是用户选了 high、实际发出去的是
+    上游默认档——用户看到的现象是「调了档位但模型思考深度没变」，没法自查。
+
+    `budget_tokens` → 档位的分界按官方文档的量级取：1024 是最小可用预算，
+    4k 以下算 low、16k 以下算 medium、64k 以下算 high，再往上 max。
+    精度不重要——它是「用户愿意花多少」的粗略表达，而上游还会按模型能力降级。
+    """
+    effort = None
+    cfg = body.get('output_config')
+    if isinstance(cfg, dict):
+        raw = cfg.get('effort')
+        if isinstance(raw, str) and raw.strip():
+            effort = _EFFORT_MAP.get(raw.strip().lower())
+
+    if effort is None:
+        think = body.get('thinking')
+        budget = think.get('budget_tokens') if isinstance(think, dict) else None
+        if isinstance(budget, bool):
+            budget = None
+        if isinstance(budget, (int, float)) and budget > 0:
+            if budget < 4096:
+                effort = 'low'
+            elif budget < 16384:
+                effort = 'medium'
+            elif budget < 65536:
+                effort = 'high'
+            else:
+                # 最高一档是 `max`（不是 `xhigh`）：预算 ≥64k 表达的是「不限思考」，
+                # 对应上游最强档。给 `xhigh` 会让这种请求拿不到应有的深度。
+                effort = 'max'
+    return effort
 
 
 def _thinking_block(text: str) -> dict:
@@ -531,10 +677,9 @@ def to_anthropic_response(data: dict, model: str, *, thinking: bool = False) -> 
         'content': content,
         'stop_reason': _STOP_REASON.get(str(choice.get('finish_reason')), 'end_turn'),
         'stop_sequence': None,
-        'usage': {
-            'input_tokens': _as_int(usage.get('prompt_tokens')),
-            'output_tokens': _as_int(usage.get('completion_tokens')),
-        },
+        # 口径转换见 _usage_fields：Anthropic 的 input 不含缓存，
+        # 直接发 prompt_tokens 会让客户端把缓存算两遍。
+        'usage': _usage_fields(usage),
     }
 
 
@@ -579,6 +724,9 @@ class _StreamTranslator:
         self.saw_content = False
         self.input_tokens = 0
         self.output_tokens = 0
+        # 缓存两段（Anthropic 把它们与 input 并列，见 _usage_fields）
+        self.cache_read = 0
+        self.cache_write = 0
 
     def _start_message(self) -> list[bytes]:
         self.started = True
@@ -645,8 +793,12 @@ class _StreamTranslator:
         # 非流式写法的 usage 也可能出现在末尾帧
         usage = obj.get('usage')
         if isinstance(usage, dict):
+            # 只累积**原始**数值，口径转换留到发送时（_usage_fields）——
+            # 因为 Anthropic 的 input 要减掉缓存，而这里是「上游原始值」。
             self.input_tokens = _as_int(usage.get('prompt_tokens')) or self.input_tokens
             self.output_tokens = _as_int(usage.get('completion_tokens')) or self.output_tokens
+            self.cache_read = _as_int(usage.get('prompt_cache_hit_tokens')) or self.cache_read
+            self.cache_write = _as_int(usage.get('prompt_cache_write_tokens')) or self.cache_write
 
         choices = obj.get('choices')
         if not isinstance(choices, list) or not choices:
@@ -756,10 +908,23 @@ class _StreamTranslator:
         # 出现过工具调用但上游没给 finish_reason 时，按 tool_use 收尾更贴近实际
         if reason is None and force and self.tool_seen:
             reason = 'tool_calls'
+        # message_delta 发的是**累计 usage**，必须把 input_tokens 一并带上。
+        #
+        # 此前只发了 output_tokens —— 而 Anthropic 规范里 input_tokens 应当出现在
+        # 这里（message_start 那一刻上游还没给 usage，所以那里必然是 0，真实值
+        # 只能在末尾补）。少了它，客户端**整条流里再也看不到真实的输入量**，
+        # 只能回退成按字符估算（中文会被低估约 1.5 倍），上下文余量也跟着算错。
+        # 社区实测：网关侧统计 7447 万，客户端只显示 3648 万，差了整整一倍
+        # （issue #39）。
         out.append(_event('message_delta', {
             'type': 'message_delta',
             'delta': {'stop_reason': _STOP_REASON.get(str(reason), 'end_turn'), 'stop_sequence': None},
-            'usage': {'output_tokens': self.output_tokens},
+            'usage': _usage_fields({
+                'prompt_tokens': self.input_tokens,
+                'completion_tokens': self.output_tokens,
+                'prompt_cache_hit_tokens': self.cache_read,
+                'prompt_cache_write_tokens': self.cache_write,
+            }),
         }))
         out.append(_event('message_stop', {'type': 'message_stop'}))
         return out
@@ -986,13 +1151,23 @@ async def count_tokens(request: Request):
     """粗略估算输入 token 数。
 
     Claude Code 等客户端会先调这个接口来决定上下文还能塞多少。我们拿不到
-    上游的分词器，**只能给粗略估算**——所以这里明确按「字符数 / 3」返回，
-    宁可高估（客户端会保守地留更多余量），也不能低估导致真实请求超限。
-    返回结构按协议要求带 `input_tokens`。
+    上游的分词器，**只能给粗略估算**。
 
-    鉴权与 `/v1/messages` 一致：它虽然不产生上游调用、不消耗额度，但同样是对外
-    接口——裸着会让任何人都能借它判断网关是否存活、探测部署规模，也与其余端点
-    的「一律先验密钥」不一致。
+    ## 估算口径：按字符类别分开算（不是统一「字符数 / 3」）
+
+    早先这里是 `(字符数 + 2) // 3`，而注释同时写着「宁可高估」——**两者是矛盾的**：
+    除 3 对 ASCII 大致合理（英文约 4 字符/token），但对中日韩文是**严重低估**
+    （汉字通常 1–1.5 字符/token，除 3 会把一段中文算成实际的 1/3）。用户报的
+    症状正是「估算偏低」（issue #39）：中文调用方按这个数留余量，真实请求却超限。
+
+    高估是安全方向（客户端少塞一点，请求仍能过），低估会让请求在真正发出时被
+    上游以「上下文过长」拒绝，且用户完全看不出是估算接口给了错数字。
+
+    所以按脚本分开加权：
+      · CJK（汉字 / 假名 / 韩文）按 ~1 字符 1 token；
+      · 其余（拉丁、代码、JSON）按 ~4 字符 1 token；
+      · 每个 block 再加一点结构开销（role、分隔符等），因为真实分词时
+        消息边界会引入额外 token，纯按字符数算必然偏低。
     """
     # 体积上限：这个端点同样对外开放，不能成为绕过网关请求体上限的后门
     # （gateway._read_json_body 逐块累加、不信任 Content-Length，正是为此）。
@@ -1013,13 +1188,20 @@ async def count_tokens(request: Request):
         return auth_err
 
     total = 0
+    blocks = 0
     system = body.get('system')
     if system:
-        total += len(_text_of(system) if not isinstance(system, str) else system)
+        blocks += 1
+        total += _estimate_tokens(
+            _text_of(system) if not isinstance(system, str) else system)
     for msg in body.get('messages') or []:
         if isinstance(msg, dict):
-            total += len(_text_of(msg.get('content')))
+            blocks += 1
+            total += _estimate_tokens(_text_of(msg.get('content')))
     for tool in body.get('tools') or []:
         if isinstance(tool, dict):
-            total += len(json.dumps(tool, ensure_ascii=False))
-    return JSONResponse({'input_tokens': max(1, (total + 2) // 3)})
+            blocks += 1
+            total += _estimate_tokens(json.dumps(tool, ensure_ascii=False))
+    # 每块 4 token 的结构开销：消息/工具边界在真实分词里都要额外占位。
+    # 这部分是「宁可高估」的落点之一。
+    return JSONResponse({'input_tokens': max(1, total + blocks * 4)})

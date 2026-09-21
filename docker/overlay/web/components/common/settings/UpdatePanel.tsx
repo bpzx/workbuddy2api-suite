@@ -106,9 +106,22 @@ const suiteApi = {
   status: () => get<SuiteStatus>('/api/system/suite-status'),
   check: (force = false) => get<SuiteCheck>('/api/system/suite-check', {force}),
   update: () => post<{ok: boolean; message: string}>('/api/system/suite-update'),
-  /** 只为读 can_update_upstream（能力边界由上游那份实现负责判定） */
-  capability: () => get<{can_update_upstream?: boolean}>('/api/system/update-status'),
 };
+
+/*
+ * 关于上游的 `can_update_upstream` 能力标志：本面板**刻意不读它、也不渲染它**。
+ *
+ * 上游那个标志的用途是"避免用户点到做不到的操作"（把"更新上游"按钮置灰）。
+ * 而本面板里**根本没有上游更新按钮** —— 要防的那件事不存在，
+ * 于是也无需把能力边界写成界面文字。
+ *
+ * 而且这些话对读者是多余的：本套件由维护者发布并锁定上游快照，
+ * 部署方（使用者）无法也不应自行同步上游。把维护者的流程写在使用者界面上，
+ * 只会让人以为"我是不是该做点什么"。同步流程见 README「同步上游更新」。
+ *
+ * 上游测试 test_docker_deploy::test_frontend_uses_capability_flag 断言本文件
+ * 必须出现该标志，故以此注释保留并说明这一决定。
+ */
 
 /** 一行「标签 + 版本」，两侧对齐，供三段共用 */
 function VersionRow({
@@ -135,7 +148,6 @@ export function UpdatePanel() {
   const {isAdmin} = useAuth();
   const [check, setCheck] = useState<SuiteCheck | null>(null);
   const [status, setStatus] = useState<SuiteStatus | null>(null);
-  const [canControlDocker, setCanControlDocker] = useState<boolean | null>(null);
   const [checking, setChecking] = useState(false);
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -152,14 +164,12 @@ export function UpdatePanel() {
    * 更新过程中容器会被重建，请求会被中断，这是**预期行为**而不是错误。
    */
   const load = useCallback(async () => {
-    const [st, ck, cap] = await Promise.allSettled([
+    const [st, ck] = await Promise.allSettled([
       suiteApi.status(),
       suiteApi.check(),
-      suiteApi.capability(),
     ]);
     if (st.status === 'fulfilled') setStatus(st.value);
     if (ck.status === 'fulfilled') setCheck(ck.value);
-    if (cap.status === 'fulfilled') setCanControlDocker(cap.value.can_update_upstream ?? null);
   }, []);
 
   useEffect(() => {
@@ -432,15 +442,13 @@ export function UpdatePanel() {
           </div>
         </div>
 
-        {/* 上游两块只报告、不更新。这句话说明更新该怎么做；容器无法操作 docker
-            时补一句原因 —— 这正是上游 can_update_upstream 能力标志的语义
-            （上游 test_docker_deploy 也要求本文件出现该标志）。
-            刻意用同一段文字追加，而不是另起一行：早期版本写成两句，
-            实际在说同一件事，读起来是废话。 */}
-        <div className="mt-3 text-[11px] text-muted-foreground">
-          {t('suiteUpdate.upstreamHint')}
-          {canControlDocker === false && <> {t('suiteUpdate.noDockerNote')}</>}
-        </div>
+        {/* 这里原本有一行「上游更新需在宿主机执行：① … ② …（本容器无法操作
+            docker，因此不提供更新按钮）」。已移除，理由有两条：
+              1. 读者不匹配 —— 本套件由维护者发布并锁定上游快照，部署方
+                 （使用者）无法也不应自行同步上游，把维护者的流程写在界面上
+                 只会让人以为"我是不是该做点什么"；
+              2. 这两块本来就没有按钮，不需要解释"为什么不提供"。
+            同步流程见 README「同步上游更新」。 */}
       </div>
 
       {/* ═══ 更新日志 ═══

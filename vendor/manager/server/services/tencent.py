@@ -199,6 +199,109 @@ async def poll_login(state: str, realm: Realm | None = None) -> dict:
     }
 
 
+def _atomic_write_json(target: Path, payload: dict) -> None:
+    """把 payload 以**原子替换**方式写到 target（临时文件 + os.replace）。
+
+    为什么必须原子（不能直接 write_text）：上游 2026-09-18 起新增了 auths 目录
+    热加载——每 5 秒轮询目录指纹（文件名 + mtime + 大小），一有变化就重新全量
+    加载。而 `write_text` 是「先截断再写」，中间存在**长度为 0 的窗口**；轮询若
+    正好落在那里，读到空文件 → `Parse` 失败 → 该账号被判定为「已删除」而从池里
+    剔除，随后才被写回。表现是账号偶发地短时间掉线，且日志里看不出原因（大概率
+    碰不上，但轮询是永久的，迟早会碰上）。
+
+    上游自己也依赖这个前提：其 watch.go 注释写明「半写入的临时文件
+    （login.sh 用 tempfile + os.replace 原子替换）不会造成误判」—— 我们的写入
+    路径必须符合同一个约定。
+
+    临时文件名以 `.` 开头且不以 `.json` 结尾：既不会被上游的 `workbuddy*.json`
+    glob 收到，也不会被它的目录指纹计入（指纹只统计 `.json`）。
+
+    **名字必须唯一**（mkstemp 的随机后缀），不能用固定的 `.workbuddy-x.json.tmp`：
+    同一账号被并发写入时（批量扫码、或用户连点重试），两次写会共用同一个临时
+    文件——先完成者 `os.replace` 成功后该临时文件已不存在，后完成者的 replace
+    失败并触发清理，把对方刚写好的内容一并删掉。实测 4 个并发线程全部报错、
+    且原账号文件消失。唯一名让每次写各自独立。
+
+    权限**必须显式放宽**：mkstemp 在 Linux 上固定创建 0600，而这里写入的文件是
+    给**上游**读的 —— 宿主部署下本面板以 root 写、上游容器以 uid 10001 读，
+    0600 会让上游读不到该账号（表现为账号加进去了但池里没有）。原来的
+    `write_text` 走 umask（典型 0644），这里要保持同样的可读性。
+
+    为什么不照抄上游 SaveAtomic 的 0o600：上游是「同一个进程既写又读」，
+    0600 自洽；我们是跨 uid 写读，前提不同。
+    """
+    fd, tmp_name = tempfile.mkstemp(prefix=f'.{target.name}.', suffix='.tmp',
+                                    dir=str(target.parent))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False, indent=1))
+        os.chmod(tmp_name, 0o644)
+        os.replace(tmp_name, target)
+    except Exception:
+        # 失败时清掉临时文件，避免在 auths 目录里留垃圾（它不会被加载，但会让人困惑）
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def update_auth_tokens(filename: str, fields: dict) -> None:
+    """就地更新账号文件里的 token 字段，**其余原样保留**（issue #40）。
+
+    与 `write_auth_file` 的分工：那个是「新建/重登」，按登录响应重建整份文件；
+    这个是「续期」，只动 `auth` 下几个键。**必须保留未知键**——账号文件里还有
+    `device_token` 等上游写入的字段，重建式写入会把它们冲掉（device_token 是
+    设备风控凭据，丢了会静默降级风控形态）。
+
+    只接受 `auth.*` 与顶层 `device_token` 之外的键由调用方负责，这里只做：
+      · 合并 `fields` 里的 accessToken / refreshToken / expiresAt / domain 到 auth；
+      · 原子替换写回。
+
+    文件不存在时抛 FileNotFoundError；解析失败时抛 ValueError（宁可不写，
+    也不要把一份坏内容覆盖到用户仅存的凭证上）。
+    """
+    target = _safe_auth_path(filename)
+    try:
+        raw = json.loads(target.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f'账号文件无法解析，已放弃写入：{exc}') from exc
+    if not isinstance(raw, dict):
+        raise ValueError('账号文件格式异常，已放弃写入')
+
+    auth = raw.get('auth')
+    if not isinstance(auth, dict):
+        auth = {}
+        raw['auth'] = auth
+    if 'access_token' in fields:
+        auth['accessToken'] = fields['access_token']
+    if 'refresh_token' in fields:
+        auth['refreshToken'] = fields['refresh_token']
+    if 'expires_at' in fields:
+        auth['expiresAt'] = fields['expires_at']
+    if 'domain' in fields:
+        auth['domain'] = fields['domain']
+    # realm 若缺失则补上（与 write_auth_file 同口径，用 resolve_realm 不含逃生门）
+    if not auth.get('realm'):
+        auth['realm'] = resolve_realm(raw.get('realm'),
+                                      str(auth.get('domain') or ''))
+
+    _atomic_write_json(target, raw)
+
+
+def _safe_auth_path(filename: str) -> Path:
+    """把文件名解析为 auths 目录下的真实路径（与 wb2api._safe_file 同口径）。"""
+    if ('/' in filename or '\\' in filename or '..' in filename
+            or '\x00' in filename):
+        raise ValueError('非法的文件名')
+    base = filename[:-len('.disabled')] if filename.endswith('.disabled') else filename
+    if not re.fullmatch(r'workbuddy[A-Za-z0-9_.-]*\.json', base):
+        raise ValueError('非法的文件名')
+    return config.AUTH_DIR / filename
+
+
 def write_auth_file(account: dict) -> tuple[str, bool]:
     """严格按 workbuddy2api 的嵌套结构落盘，返回 (文件名, 是否覆盖)。
 
@@ -253,49 +356,106 @@ def write_auth_file(account: dict) -> tuple[str, bool]:
     if old_device_token:
         payload['device_token'] = old_device_token
 
-    # **原子替换**（临时文件 + os.replace），不能直接 write_text。
-    #
-    # 为什么必须这样：上游 2026-09-18 起新增了 auths 目录热加载——每 5 秒轮询
-    # 目录指纹（文件名 + mtime + 大小），一有变化就重新全量加载。而 `write_text`
-    # 是「先截断再写」，中间存在**长度为 0 的窗口**；轮询若正好落在那里，读到空文件
-    # → `Parse` 失败 → 该账号被判定为「已删除」而从池里剔除，随后才被写回。
-    # 表现是账号偶发地短时间掉线，且日志里看不出原因（大概率碰不上，但轮询是永久的，
-    # 迟早会碰上）。
-    #
-    # 上游自己也依赖这个前提：其 watch.go 注释写明「半写入的临时文件
-    # （login.sh 用 tempfile + os.replace 原子替换）不会造成误判」—— 我们的写入
-    # 路径必须符合同一个约定。
-    #
-    # 临时文件名以 `.` 开头且不以 `.json` 结尾：既不会被上游的 `workbuddy*.json`
-    # glob 收到，也不会被它的目录指纹计入（指纹只统计 `.json`）。
-    #
-    # **名字必须唯一**（mkstemp 的随机后缀），不能用固定的 `.workbuddy-x.json.tmp`：
-    # 同一账号被并发写入时（批量扫码、或用户连点重试），两次写会共用同一个临时
-    # 文件——先完成者 `os.replace` 成功后该临时文件已不存在，后完成者的 replace
-    # 失败并触发清理，把对方刚写好的内容一并删掉。实测 4 个并发线程全部报错、
-    # 且原账号文件消失。唯一名让每次写各自独立。
-    fd, tmp_name = tempfile.mkstemp(prefix=f'.{target.name}.', suffix='.tmp',
-                                    dir=str(target.parent))
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
-            fh.write(json.dumps(payload, ensure_ascii=False, indent=1))
-        # **必须显式放宽权限**：mkstemp 在 Linux 上固定创建 0600，而这里写入的
-        # 文件是给**上游**读的 —— 宿主部署下本面板以 root 写、上游容器以 uid
-        # 10001 读，0600 会让上游读不到该账号（表现为账号加进去了但池里没有）。
-        # 原来的 `write_text` 走 umask（典型 0644），这里要保持同样的可读性。
-        #
-        # 为什么不照抄上游 SaveAtomic 的 0o600：上游是「同一个进程既写又读」，
-        # 0600 自洽；我们是跨 uid 写读，前提不同。
-        os.chmod(tmp_name, 0o644)
-        os.replace(tmp_name, target)
-    except Exception:
-        # 失败时清掉临时文件，避免在 auths 目录里留垃圾（它不会被加载，但会让人困惑）
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
+    # 原子替换的完整理由见 `_atomic_write_json`（热加载读到空文件会误判账号被删）
+    _atomic_write_json(target, payload)
     return target.name, existed
+
+
+async def refresh_token(auth: dict) -> tuple[bool, str, dict]:
+    """用 refreshToken 换新的 accessToken（issue #40）。
+
+    返回 `(是否成功, 说明, 新字段)`；成功时 `新字段` 含
+    `access_token` / `refresh_token` / `expires_at`（后两者可能缺省 = 上游没返回、
+    保持旧值）。
+
+    ## 为什么管理端要自己实现这一步
+
+    上游 workbuddy2api **有**刷新能力（`internal/upstream/client.go` 的
+    `RefreshToken`），但它**没有任何对外接口**——其路由表里只有
+    `/v1/chat/completions`、`/v1/models`、`/status`、`/v1/stats` 与三个
+    `/admin/accounts/...`（后者还默认关闭）。刷新只发生在三个**内部**时机：
+
+      · 保活排程（`schedule.keepalive_hours`，默认每天 22 点一次）；
+      · 每次 chat 选号后、token 距到期不足 `RefreshSkew`（默认 10 分钟）时；
+      · 签到前 token 临近过期时。
+
+    所以「点了刷新按钮却没续期」不是偶然而是**必然**：面板此前那个按钮只是
+    触发一次上游重载（`reload.restart_now()`），而重载既不续期、也不改变任何
+    token。用户报的 issue #40 正是这个——他期待「刷新」能做它字面承诺的事。
+
+    ## 协议
+
+    `POST {chat_base}/v2/plugin/auth/token/refresh`，refreshToken 走
+    **`X-Refresh-Token` 头**（不是 body），响应 `{accessToken, refreshToken,
+    expiresIn, domain}`。与上游 `RefreshHeaders` 对齐：
+    `X-Auth-Refresh-Source: plugin` 是官方客户端的刷新渠道标识，缺了可能被风控
+    当异常来源（上游 D3 实测）。
+    """
+    refresh = str(auth.get('refresh_token') or '').strip()
+    if not refresh:
+        return False, '该账号没有 refreshToken（只能重新扫码或登录）', {}
+
+    realm = realm_of(auth)
+    uid = str(auth.get('uid') or '')
+    enterprise_id = str(auth.get('enterprise_id') or '')
+    # 刷新带的是旧 accessToken（上游同样用刷新前的值构造头）
+    headers = _hdr(realm, str(auth.get('access_token') or ''), uid)
+    headers['X-Refresh-Token'] = refresh
+    headers['X-Auth-Refresh-Source'] = 'plugin'
+    if enterprise_id:
+        headers['X-Enterprise-Id'] = enterprise_id
+    if uid:
+        headers['X-User-Id'] = uid
+    _dt = device_token_for(auth)
+    if _dt:
+        headers['X-Device-Token'] = _dt
+
+    url = f'{chat_base(realm)}/v2/plugin/auth/token/refresh'
+    try:
+        async with config.http_client(config.TENCENT_TIMEOUT, connect=5) as client:
+            resp = await client.post(url, headers=headers)
+    except Exception as exc:  # noqa: BLE001
+        return False, f'刷新异常: {exc}', {}
+
+    if resp.status_code >= 400:
+        # 12153 / session dead 的典型表现：refreshToken 也失效了，只能重新登录。
+        # 说清楚「该重新扫码」比让用户反复点刷新有用。
+        return False, (f'刷新失败（HTTP {resp.status_code}）——'
+                       '若反复失败说明登录态已失效，需重新扫码或登录'), {}
+
+    try:
+        data = resp.json()
+    except Exception:  # noqa: BLE001
+        return False, '刷新响应不是 JSON', {}
+
+    # 上游可能把结果包在 data 里（与登录接口同风格），两种形态都认
+    body = (data.get('data') if isinstance(data, dict)
+            and isinstance(data.get('data'), dict) else data)
+    if not isinstance(body, dict):
+        return False, '刷新响应格式异常', {}
+    new_access = str(body.get('accessToken') or '')
+    if not new_access:
+        return False, '刷新响应里没有 accessToken —— 需重新扫码或登录', {}
+
+    out: dict = {'access_token': new_access}
+    new_refresh = str(body.get('refreshToken') or '')
+    if new_refresh:
+        out['refresh_token'] = new_refresh
+    # expiresIn 缺省时**保留旧到期时间**（与上游 preserveExpiry 同口径）：
+    # 拿不到就不要乱写，否则会把有效期改成错的值、让面板显示误导信息。
+    expires_in = body.get('expiresIn')
+    if isinstance(expires_in, bool):
+        expires_in = None
+    if isinstance(expires_in, (int, float)) and 0 < expires_in < 10 * 365 * 86400:
+        out['expires_at'] = int(time.time() + expires_in)
+    if isinstance(body.get('domain'), str) and body['domain']:
+        out['domain'] = body['domain']
+
+    when = out.get('expires_at')
+    if when:
+        left = max(0, when - int(time.time()))
+        return True, f'刷新成功，新令牌有效期 {left // 86400} 天', out
+    return True, '刷新成功（上游未返回有效期，沿用原值）', out
 
 
 async def checkin(access_token: str | dict, realm: Realm = CN) -> tuple[int, str]:

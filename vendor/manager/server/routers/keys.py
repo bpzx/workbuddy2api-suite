@@ -6,7 +6,8 @@ import ipaddress
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from .. import keysvc, security
+from .. import db, keysvc, security
+from ..services import modelcatalog
 from ..iputil import client_ip
 
 router = APIRouter(prefix='/api/keys', tags=['keys'])
@@ -69,6 +70,47 @@ class KeyPatch(BaseModel):
     quota: int | None = None
     quota_credit: float | None = None
     realm: str | None = None
+
+
+class WhitelistCheckIn(BaseModel):
+    models: list[str] = Field(default_factory=list)
+    realm: str = Field(default='', max_length=16)
+
+
+@router.post('/check-models')
+def check_models(body: WhitelistCheckIn,
+                 user: dict = Depends(security.current_user)) -> dict:
+    """检查模型白名单里哪些名字**匹配不到已知模型**（issue #46 的可选做法 2）。
+
+    为什么要有个接口而不是前端自己比对：判据必须与调用侧**同一份**
+    （`keysvc._bare_model` 的去 `cn:` 前缀、保留 `global:` 口径）。前端再实现
+    一遍就是第二份事实来源，迟早漂移——而"两处口径不一致"正是 issue #46 的成因。
+
+    **拿不到清单时不猜**（两种粒度）：
+
+      · 两份清单都拿不到 → `checked: false`，前端如实显示「暂时无法校验」；
+      · 只有一份拿得到 → **只判那一版的条目**，另一版的条目原样放过。因为两个版本
+        的清单是分开取的，拿国内版清单去判 `global:xxx` 必然判成"找不到"——那是
+        假警报，用户会去改一个本来正确的名字（比不提示更糟）。
+
+    校验刻意**只读缓存、不发网络**：它挂在输入框失焦上，不该让一次上游慢响应把
+    交互拖住；而且校验失败是可接受的（下次再看），打上游失败反而更糟。
+    """
+    names = [str(x).strip() for x in body.models if str(x).strip()]
+    if not names:
+        return {'checked': True, 'unknown': []}
+
+    # 两个版本的清单**分别取、分别判**（见 docstring 里的假警报说明）
+    known_by_realm: dict[str, set[str] | None] = {
+        r: modelcatalog.cached_ids(r) for r in ('cn', 'global')
+    }
+    if all(v is None for v in known_by_realm.values()):
+        return {'checked': False, 'unknown': [],
+                'reason': '暂时读不到模型清单（去「模型」页刷新一次再回来）'}
+
+    aliases = list((db.get_setting('model_map', {}) or {}).keys())
+    unknown = keysvc.unknown_whitelist_entries(names, known_by_realm, aliases)
+    return {'checked': True, 'unknown': unknown}
 
 
 @router.get('')

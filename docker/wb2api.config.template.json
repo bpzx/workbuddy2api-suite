@@ -1,29 +1,43 @@
 {
-  "_comment": "workbuddy2api 配置模板（首次启动由 entrypoint 生成到 /data/config.json）。字段结构对齐上游 vendor/wb2api/config.example.json，仅路径改为容器内布局。",
+  "_comment": "workbuddy2api 配置模板：首次启动时由 entrypoint 生成到 /data/config.json，并把 api_key 换成随机值。键集必须与上游 vendor/wb2api/config.example.json 一致（由 tests/test_config_template.py 强制），只有 api_key 与两个路径是容器化的覆盖值。容器内不设任何 WB2A_* 环境变量 —— config.json 是唯一事实来源。",
   "listen": ":7863",
   "api_key": "REPLACED_AT_FIRST_BOOT",
   "auth_dir": "/data/auths",
   "state_file": "/data/state.json",
-  "server": {
-    "max_body_mb": 8
-  },
   "cooldown": {
     "soft_rate": "600s",
     "soft_rate_max": "2h"
   },
   "schedule": {
-    "checkin_hours": [9, 21],
-    "travel_hours": [9, 21],
-    "activity_hours": [10],
-    "keepalive_hours": [22],
-    "school_hours": [12],
-    "cat_hours": [1],
+    "checkin_hours": [
+      9,
+      21
+    ],
+    "travel_hours": [
+      9,
+      21
+    ],
+    "activity_hours": [
+      10
+    ],
+    "keepalive_hours": [
+      22
+    ],
+    "school_hours": [
+      12
+    ],
+    "cat_hours": [
+      1
+    ],
     "checkin_enabled": true,
     "travel_enabled": true,
     "activity_enabled": true,
     "keepalive_enabled": true,
     "school_enabled": true,
     "cat_enabled": true
+  },
+  "admin": {
+    "enabled": false
   },
   "global": {
     "enabled": true,
@@ -55,12 +69,17 @@
   },
   "pool": {
     "max_in_flight": 3,
+    "max_in_flight_global": 2,
     "breaker_threshold": 3,
     "breaker_cooldown": "30m",
     "breaker_cooldown_max": "6h",
+    "degrade_threshold": 5,
+    "degrade_cooldown": "10m",
+    "degrade_cooldown_max": "2h",
     "idle_weight_per_hour": 0.5,
     "idle_weight_max": 5.0,
-    "expiring_soon": "168h"
+    "expiring_soon": "168h",
+    "cost_explore_interval": "30m"
   },
   "session_sticky": {
     "enabled": true,

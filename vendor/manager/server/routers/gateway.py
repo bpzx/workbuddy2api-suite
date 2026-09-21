@@ -483,26 +483,79 @@ def _as_anthropic_models(payload: object) -> object:
     }
 
 
-def _scope_models(payload: object, key: dict | None) -> object:
-    """按密钥版本裁剪模型列表（未限定版本时原样返回）。
+def _model_realm_of(m: object) -> str:
+    """清单条目的版本：`global:` 前缀 = 国际版，其余 = 国内版。"""
+    return 'global' if str((m or {}).get('id') or '').lower().startswith('global:') else 'cn'
 
-    上游的 /v1/models 用 `cn:` / `global:` 前缀区分版本，判定与
-    db.realm_of_model 保持一致（这也是网关转发时上游实际用的路由依据）。
+
+def _alias_entries(items: list, allow: list[str]) -> list[dict]:
+    """白名单里写的是**别名**时，补一条以别名为 id 的模型条目（issue #46）。
+
+    别名（设置页「模型映射」）是给下游用的名字，它**不在上游模型清单里**。
+    若只按清单字面裁剪，白名单填成别名的密钥会拿到**空列表**——而那个别名明明
+    能调用（鉴权判的是请求里的名字，模型映射发生在鉴权**之后**）。空列表比不裁
+    更糟：客户端会显示「没有可用模型」，用户看不出是自己把名字写成了别名。
+
+    条目取别名所指模型的信息，只把 `id` 换成别名——**那才是客户端要发的名字**
+    （发清单里的真名会被白名单拒掉）。
+    """
+    mapping = db.get_setting('model_map', {}) or {}
+    if not isinstance(mapping, dict) or not mapping:
+        return []
+    by_bare: dict[str, dict] = {}
+    for m in items:
+        if isinstance(m, dict) and m.get('id'):
+            by_bare.setdefault(keysvc._bare_model(m.get('id')), m)
+    out: list[dict] = []
+    seen: set[str] = set()
+    for raw in allow:
+        name = keysvc._bare_model(raw)
+        # 本身就是清单里的模型 → 上面的白名单裁剪已保留它，不重复添加
+        if not name or name in seen or name in by_bare:
+            continue
+        target = mapping.get(name)
+        src = by_bare.get(keysvc._bare_model(target)) if target else None
+        if not src:
+            continue          # 别名指向的模型不在本版本清单里 → 调不通，不给
+        out.append({**src, 'id': name})
+        seen.add(name)
+    return out
+
+
+def _scope_models(payload: object, key: dict | None) -> object:
+    """按密钥的**版本**与**模型白名单**裁剪模型列表。
+
+    这个接口要回答的是「**你能用**什么模型」——客户端普遍拿它当模型选择器
+    （issue #46）。所以两维都得裁：只裁版本会出现「列表里有、一选就失败」
+    （白名单外的模型照旧列出来，选中就 400）。
+
+    白名单判据与调用侧**共用 `keysvc.model_allowed`**，不另写一份：两处各写一遍
+    迟早漂移，而漂移的表现正是这个函数要修的问题。白名单为空 = 不限制，这一维
+    不裁（与调用侧语义一致）。
+
     结构不是预期的 `{data: [...]}` 时**原样透传**——配额耗尽之类的判断
     不该因为我们认不出结构就去改动上游的响应。
     """
-    want = keysvc._norm_realm((key or {}).get('realm'))
-    if not want or not isinstance(payload, dict):
+    key = key or {}
+    want = keysvc._norm_realm(key.get('realm'))
+    allow = [str(x) for x in (key.get('models') or []) if str(x).strip()]
+    if not want and not allow:
+        return payload
+    if not isinstance(payload, dict):
         return payload
     items = payload.get('data')
     if not isinstance(items, list):
         return payload
-    kept = [
-        m for m in items
-        if isinstance(m, dict)
-        and ('global' if str(m.get('id') or '').lower().startswith('global:') else 'cn') == want
-    ]
-    return {**payload, 'data': kept}
+
+    in_realm = [m for m in items
+                if isinstance(m, dict) and (not want or _model_realm_of(m) == want)]
+    if not allow:
+        return {**payload, 'data': in_realm}
+
+    scoped = [m for m in in_realm if keysvc.model_allowed(key, m.get('id'))]
+    # 别名：白名单可能写的是下游熟悉的别名，它不在清单里，要补进来
+    scoped += _alias_entries(in_realm, allow)
+    return {**payload, 'data': scoped}
 
 
 # ── 对话补全（v1 / v2）──────────────────────────────────

@@ -61,8 +61,16 @@ class OverlayMarkerTest(unittest.TestCase):
                               f'{f.name} 缺少 SUITE-OVERLAY 标记')
 
     def test_update_panel_keeps_capability_flag(self) -> None:
-        """上游 test_docker_deploy 断言该串必须存在（界面要透出能力边界）。"""
-        self.assertIn('can_update_upstream', _PANEL.read_text(encoding='utf-8'))
+        """上游 test_docker_deploy 断言本文件必须出现该串（按字面量检查）。
+
+        本面板**不渲染**这个能力标志：这里根本没有"更新上游"按钮，要防的
+        "点到做不到的操作"不存在，也就无需解释"为什么不提供"。它只以注释形式
+        存在并说明这一决定。下面顺手守住"别把它wire回组件状态"。
+        """
+        src = _PANEL.read_text(encoding='utf-8')
+        self.assertIn('can_update_upstream', src)
+        self.assertNotIn('canControlDocker', src,
+                         '能力标志不该再驱动界面状态（本面板没有上游更新按钮）')
 
     def test_update_panel_uses_heartbeat_not_raw_interval(self) -> None:
         """手写 setInterval 会踩上游的轮询可见性守卫，必须用现成的 useHeartbeat。

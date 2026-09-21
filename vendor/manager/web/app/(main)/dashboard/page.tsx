@@ -115,7 +115,7 @@ export default function DashboardPage() {
   /** 可用性分档的汇总（只统计「能正常调用」的，与账号页说法一致） */
   const availability = useMemo(() => {
     const counts: Record<AvailabilityTier, number> = {
-      disabled: 0, disabledByPanel: 0, expired: 0, unknown: 0, cooling: 0,
+      disabled: 0, disabledByPanel: 0, manualDisabled: 0, expired: 0, unknown: 0, cooling: 0,
       neverSucceeded: 0, notLoaded: 0, online: 0,
     };
     for (const a of scoped) counts[availabilityOf(a)] += 1;
@@ -129,8 +129,9 @@ export default function DashboardPage() {
    *
    * 两类**刻意不计入**：
    *   · unknown（读不到上游）——那是我们看不到，不是账号有问题；
-   *   · disabledByPanel（面板主动停用）——那是用户自己的决定，不需要「处理」，
-   *     计进去会让卡片一直提示「N 个不可用」而用户其实已经处理完了。
+   *   · disabledByPanel / manualDisabled（主动停用）——那是用户自己的决定，
+   *     不需要「处理」，计进去会让卡片一直提示「N 个不可用」而用户其实已经
+   *     处理完了（两种机制同属这一类，只是实现不同）。
    */
   const unusable = availability.notLoaded + availability.disabled
     + availability.neverSucceeded + availability.cooling;

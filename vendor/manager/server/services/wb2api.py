@@ -241,6 +241,13 @@ def merge_pool_status(accounts: list[dict], status: dict) -> list[dict]:
         _rl = p.get('rate_limited_models')
         a['rate_limited_models'] = _rl if isinstance(_rl, list) else []
         a['disabled'] = bool(p.get('disabled'))
+        # 运维手动停用（上游 issue #138/#118，本面板 issue #45）。与 `disabled`
+        # **并列独立**：那个是上游按错误分类自动禁的（11140 需重新登录），
+        # 这个是运维主动摘的，前者可 revive、后者该 enable。上游对叠加态
+        # 两个字段分别透出，我们照搬，前端才能把「系统判定坏了」与
+        # 「我主动摘的」分开说——合并成一个字段会互相覆盖（上游注释的原话）。
+        a['manual_disabled'] = bool(p.get('manual_disabled'))
+        a['manual_reason'] = str(p.get('manual_reason') or '')
         # 禁用原因：上游对 11140（request illegal，需重新 OAuth 登录）会**硬禁用**
         # 账号（到期也不自愈），对 14017（试用未激活）只软冷却。展示原因才能
         # 让用户知道该去重新登录，而不是干等冷却。
@@ -289,7 +296,35 @@ def delete_auth_account(filename: str) -> bool:
 # 「临时禁用」的文件名标记：加在 `.json` 之后，于是**不再匹配上游的
 # `workbuddy*.json` glob**，上游重启后就不会加载它——这是不修改上游代码
 # 就能真正停用某个账号的唯一办法（见 set_account_disabled 的说明）。
-_DISABLED_SUFFIX = '.disabled'
+DISABLED_SUFFIX = '.disabled'
+# 兼容旧引用（本文件内部原先叫 _DISABLED_SUFFIX）
+_DISABLED_SUFFIX = DISABLED_SUFFIX
+
+
+def read_account_file_any(filename: str) -> dict:
+    """读账号文件，`workbuddy-x.json` 与 `workbuddy-x.json.disabled` **两种形态都试**。
+
+    为什么需要：调用方手里的文件名可能与磁盘上的形态不一致——界面在「停用」
+    之后仍然持有旧名字（心跳刷新前），或反过来用户刚停用就点了启用。只按
+    传进来的名字读会 FileNotFoundError，于是 uid 解析不出来，依赖 uid 的
+    路径（上游状态位）就被静默跳过，功能看着「没生效」。
+
+    两种形态都不存在时抛最后一个异常（FileNotFoundError），语义与
+    `read_account_file` 一致。
+    """
+    candidates = [filename]
+    if filename.endswith(DISABLED_SUFFIX):
+        candidates.append(filename[: -len(DISABLED_SUFFIX)])
+    else:
+        candidates.append(filename + DISABLED_SUFFIX)
+    last: FileNotFoundError | None = None
+    for name in candidates:
+        try:
+            return read_account_file(name)
+        except FileNotFoundError as exc:
+            last = exc
+    assert last is not None          # 至少两个候选，循环必然执行过
+    raise last
 
 
 def set_account_disabled(filename: str, disabled: bool) -> dict:
@@ -374,6 +409,89 @@ async def get_status() -> dict:
         return data
     except Exception as exc:  # noqa: BLE001
         return {'connected': False, 'error': _err_text(exc)}
+
+
+def _admin_route_missing(resp: object) -> bool:
+    """判断这次 404 是「接口没注册」还是「账号不在池里」。
+
+    两者都是 404，但含义完全相反，处理方式也相反——前者要回退到改名，
+    后者是真错误（改名同样救不了）。上游对这两种 404 的响应体不同：
+
+      · **接口没注册**（`admin.enabled=false` 或旧版本未实现）：net/http 的
+        默认路由兜底，响应体是纯文本 `404 page not found`；
+      · **账号不存在**：handler 内 `writeOpenAIError(..., "not_found", ...)`,
+        响应体是 JSON `{"error":{"code":"not_found",...}}`。
+
+    所以按「响应体能否解析成带 error.code 的 JSON」来区分。判不出来时
+    保守按「接口没注册」处理（回退改名仍然实现了用户意图：不被选中）。
+    """
+    text = ''
+    try:
+        text = resp.text  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        return True
+    try:
+        data = json.loads(text)
+    except Exception:  # noqa: BLE001
+        return True
+    return not (isinstance(data, dict) and isinstance(data.get('error'), dict))
+
+
+async def set_manual_disabled(uid: str, disabled: bool, reason: str = '') -> tuple[bool, str, str]:
+    """用上游的 `manual_disabled` 状态位停用/启用账号。
+
+    返回 `(是否成功, 说明文案, 结果码)`。结果码用于调用方决定是否回退：
+
+      · `ok`        —— 状态位已生效；
+      · `no_route`  —— 上游没注册这组接口（旧版本、或 `admin.enabled=false`）；
+      · `not_found` —— 接口在，但该 uid 不在池里（文件没被加载等）；
+      · `error`     —— 其它失败（网络、5xx、鉴权）。
+
+    ## 为什么优先用它，而不是改文件名（issue #45）
+
+    上游 2026-09-19 暴露了 `POST /admin/accounts/{uid}/disable|enable`，
+    语义是**「对话流量摘除」而非「账号冻结」**（其 admin.go 原话）：
+
+      · 停用期间**不参与选号**（`pick.go` 把 `e.disabled || e.manualDisabled`
+        一并排除，对话流量不落到它身上）；
+      · 但**签到 / token 保活 / 猫猫旅行 / 活跃上报照常执行**；
+      · 凭证与积分保持活跃，重启也保留这个意图（持久化在 state.json）。
+
+    而「改文件名」会让账号**完全退出账号池**：既不被选中，也不再执行任何排程任务。
+    对「这个号在拖后腿，先停一会儿」这种用法，后者副作用过大——积分不再增长、
+    token 不再续期，回来时可能已经过期。所以两条路并存，优先走状态位。
+
+    ## 关于 `admin.enabled` 默认关闭
+
+    上游这组接口**默认不注册**（`admin.enabled` 默认 false，关闭时一律 404，
+    其注释写明是「不向外暴露管理面」的有意设计）。所以能拿到 `no_route` 是
+    **常见且正常**的，不是故障——调用方据此回退改名即可，并把开启方式告诉用户。
+
+    ## 鉴权
+
+    与 `/status` 同源（`api_key`）。`_auth_headers()` 已带上；上游未配 api_key 时
+    它自己的启动校验会拒绝 `admin.enabled=true`，所以这里不需要额外分支。
+    """
+    if not uid:
+        return False, 'uid 为空', 'error'
+    action = 'disable' if disabled else 'enable'
+    url = f'{config.WB2API_BASE}/admin/accounts/{uid}/{action}'
+    body: dict = {'reason': reason} if (disabled and reason) else {}
+    try:
+        async with config.http_client(10, connect=3) as client:
+            resp = await client.post(url, json=body, headers=_auth_headers())
+    except Exception as exc:  # noqa: BLE001
+        return False, _err_text(exc), 'error'
+    if resp.status_code == 404:
+        if _admin_route_missing(resp):
+            return False, '上游未启用管理接口（admin.enabled=false 或版本较旧）', 'no_route'
+        return False, '该账号不在上游账号池里', 'not_found'
+    if resp.status_code == 401:
+        return False, '上游拒绝了鉴权（api_key 不一致）', 'error'
+    if resp.status_code >= 400:
+        return False, f'上游返回 {resp.status_code}', 'error'
+    return True, ('已通过上游状态位停用（签到与保活照常执行）' if disabled
+                  else '已通过上游状态位启用'), 'ok'
 
 
 async def get_models() -> tuple[bool, list | dict]:
@@ -533,8 +651,14 @@ def read_container_logs(limit: int = 200, timestamps: bool = True) -> list[str]:
 # 也是 `load_upstream_config` 的**下发白名单**——两处必须是同一份，否则会出现
 # 「能保存但读不回来」或「读得到却存不回去」的不一致。顶层其余键（api_key、
 # auth_dir、state_file 等）一律不下发：它们是凭据或部署路径，界面不使用。
+#
+# `admin` 段：上游的运维管理端点开关（`admin.enabled`，默认 false），
+# 面板的「临时停用」优先走它——它只摘对话流量，签到与保活照常。
+# 必须可由界面开启：否则用户只能手改上游 config.json，而这条路的收益
+# （保留签到与保活）正需要一个「顺手就能开」的入口，否则没人会去开。
 _EDITABLE_SECTIONS = ('schedule', 'pool', 'cooldown', 'features',
-                      'session_sticky', 'prompt', 'server', 'upstream', 'global')
+                      'session_sticky', 'prompt', 'server', 'upstream', 'global',
+                      'admin')
 
 
 def _mask(v: str) -> str:
@@ -772,6 +896,24 @@ def _sanitize_section(section: str, incoming: dict) -> dict:
             if _has_control_chars(path):
                 raise ValueError('prompt.file 不能包含换行或控制字符')
             out[key] = path
+        elif section == 'admin' and key == 'enabled':
+            # 上游对这组配置有 **fail-fast**：`admin.enabled=true` 且 `api_key`
+            # 为空时 normalize() 直接返回错误、拒绝启动（其 config.go 原话：
+            # 「admin.enabled=true 但 api_key 为空：请设置 api_key 或将
+            # admin.enabled 置 false」）。开关本意是「管理端点必须有鉴权」——
+            # 未鉴权的 disable/revive 比读泄漏危险（可用性操作）。
+            #
+            # 所以这里必须拦：放行会得到「保存成功、然后上游起不来」这个最难查的
+            # 形态（本函数注释里点名的正是它）。可达路径是直接 POST
+            # /api/settings/upstream 透传 body，不经过前端表单。
+            #
+            # 判据用**落盘后的实际状态**：api_key 不在下发/写入白名单里，所以
+            # 这里永远读现有配置来判，而不是假定它为空。
+            if raw is True and not config.upstream_api_key().strip():
+                raise ValueError(
+                    '开启账号管理接口需要上游已设置 api_key（上游要求管理端点必须鉴权，'
+                    '否则拒绝启动）。请先在上游 config.json 里设置 api_key')
+            out[key] = bool(raw)
         elif section == 'upstream' and key in _UPSTREAM_TEXT_KEYS:
             # 单行文本：UA、客户端版本、用量归知名度、设备 token 文件路径
             val = str(raw or '').strip()

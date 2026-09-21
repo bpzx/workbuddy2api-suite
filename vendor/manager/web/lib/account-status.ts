@@ -25,6 +25,8 @@ export type AvailabilityTier =
   | 'disabled'
   /** 本面板主动临时禁用（issue #21）：文件名带 .disabled，上游不加载它 */
   | 'disabledByPanel'
+  /** 上游手动停用位（issue #45）：还在池里、任务照常，只是不被选中转发 */
+  | 'manualDisabled'
   | 'expired'
   /** 本次读不到上游状态，运行时字段全部未知（`upstream.connected !== true`） */
   | 'unknown'
@@ -72,6 +74,11 @@ export function mergePoolStatus(
       healthy: typeof p.healthy === 'boolean' ? p.healthy : null,
       disabled: typeof p.disabled === 'boolean' ? p.disabled : null,
       disabled_reason: typeof p.disabled_reason === 'string' ? p.disabled_reason : '',
+      // 上游的手动停用状态位（issue #45）。取的是**这份快照**的值——用户点了
+      // 停用后状态位由上游持有，本页靠心跳拿到新值；不取的话徽章要等下次整页
+      // 刷新才更新，点了按钮看着没反应。
+      manual_disabled: typeof p.manual_disabled === 'boolean' ? p.manual_disabled : null,
+      manual_reason: typeof p.manual_reason === 'string' ? p.manual_reason : '',
       in_flight: typeof p.in_flight === 'number' ? p.in_flight : null,
       cooling: typeof p.cooling === 'boolean' ? p.cooling : null,
       degrade_until: typeof p.degrade_until === 'string' ? p.degrade_until : null,
@@ -100,12 +107,44 @@ export function isDegraded(a: Account): boolean {
   return Number.isFinite(at) && at > Date.now();
 }
 
+/**
+ * 该账号是否正被**模型级**限流（6004）——账号在线、但某个模型暂时用不了。
+ *
+ * 为什么需要单独判（issue #43 的现场）：腾讯对单个模型的频率限制是**按模型**
+ * 生效的，账号本身仍然健康、仍能被选中转发。用户的实际观察是「换个模型就能
+ * 继续用」，但面板上那个账号显示「在线」，完全看不出「这个模型被限流了」——
+ * 于是只能自己去 docker 里翻 state.json 才知道。
+ *
+ * 上游为此单独给了一本台账（`rate_limited_models`，其注释写明用途就是让运维
+ * 看到「账号 A 的模型 X 还在限额中，预计 Z 时间恢复」），到期即从台账消失。
+ *
+ * **不能用 `cooling` 判**：那是账号级状态，模型级限流不会置位它。所以这里读台账，
+ * 并且与 `isDegraded` 同一口径——以「截止时间是否在未来」为准，而不是「字段是否
+ * 存在」：前端拿到的快照可能已经过时，字段还在、窗口早过了。
+ */
+export function rateLimitedModels(a: Account): {model: string; reason: string}[] {
+  const rows = a.rate_limited_models ?? [];
+  const now = Date.now();
+  return rows
+    .filter((m) => {
+      const until = m.until;
+      if (typeof until !== 'string' || !until) return false;
+      const at = Date.parse(until);
+      return Number.isFinite(at) && at > now;
+    })
+    .map((m) => ({model: m.model, reason: String(m.reason ?? '')}));
+}
+
 /** 该账号的可用性分档（顺序即优先级，见模块注释）。 */
 export function availabilityOf(a: Account): AvailabilityTier {
-  // 面板主动禁用要**先于**其它判定：这类账号必然不在池里（上游不加载它），
+  // 面板主动停用要**先于**其它判定：这类账号必然不在池里（上游不加载它），
   // 若不先判就会落到 notLoaded，显示成「未加载 / 账号文件可能有问题」——
-  // 而它其实是用户自己刚点的「禁用」，看着像故障（实测会在界面上造成这种误导）。
+  // 而它其实是用户自己刚点的「停用」，看着像故障（实测会在界面上造成这种误导）。
   if (a.disabled_by_panel) return 'disabledByPanel';
+  // 上游的手动停用位（issue #45）。也先于 disabled/cooling 判定：它是运维的
+  // 明确意图，与上面那条同源（都是「我主动摘的」），只是机制不同——这条账号
+  // **还在池里**，签到与保活照常，所以文案必须与改名那条区分开。
+  if (a.manual_disabled === true) return 'manualDisabled';
   if (a.disabled === true) return 'disabled';
   if (a.is_expired) return 'expired';
   // 「看不到上游」必须早于「不在池里」：否则会把正常账号说成文件损坏
@@ -136,6 +175,8 @@ export function availabilityLabelKey(tier: AvailabilityTier, a?: Account): strin
         : 'accounts.badgeDisabled';
     case 'disabledByPanel':
       return 'accounts.badgeDisabledByPanel';
+    case 'manualDisabled':
+      return 'accounts.badgeManualDisabled';
     case 'expired':
       return 'accounts.badgeExpired';
     case 'unknown':
@@ -163,6 +204,12 @@ export function availabilityTitleKey(tier: AvailabilityTier): string | null {
       return 'accounts.badgeNeverSucceededTitle';
     case 'notLoaded':
       return 'accounts.badgeNotLoadedTitle';
+    // 两种停用机制的差别（任务停不停）用户看不出来，必须写清——否则他会以为
+    // 点了「停用」签到也停了，或者反过来以为积分还在涨。
+    case 'disabledByPanel':
+      return 'accounts.badgeDisabledByPanelTitle';
+    case 'manualDisabled':
+      return 'accounts.badgeManualDisabledTitle';
     default:
       return null;
   }
@@ -174,9 +221,10 @@ export function availabilityClass(tier: AvailabilityTier): string {
     case 'disabled':
     case 'expired':
       return 'text-red-600 dark:text-red-400';
-    // 主动禁用是**用户自己的选择**，用中性灰而不是告警红——
+    // 主动停用是**用户自己的选择**，用中性灰而不是告警红——
     // 它不是故障，标红会让人以为出了问题。
     case 'disabledByPanel':
+    case 'manualDisabled':
       return 'text-muted-foreground';
     case 'unknown':
       return 'text-muted-foreground';

@@ -76,13 +76,31 @@ export interface Account {
   /** 已知上游不会加载该文件时的原因（空 = 未发现明显问题） */
   invalid_reason?: string;
   /**
-   * 本面板**主动临时禁用**（issue #21）——文件名带 `.disabled` 后缀，
+   * 本面板**主动临时停用**（issue #21）——文件名带 `.disabled` 后缀，
    * 上游的 `workbuddy*.json` glob 因此不再匹配它、不加载该账号。
    *
    * 与 `disabled` 是两回事：那个是上游按错误分类自动禁的（需重新登录），
    * 这个是运维手动停用的，在面板上再点一次「启用」即可恢复。
+   *
+   * **注意**：新版上游走 `manual_disabled` 状态位停用（见下），那时本字段为
+   * false 而 `manual_disabled` 为 true。两种停用都要当「已停用」看。
    */
   disabled_by_panel?: boolean;
+  /**
+   * 上游的**手动停用**状态位（上游 issue #138/#118，本面板 issue #45）。
+   *
+   * 语义是「对话流量摘除」而非「账号冻结」：账号仍在池里、**签到 / token 保活 /
+   * 猫猫旅行照常执行**，凭证与积分都是活的，只是不被选中转发。与 `disabled`
+   * 并列独立（上游对叠加态分别透出），两位都清才真正回池。
+   *
+   * 有它的时候优先用它：副作用比改名（`disabled_by_panel`）小得多。
+   *
+   * `null` = 上游这份快照里没这个字段（账号不在池里，或旧版上游没有该状态位）。
+   * 与 `false`（明确未停用）区分，同 `disabled` 的口径。
+   */
+  manual_disabled?: boolean | null;
+  /** 手动停用的原因文案（仅 `manual_disabled` 为真时有值） */
+  manual_reason?: string;
   /** 账号所属版本（cn / global）；存量账号按域名回退，无该字段时视为 cn */
   realm?: 'cn' | 'global';
   /** 该版本是否支持签到体系（国际版没有） */
@@ -432,6 +450,14 @@ export interface UpstreamConfig {
   upstream?: Record<string, unknown>;
   /** 国际版（workbuddy.ai）路由：enabled / chat_base / billing_base */
   global?: Record<string, unknown>;
+  /**
+   * 上游的运维管理端点开关：enabled。
+   *
+   * 决定账号页「临时停用」走哪条路——开启后走上游的停用接口（只摘转发流量，
+   * 签到与保活照常），不开启则回退为改文件名（账号完全退出账号池）。
+   * 上游默认关闭，所以面板提供一个开关，否则用户只能手改 config.json。
+   */
+  admin?: Record<string, unknown>;
   upstash?: UpstashConfig;
 }
 

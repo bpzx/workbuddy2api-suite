@@ -127,7 +127,8 @@
     "days": {
       "one": "{n} day",
       "other": "{n} days"
-    }
+    },
+    "yesterday": "yesterday"
   },
   "expiry": {
     "expired": "Expired",
@@ -286,10 +287,13 @@
     "disabledReason": "Disabled reason: {reason}",
     "badgeDisabled": "● Disabled",
     "badgeDisabledByPanel": "● Paused",
+    "badgeManualDisabled": "● Paused",
     "badgeDisabledByPanelTitle": "You paused this account here: the upstream will not load it, so it is never selected. Press \"Enable\" to restore it anytime (credentials are kept).",
+    "badgeManualDisabledTitle": "You disabled this account upstream: it will not be picked for traffic, but it stays in the pool — check-in, token keep-alive and other jobs keep running, and its credentials and credits stay live. Click \"Enable\" on the right to resume at any time.",
     "disableTitle": "Pause this account (never selected upstream; reversible)",
     "enableTitle": "Enable this account (selected upstream again)",
     "disabled": "Account paused",
+    "manualDisabled": "Account paused (no longer picked for traffic; check-in and keep-alive continue)",
     "enabled": "Account enabled",
     "badgeDisabledRelogin": "● Disabled (re-login required)",
     "badgeExpired": "● Expired",
@@ -306,6 +310,11 @@
     "etaRecovery": "Recovers in about {left}",
     "limitedModels": "Rate-limited models: {models} (recovers automatically)",
     "missingModels": "Account lacks these models: {models} (temporarily skipped, no action needed)",
+    "modelLimitTitle": "These models are temporarily unavailable (the account is still online; other models work):",
+    "modelLimitBadge": "Models limited: {models}",
+    "modelLimited": "rate limited",
+    "modelLimitUntil": "expected back at {at}",
+    "modelMissing": "this account does not have this model",
     "creditsNoneTitle": "Upstream has not returned credits for this account yet (recently added, or upstream unreachable)",
     "creditsTitle": "Current spendable credit balance (all plans combined)",
     "cacheTitle": "Queried within the last 60 seconds — served from the server cache. Use Refresh credits to force a fresh query.",
@@ -406,7 +415,8 @@
     "disabled": "Disabled",
     "quotaCredit": "Credit quota",
     "quotaCreditHint": "Accumulated from the real charge reported by the upstream (not estimated from tokens). Independent of the token quota above — exceeding either one blocks calls. Leave 0 for unlimited",
-    "creditUsed": "{used} / {quota} credits"
+    "creditUsed": "{used} / {quota} credits",
+    "modelsUnknown": "No model matches these names (possible typo): {names}. They will not be listed and calls using them are rejected."
   },
   "logs": {
     "title": "Request logs",
@@ -1175,6 +1185,12 @@
     "令牌无效": "Invalid token",
     "未授权": "Unauthorized",
     "会话失效": "Session expired",
-    "-> 生效": "-> registered"
+    "-> 生效": "-> registered",
+    "账号管理接口": "Account management API",
+    "账号页的「临时停用」走哪条路。**开启后**上游提供停用接口：停用只摘除转发流量，签到与令牌保活照常执行（积分与凭证保持活跃）；不开启则回退为改文件名，那会让账号完全退出账号池、任务也一并停止。改动后**需重启上游容器**才生效（上游只在启动时读这个开关）。": "Which path the \"pause\" action on the Accounts page takes. **When enabled**, the upstream exposes pause endpoints: pausing only removes the account from traffic, while check-in and token keep-alive keep running (credits and credentials stay alive). When disabled, pausing falls back to renaming the file, which removes the account from the pool entirely and stops its tasks too. **Restart the upstream container** for a change to take effect (the upstream only reads this flag at startup).",
+    "启用账号管理接口": "Enable the account management API",
+    "仅对**旧版**上游生效：上游 9d1a21b 起已移除该配置、不再限制请求体大小。本网关自身的入站上限由环境变量 WB_GATEWAY_MAX_BODY_MB 控制（默认 32 MB）": "Applies to **older** upstream versions only: the upstream removed this setting in 9d1a21b and no longer limits request body size. This gateway's own inbound limit is controlled by the WB_GATEWAY_MAX_BODY_MB environment variable (default 32 MB)",
+    "请求体上限（旧版上游）": "Request body limit (older upstream)",
+    "让「临时停用」只摘除转发流量（签到 / 保活照常、积分与凭证保持活跃）。不开启时停用会回退为「改文件名」，账号会完全退出账号池、任务一并停止。**需重启上游容器生效**；且上游要求 api_key 非空，否则拒绝启动": "Makes \"pause\" remove the account from traffic only (check-in / keep-alive keep running, credits and credentials stay alive). When off, pausing falls back to renaming the file — the account leaves the pool entirely and its tasks stop. **Requires restarting the upstream container**; the upstream also requires a non-empty api_key, otherwise it refuses to start."
   }
 }

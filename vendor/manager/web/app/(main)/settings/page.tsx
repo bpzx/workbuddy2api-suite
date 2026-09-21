@@ -556,9 +556,29 @@ const GLOBAL_FIELDS: Field[] = [
   },
 ];
 
-type Group = 'schedule' | 'prompt' | 'cooldown' | 'features' | 'session' | 'pool' | 'server' | 'upstream' | 'global';
+/**
+ * 账号管理接口（上游 `admin` 段）。
+ *
+ * 这个开关决定账号页「临时停用」走哪条路，所以文案必须写清两条路的差别——
+ * 用户点停用时看到的提示会随它变化，不先说清楚会以为是 bug（实测有过反馈：
+ * 升级后点停用弹出一句「账号将完全退出账号池，签到与保活也会一并停止」，
+ * 用户不知道自己该不该开这个开关）。
+ */
+const ADMIN_FIELDS: Field[] = [
+  {
+    key: 'enabled',
+    kind: 'bool',
+    label: '启用账号管理接口',
+    desc: '让「临时停用」只摘除转发流量（签到 / 保活照常、积分与凭证保持活跃）。'
+      + '不开启时停用会回退为「改文件名」，账号会完全退出账号池、任务一并停止。'
+      + '**需重启上游容器生效**；且上游要求 api_key 非空，否则拒绝启动',
+    def: false,
+  },
+];
 
-/** 高级 JSON 编辑器里可直写的上游配置段 */
+type Group = 'schedule' | 'prompt' | 'cooldown' | 'features' | 'session' | 'pool' | 'server' | 'upstream' | 'global' | 'admin';
+
+/** 高级 JSON 编辑器里可直写的上游配置段（与后端 _EDITABLE_SECTIONS 一致） */
 type WireSection =
   | 'schedule'
   | 'cooldown'
@@ -568,7 +588,8 @@ type WireSection =
   | 'prompt'
   | 'server'
   | 'upstream'
-  | 'global';
+  | 'global'
+  | 'admin';
 
 interface GroupDef {
   id: Group;
@@ -642,6 +663,16 @@ const GROUPS: GroupDef[] = [
     title: '国际版',
     desc: '国际版（workbuddy.ai）路由开关与基址。关闭即锁死纯 CN',
     fields: GLOBAL_FIELDS,
+  },
+  {
+    id: 'admin',
+    section: 'admin',
+    title: '账号管理接口',
+    desc: '账号页的「临时停用」走哪条路。**开启后**上游提供停用接口：停用只摘除转发流量，'
+      + '签到与令牌保活照常执行（积分与凭证保持活跃）；不开启则回退为改文件名，'
+      + '那会让账号完全退出账号池、任务也一并停止。'
+      + '改动后**需重启上游容器**才生效（上游只在启动时读这个开关）。',
+    fields: ADMIN_FIELDS,
   },
 ];
 
@@ -781,6 +812,7 @@ export default function SettingsPage() {
     server: defaultValues(SERVER_FIELDS),
     upstream: defaultValues(UPSTREAM_FIELDS),
     global: defaultValues(GLOBAL_FIELDS),
+    admin: defaultValues(ADMIN_FIELDS),
   });
   /** 加载时的原始值，用于只提交改动过的项 */
   const original = useRef<Record<Group, Record<string, FieldValue>>>({
@@ -793,6 +825,7 @@ export default function SettingsPage() {
     server: defaultValues(SERVER_FIELDS),
     upstream: defaultValues(UPSTREAM_FIELDS),
     global: defaultValues(GLOBAL_FIELDS),
+    admin: defaultValues(ADMIN_FIELDS),
   });
   /** 高级模式（直接编辑 JSON） */
   const [advanced, setAdvanced] = useState(false);
@@ -837,6 +870,7 @@ export default function SettingsPage() {
           server: pickValues(SERVER_FIELDS, v.server),
           upstream: pickValues(UPSTREAM_FIELDS, v.upstream),
           global: pickValues(GLOBAL_FIELDS, v.global),
+          admin: pickValues(ADMIN_FIELDS, v.admin),
         };
         setForm(picked);
         original.current = {
@@ -849,6 +883,7 @@ export default function SettingsPage() {
           server: {...picked.server},
           upstream: {...picked.upstream},
           global: {...picked.global},
+          admin: {...picked.admin},
         };
         setSchedText(JSON.stringify(v.schedule ?? {}, null, 2));
         setCoolText(JSON.stringify(v.cooldown ?? {}, null, 2));

@@ -118,7 +118,8 @@
     "daysAgo": "{n} 天前",
     "minutes": "{n} 分钟",
     "hours": "{n} 小时",
-    "days": "{n} 天"
+    "days": "{n} 天",
+    "yesterday": "昨天"
   },
   "expiry": {
     "expired": "已过期",
@@ -262,10 +263,13 @@
     "disabledReason": "禁用原因：{reason}",
     "badgeDisabled": "● 已禁用",
     "badgeDisabledByPanel": "● 已停用",
+    "badgeManualDisabled": "● 已停用",
     "badgeDisabledByPanelTitle": "你已在本面板临时停用该账号：上游不会加载它、不会被选中。点右侧的「启用」可随时恢复（凭证不会丢失）。",
+    "badgeManualDisabledTitle": "你已在上游停用该账号：它不会被选中转发，但仍在账号池里——签到、Token 保活等任务照常执行，积分与凭证都是活的。点右侧的「启用」可随时恢复。",
     "disableTitle": "临时停用该账号（不会被上游选中，可随时恢复）",
     "enableTitle": "启用该账号（恢复被上游选中）",
     "disabled": "已停用该账号",
+    "manualDisabled": "已停用该账号（不再被选中转发；签到与保活照常）",
     "enabled": "已启用该账号",
     "badgeDisabledRelogin": "● 已禁用（需重新登录）",
     "badgeExpired": "● 已过期",
@@ -282,6 +286,11 @@
     "etaRecovery": "预计 {left}后恢复",
     "limitedModels": "被限流的模型：{models}（稍后会自动恢复）",
     "missingModels": "该账号无这些模型：{models}（临时避让，无需处理）",
+    "modelLimitTitle": "以下模型暂时不可用（账号仍在线，其它模型可用）：",
+    "modelLimitBadge": "模型受限 {models}",
+    "modelLimited": "限流中",
+    "modelLimitUntil": "预计 {at} 恢复",
+    "modelMissing": "该账号没有这个模型",
     "creditsNoneTitle": "上游尚未返回该账号的积分（可能是刚添加、或上游不可达）",
     "creditsTitle": "当前可花费积分余额（所有套餐剩余额度合计）",
     "cacheTitle": "60 秒内已查过，直接用了服务端缓存；点「刷新积分」可强制重新查询",
@@ -382,7 +391,8 @@
     "disabled": "已停用",
     "quotaCredit": "积分额度",
     "quotaCreditHint": "按上游返回的真实扣费累计（不是按 token 估算）。与上面的 token 额度互不影响，任一超限即拒绝调用；留 0 = 不限",
-    "creditUsed": "积分 {used} / {quota}"
+    "creditUsed": "积分 {used} / {quota}",
+    "modelsUnknown": "这些名字找不到对应模型（可能拼错了）：{names}。它们不会被列出，调用时也会被拒。"
   },
   "logs": {
     "title": "请求日志",

@@ -272,6 +272,103 @@ def resolve(token: str) -> dict | None:
     return None
 
 
+def model_allowed(key: dict, model: object) -> bool:
+    """该密钥的**模型白名单**是否放行这个模型。
+
+    **调用侧与 `/v1/models` 裁剪共用这一份判据**（issue #46）：两处各写一遍
+    迟早漂移，而漂移的表现正是那个 issue 要修的问题——列表里给出的模型，
+    调用时却被白名单拒掉（客户端把它当模型选择器，于是「能选、一选就失败」）。
+
+    白名单为空 = 不限制，一律放行。
+    """
+    allow = key.get('models') or []
+    if not allow:
+        return True
+    if not isinstance(model, str) or not model.strip():
+        return False
+    # 白名单比对**去掉 cn: 前缀**再比，两种写法都认。
+    #
+    # 为什么必须这样：`cn:` 只是上游的路由约定，不是模型名的一部分。界面上
+    # 现在显示的是腾讯自带的裸名（glm-5.2），用户照着填；而**存量密钥**的
+    # 白名单里可能写着带前缀的 `cn:glm-5.2`。若按字面比对，改版后前者会
+    # 被后者拒掉（用户看到「模型不在白名单内」却查不出哪里不对）。
+    # `global:` 不归一化——它决定路由，两个版本的同名模型是**不同的东西**。
+    return _bare_model(model) in {_bare_model(x) for x in allow}
+
+
+def _strip_realm_prefix(name: str) -> str:
+    """去掉 `cn:` / `global:` 前缀（两者都去）。
+
+    与 `_bare_model` 的区别，以及**为什么校验里必须用这个而不是它**：
+
+      · `_bare_model` 只去 `cn:`、**保留 `global:`** —— 那是**白名单比对**要的
+        语义，因为 `global:` 决定路由，两个版本的同名模型不是一回事；
+      · 而模型目录里的 id 是**裸名**（`_strip_realm_prefix` 已把两种前缀都去掉，
+        因为目录本身就是按版本分开取的：在「国际版目录」里 `gpt-5.6-sol` 本来就
+        是国际版那个）。
+
+    所以「某个名字在不在**它所属版本**的目录里」这个判断，必须把两边的前缀都
+    去掉再比——否则 `global:gpt-5.6-sol` 会去跟目录里的 `gpt-5.6-sol` 比，
+    永远不相等，把**正确**的名字报成"找不到"（实测踩到：假警报）。
+    """
+    low = name.lower()
+    for pref in ('cn:', 'global:'):
+        if low.startswith(pref):
+            return name[len(pref):]
+    return name
+
+
+def unknown_whitelist_entries(models: list[str], known_by_realm: dict,
+                             aliases: list[str] | set[str] = ()) -> list[str]:
+    """白名单里**匹配不到任何已知模型**的条目（多半是拼错了）。
+
+    为什么需要（issue #46 的可选做法 2）：白名单是自由文本框，填错了不会报错，
+    只会在下游表现为「模型列表是空的」。而空列表本身看不出原因——用户不知道自己
+    是少打了一个连字符、还是填成了显示名。所以在**编辑处**当场点出来，比事后裁剪
+    更根本。
+
+    ## 参数
+
+    `known_by_realm`：`{'cn': {...} | None, 'global': {...} | None}`，
+    值为该版本的模型 id 集合；`None` = **该版本的清单拿不到**。
+
+    ## 每个名字只跟自己版本的清单比
+
+    `global:` 前缀的条目只能拿国际版清单判，裸名只能拿国内版清单判——两个版本的
+    清单是**分开取的**，用一份判另一份必然出错。更关键的是：**清单拿不到就不判**
+    （而不是判成"找不到"）。否则「另一个版本还没缓存」会被显示成「你这个名字写错了」，
+    用户会去改一个本来正确的名字——假警报比不提示更糟。
+
+    ## 前缀要两边都去掉再比
+
+    目录里的 id 是裸名（见 `_strip_realm_prefix` 的说明），白名单里往往带
+    `global:` 前缀。只去掉一边就是假警报。
+
+    别名要算：它本来就是给下游用的合法名字（鉴权判请求名，映射在其后）。
+    别名的存在性与模型清单无关，所以无条件认。
+    """
+    if not models:
+        return []
+    alias_bare = {_strip_realm_prefix(str(x)).strip() for x in aliases}
+    out: list[str] = []
+    for raw in models:
+        entry = str(raw).strip()
+        if not entry:
+            continue
+        # 先按**请求名**判别名：别名匹配发生在鉴权之后，用的是客户端发来的原样名字
+        if entry in alias_bare or _strip_realm_prefix(entry) in alias_bare:
+            continue
+        realm = 'global' if entry.lower().startswith('global:') else 'cn'
+        known = known_by_realm.get(realm)
+        if known is None:
+            continue            # 该版本清单不可用 → 不判（宁可这次不提示）
+        # 两边都去前缀：目录是裸名，白名单可能带前缀
+        if _strip_realm_prefix(entry) in {_strip_realm_prefix(str(x)) for x in known}:
+            continue
+        out.append(entry)
+    return out
+
+
 def validate(key: dict, ip: str, model: str | None,
              *, is_model_list: bool = False) -> str | None:
     """返回 None 表示放行，否则返回拒绝原因（`Rejection`，自带状态码）。
@@ -344,14 +441,9 @@ def validate(key: dict, ip: str, model: str | None,
         if not isinstance(model, str) or not model.strip():
             return Rejection('请求未指定 model，而该密钥启用了模型白名单', 400,
                              'invalid_request_error', 'model_not_allowed')
-        # 白名单比对**去掉 cn: 前缀**再比，两种写法都认。
-        #
-        # 为什么必须这样：`cn:` 只是上游的路由约定，不是模型名的一部分。界面上
-        # 现在显示的是腾讯自带的裸名（glm-5.2），用户照着填；而**存量密钥**的
-        # 白名单里可能写着带前缀的 `cn:glm-5.2`。若按字面比对，改版后前者会
-        # 被后者拒掉（用户看到「模型不在白名单内」却查不出哪里不对）。
-        # `global:` 不归一化——它决定路由，两个版本的同名模型是**不同的东西**。
-        if _bare_model(model) not in {_bare_model(x) for x in key['models']}:
+        # 判据见 `model_allowed`：与 `/v1/models` 的裁剪共用同一份，
+        # 避免「列表里有、调用被拒」那种漂移（issue #46）。
+        if not model_allowed(key, model):
             return Rejection(f'模型 {model} 不在密钥白名单内', 400,
                              'invalid_request_error', 'model_not_allowed')
     return None

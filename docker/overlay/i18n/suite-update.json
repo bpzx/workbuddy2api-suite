@@ -8,9 +8,11 @@
     "约定：",
     "  * **不出现内部行话**。用户界面上不说\"侧车\"、\"socket 代理\"这类只在",
     "    开发文档里才有意义的词 —— 需要解释的东西放到 README，不放界面上。",
-    "  * 不重复表达同一件事（早期版本把\"不更新上游\"与\"容器无法操作 docker\"",
-    "    写成两句，读起来是废话；现在合成一句）。",
-    "  * 只保留真正在用的键：panel 里没有引用的键一律删掉，别留死文案。",
+    "  * **只写读者用得上的信息**。本套件由维护者发布并锁定上游快照，部署方",
+    "    （使用者）无法也不应自行同步上游 —— 所以\"上游更新需在宿主机执行…\"",
+    "    这类维护者流程**不写进界面**，只写在 README 里。界面上留下的是",
+    "    \"上游有没有更新\"这个事实，以及本套件自己能否一键更新。",
+    "  * 不重复表达同一件事，也不留没人引用的死键。",
     "",
     "约束（apply.py 会强制校验，不满足则构建失败）：",
     "  * 键集必须与 zh-CN 完全一致（上游 i18n 测试要求各语系键集相同）；",
@@ -45,8 +47,6 @@
       "pinned": "固定提交",
       "remote": "远端最新",
       "noUpdate": "无更新",
-      "upstreamHint": "上游更新需在宿主机执行：① ./scripts/sync-upstreams.sh 同步快照 ② 重建镜像后 docker compose pull && docker compose up -d",
-      "noDockerNote": "（本容器无法操作 docker，因此不提供更新按钮）",
       "resultOk": "更新完成",
       "resultFail": "更新失败"
     },
@@ -74,8 +74,6 @@
       "pinned": "固定提交",
       "remote": "遠端最新",
       "noUpdate": "無更新",
-      "upstreamHint": "上游更新需在宿主機執行：① ./scripts/sync-upstreams.sh 同步快照 ② 重建映像後 docker compose pull && docker compose up -d",
-      "noDockerNote": "（本容器無法操作 docker，因此不提供更新按鈕）",
       "resultOk": "更新完成",
       "resultFail": "更新失敗"
     },
@@ -103,8 +101,6 @@
       "pinned": "Pinned commit",
       "remote": "Remote HEAD",
       "noUpdate": "No update",
-      "upstreamHint": "Updating the upstreams is done on the host: (1) ./scripts/sync-upstreams.sh to sync the snapshot (2) rebuild the image, then docker compose pull && docker compose up -d",
-      "noDockerNote": "(this container cannot control docker, so no update button is offered here)",
       "resultOk": "Update finished",
       "resultFail": "Update failed"
     },
@@ -132,8 +128,6 @@
       "pinned": "固定コミット",
       "remote": "リモート最新",
       "noUpdate": "更新なし",
-      "upstreamHint": "上流の更新はホスト側で行います：① ./scripts/sync-upstreams.sh でスナップショットを同期 ② イメージを再ビルドして docker compose pull && docker compose up -d",
-      "noDockerNote": "（このコンテナは docker を操作できないため、更新ボタンはありません）",
       "resultOk": "更新が完了しました",
       "resultFail": "更新に失敗しました"
     },
@@ -161,8 +155,6 @@
       "pinned": "고정 커밋",
       "remote": "원격 최신",
       "noUpdate": "업데이트 없음",
-      "upstreamHint": "업스트림 업데이트는 호스트에서 수행합니다: ① ./scripts/sync-upstreams.sh 로 스냅샷 동기화 ② 이미지 재빌드 후 docker compose pull && docker compose up -d",
-      "noDockerNote": "(이 컨테이너는 docker 를 제어할 수 없어 업데이트 버튼이 없습니다)",
       "resultOk": "업데이트 완료",
       "resultFail": "업데이트 실패"
     }

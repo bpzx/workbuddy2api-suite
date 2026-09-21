@@ -6,7 +6,7 @@ import {useHeartbeat} from '@/lib/use-heartbeat';
 import {notify} from '@/lib/toast';
 import {keyApi, logApi, errText} from '@/lib/api';
 import type {ApiKey, RequestLog} from '@/lib/types';
-import {fmtCredit, fmtDateTime, fmtLatency, fmtNumber} from '@/lib/format';
+import {fmtCredit, fmtDateTime, fmtDateTimeMarked, fmtLatency, fmtNumber} from '@/lib/format';
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {EmptyState} from '@/components/common/layout/EmptyState';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
@@ -230,7 +230,7 @@ export default function LogsPage() {
                 className="cursor-pointer border-b border-border/40"
                 onClick={() => setDetail(l)}
               >
-                <TableCell className="pl-4 text-xs text-muted-foreground">{fmtDateTime(l.ts)}</TableCell>
+                <TableCell className="pl-4 text-xs text-muted-foreground">{fmtDateTimeMarked(l.ts)}</TableCell>
                 <TableCell className="text-xs">{l.key_name || '—'}</TableCell>
                 <TableCell className="font-mono text-xs text-muted-foreground">{l.ip}</TableCell>
                 <TableCell className="text-xs">
