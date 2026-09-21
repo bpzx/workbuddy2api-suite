@@ -4,12 +4,17 @@
 # 职责：
 #   0. 以 root 修正数据目录属主，再用 gosu 降权到 app 运行（见下）
 #   1. 首次启动生成 /data/config.json（从模板，api_key 随机化）
-#   2. 对已存在的 config.json 只做**只读检查**，发现路径不对时明确告警（不改写）
+#   2. 已存在时：**增量补齐**上游新增的配置项（只补缺失键，绝不改已有值），
+#      然后做只读的路径校验，发现路径不对时明确告警
 #   3. 启动上游二进制
 #
-# 为什么只检查不改写：manager 的设置页会写这个文件，我们不该在启动时
-# 悄悄覆盖用户（或 manager）写下的配置。路径不对时给出可执行的修复提示，
-# 由人来决定，比"自动修好但没人知道"更安全。
+# 为什么不整个重新生成、也不覆盖已有值：manager 的设置页会写这个文件，
+# 启动时悄悄改用户写下的配置比"缺一个键"危险得多。所以只补缺失的键 ——
+# 用户能从日志里看到补了哪几个，而不是配置被静默改造。
+#
+# 为什么需要"增量补齐"这一步：config.json 只在首次启动生成，之后不再重新生成。
+# 上游一旦新增配置项，老部署里就没有那些键，设置页会因此显示字面量 `undefined`
+# （成因见 docker/overlay/config_merge.py 的注释，那是真实发生过的事故）。
 #
 # ── 关于「先 root 再降权」──────────────────────────────────
 # compose 默认把数据放在宿主目录（bind mount），该目录由 Docker/宿主创建时
@@ -66,6 +71,10 @@ PY
     echo "[suite] api_key 已写入 $CONFIG（查看：docker compose exec wb2api cat $CONFIG）"
 else
     echo "[suite] 复用已存在的 $CONFIG"
+
+    # 增量补齐：把模板里有、config.json 里没有的键补上（只补不改，写前留 .bak）。
+    # 失败不影响启动 —— 上游对缺字段会套默认值，只是设置页可能显示 undefined。
+    python3 /opt/suite/config_merge.py "$TEMPLATE" "$CONFIG" || true
 
     # 只读校验：auth_dir / state_file 必须落在数据卷内。
     # 典型误用：把裸机部署的 ./auths 或 /opt/workbuddy2api/auths 原样搬进来，

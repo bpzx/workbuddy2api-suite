@@ -1,9 +1,26 @@
 # 构建上下文裁剪。
 #
-# 原则：只排除「体积大」或「会影响构建正确性」的东西，不为省几百 KB 去排除
-# 裸文件名（如 README.md / LICENSE），因为 Docker 的 .dockerignore 匹配规则对
-# 裸模式的层级语义容易踩坑，一旦误伤 vendor/manager/LICENSE 之类的构建输入，
-# 表现是构建期报"文件不存在"，排查起来不值当。
+# 两类要排除的东西：
+#   1. **影响构建正确性**的（数据目录、.env、node_modules、本地产物）——
+#      这类必须排除，理由逐条写在下面；
+#   2. **根本不是构建输入**的（项目根的说明文档、开发脚本、测试）。
+#
+# 关于第 2 类的收益，如实说：**体积上几乎可以忽略**（这些加起来约 276 KB，
+# 而 `vendor/` 就要 11 MB，占比约 2%）。所以别为了"省空间"加它。
+# 加它的真正理由是**把契约显式化**：将来有人写 `COPY README.md` 时，
+# 构建会立刻失败并提示找不到文件，而不是把说明文档悄悄打进镜像。
+#
+# ⚠️ 本文件的模式**一律锚定**（前导 `/` 表示仓库根，或写完整相对路径）。
+# 裸模式会匹配**任意层级**，例如裸 `LICENSE` 会连 `vendor/manager/LICENSE`
+# 一起排除 —— 而那个文件是 Dockerfile 明确 COPY 的，表现是构建期报
+# "文件不存在"，很难联想到是这个文件干的。同一条教训在根 `.gitignore` 上
+# 已经吃过一次（上游 `.gitignore` 的 bare `*.md` 误伤了 `go:embed` 需要的文件），
+# 那里现在也约定「所有模式一律锚定」。
+#
+# 锚定**不等于**安全：真正需要构建输入的路径（`vendor/`、`docker/`、
+# `upstreams.json`）绝不能出现在下面。这一点由 `tests/test_dockerignore.py`
+# 机械守住 —— 它解析 Dockerfile 的 COPY 源，逐个断言没有被本文件排除；
+# 该测试自带正反例（裸 `LICENSE` 必须被判为"会误伤"），避免匹配器写错时空转。
 
 # ── 必须排除：影响构建正确性 ─────────────────────────────
 # ⚠️ 运行时数据目录必须排除。compose 默认把数据放在宿主机 ./data
@@ -40,6 +57,27 @@ vendor/wb2api/credit
 vendor/wb2api/signin_bin
 vendor/wb2api/trial_bin
 vendor/wb2api/activity_bin
+
+# ── 项目根：除 upstreams.json 外都不是构建输入 ─────────────
+# Dockerfile 从根目录只取 `upstreams.json`（烤进镜像 /opt/suite/ 作为血统记录），
+# 其余根级条目一律不需要。加了这些之后，若将来有人写 `COPY README.md`，
+# 构建会直接失败并提示找不到文件 —— 那正是我们想要的即时反馈。
+#
+# 注意 `/.github` 只排除仓库根的 CI 配置；`vendor/manager/.github` 必须保留
+# （上游测试会读自己的 `.github/workflows/release.yml`）—— 锚定前缀让这两者
+# 互不影响，这正是不能写裸 `.github` 的原因。
+/README.md
+/MAINTAINING.md
+/UPSTREAMS.md
+/CHANGELOG.md
+/LICENSE
+/.gitignore
+/.dockerignore
+/.env.example
+/docker-compose.yml
+/.github
+/scripts
+/tests
 
 # ── 必须排除：体积 ────────────────────────────────────────
 .git

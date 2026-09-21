@@ -50,6 +50,7 @@ class OverlayMarkerTest(unittest.TestCase):
         files = [
             _SIDECAR,
             _RUNNER,
+            _OVERLAY / 'config_merge.py',
             _OVERLAY / 'server' / 'services' / 'suite.py',
             _OVERLAY / 'server' / 'routers' / 'suite.py',
             _PANEL,
