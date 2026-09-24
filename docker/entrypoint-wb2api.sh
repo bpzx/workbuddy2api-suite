@@ -114,6 +114,12 @@ for key in ('auth_dir', 'state_file'):
 PY
 fi
 
+# ── 只读检查：账号是否带设备风控凭据 device_token ──────────
+# 网关对外声称自己是官方桌面客户端，而 X-Device-Token 只在账号带 device_token 时
+# 才发送；内置登录流程**不写这个字段**，所以缺了不会报错、只会静默降级风控形态。
+# 因此在这里显式提示，并给出查看方式。逻辑与理由见 docker/overlay/check_device_token.py。
+python3 /opt/suite/check_device_token.py "$AUTH_DIR" || true
+
 cd /opt/wb2api
 echo "[suite] 启动 workbuddy2api（config=$CONFIG）"
 exec /opt/wb2api/wb2api -config "$CONFIG"

@@ -60,13 +60,21 @@ class TextPatchPreflightTest(unittest.TestCase):
                 )
 
     def test_patch_targets_are_the_expected_files(self) -> None:
-        """把"改了哪些上游文件"固定下来：新增一个补丁时这里会失败，提醒复核清单。"""
+        """把"改了哪些上游文件"固定下来：新增一个补丁时这里会失败，提醒复核清单。
+
+        2026-09 上游 wb2api 删除后，本项目自行维护该部分，补丁从 4 组扩到 7 组
+        （新增 3 组风控加固，因此新增 4 个 Go 文件）—— 见 UPSTREAMS.md 的登记。
+        """
         files = sorted({str(p.relative_to(_VENDOR)).replace('\\', '/')
                         for p, *_ in apply.build_text_edits(_VENDOR)})
         self.assertEqual(files, [
             'manager/server/config.py',
             'manager/server/main.py',
             'manager/web/components/common/layout/ManagementBar.tsx',
+            'wb2api/cmd/server/main.go',
+            'wb2api/internal/scheduler/scheduler.go',
+            'wb2api/internal/scheduler/travel.go',
+            'wb2api/internal/upstream/headers.go',
             'wb2api/internal/upstream/transport.go',
         ])
 
@@ -142,6 +150,44 @@ class PatchIntentTest(unittest.TestCase):
     def test_manager_patch_adds_direct_mounts(self) -> None:
         self.assertIn('_internal_direct_mounts', apply.MANAGER_NEW)
         self.assertIn('kwargs[\'mounts\']', apply.MANAGER_NEW)
+
+    # ── 以下三组是上游删除后本项目自行加的风控加固（补丁 5~7）──
+
+    def test_device_salt_patch_keeps_default_and_adds_override(self) -> None:
+        """换盐补丁必须**默认不变**（有测试断言派生值），且真的装了环境变量覆盖。"""
+        self.assertIn('"wb2a:"', apply.GO_SALT_NEW, '默认盐必须保留，否则全体设备标识突变')
+        self.assertIn('WB2A_DEVICE_ID_SALT', apply.GO_SALT_NEW)
+        self.assertIn('deviceIDSalt()', apply.GO_SALT_NEW)
+        # 替换后的函数必须仍按 <盐>+purpose+":"+uid 的形态派生
+        self.assertIn('deviceIDSalt() + purpose + ":" + uid', apply.GO_SALT_NEW)
+        # import 补丁要真的加上 os
+        self.assertIn('"os"', apply.GO_IMPORT_NEW)
+        self.assertNotIn('"os"', apply.GO_IMPORT_OLD)
+
+    def test_max_inflight_patch_warns_and_keeps_call(self) -> None:
+        """告警补丁不能把原来的调用弄丢 —— 否则池就不设上限了。"""
+        self.assertIn('cfg.Pool.MaxInFlight == 0', apply.GO_MAXINFLIGHT_NEW)
+        self.assertIn('log.Printf', apply.GO_MAXINFLIGHT_NEW)
+        self.assertIn(apply.GO_MAXINFLIGHT_OLD, apply.GO_MAXINFLIGHT_NEW,
+                      '替换文本里必须仍包含原来那行调用')
+
+    def test_jitter_patch_is_bounded_and_test_safe(self) -> None:
+        """抖动助手：base<=0 原样返回（测试靠这个跳过等待）+ 用真随机数源。"""
+        self.assertIn('if base <= 0', apply.GO_JITTER_HELPER)
+        self.assertIn('return base', apply.GO_JITTER_HELPER)
+        self.assertIn('rand.Int63n(span)', apply.GO_JITTER_HELPER)
+        # 初版用挂钟取熵，被采样测试抓到退化成常数 —— 确保代码里没退回那种写法。
+        # 注意只检查**代码行**：注释里正好解释了"为什么不用 time.Now()"，
+        # 直接对整个文本做断言会命中注释（同类误报之前已经犯过一次）。
+        code_only = '\n'.join(
+            line for line in apply.GO_JITTER_HELPER.splitlines()
+            if not line.strip().startswith('//')
+        )
+        self.assertNotIn('time.Now()', code_only)
+        self.assertIn('"math/rand"', apply.GO_JITTER_IMPORT_NEW)
+        # 三处调用点都必须真的用上抖动助手
+        for new in (apply.GO_TRAVEL_DELAY_NEW, apply.GO_ACT_DELAY_NEW, apply.GO_ACT_GAP_NEW):
+            self.assertIn('jitteredDelay(', new)
 
 
 if __name__ == '__main__':

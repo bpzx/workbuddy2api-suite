@@ -2,87 +2,7 @@
 
 基于 [workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 与
 [workbuddy-manager](https://github.com/ithtelab/workbuddy-manager)
-构建的**发行版**：把两者锁定到确定的版本、打包成一个预构建镜像，
-并补上它们在容器化部署下缺的几块能力。
-
-- **workbuddy2api**（Go）— 把 CodeBuddy 账号池包装成 OpenAI 兼容接口的反代网关
-- **workbuddy-manager**（FastAPI + Next.js）— 配套的 Web 管理控制台 + 对外多密钥网关
-
-## 部署机要求与建议配置
-
-### 必须满足
-
-| 项 | 要求 | 说明 |
-|---|---|---|
-| Docker | Engine + **Compose v2**（即 `docker compose`，不是旧的 `docker-compose`） | compose 文件用了顶层 `name:`（需 Compose v2.3+） |
-| CPU 架构 | `linux/amd64` 或 `linux/arm64` | CI 只构建这两个平台，其余架构需自行构建 |
-| 出网 | 能访问 ghcr.io（拉镜像）、GitHub API（版本检测）、腾讯（网关上游） | 全程不通外网时需配 `WB_HTTP_PROXY`（支持 http/socks5） |
-| 数据目录 | **本地文件系统**，且可 `chown` | 入口脚本以 root 修正属主后降权到 uid 10001。**NFS / 只读挂载会失败**（`.env.example` 里有手工修复说明） |
-| 时钟 | 宿主时间准确 | 镜像内固定 `TZ=Asia/Shanghai`；签到、夜猫等定时任务按本地时区判定 |
-
-### 建议配置（经验值，按账号数与并发调）
-
-| 资源 | 最低 | 建议 | 受什么影响 |
-|---|---|---|---|
-| CPU | 1 核 | 2 核 | 大部分时间在等 I/O（转发 SSE、等上游）；并发上去才吃 CPU |
-| 内存 | 512 MB | 1–2 GB | manager（uvicorn + SQLite）、wb2api（Go，账号池随账号数增长）、前端静态托管 |
-| 磁盘 | 2 GB 可用 | 5 GB 以上 | 镜像本身预计数百 MB 量级（内含 Python 运行时、6 个静态 Go 二进制、docker CLI 与 compose 插件、前端产物）；再加数据目录里日志与用量记录的持续增长 |
-
-> 上面的磁盘数字是**预期值，未在本仓库实测**（本项目没有实跑过镜像构建）。
-> 部署后自己量一下更准：
->
-> ```bash
-> # 镜像大小（解压后）
-> docker image inspect ghcr.io/bpzx/workbuddy2api-suite:latest --format '{{.Size}}' \
->   | numfmt --to=iec
-> # 各容器实时 CPU / 内存
-> docker stats --no-stream
-> ```
-
-### 不建议这样部署
-
-- **不要把 7864 直接暴露到公网**。它是唯一对外入口，但应经 Cloudflare Tunnel 或
-  反向代理，并把 `MANAGER_BIND` 设为 `127.0.0.1` —— 否则 IP 白名单、登录失败锁定
-  这些管控会失去意义。配置写法见 [`.env.example`](.env.example) 的
-  「用 Cloudflare Tunnel 上线」一节。
-- **不要把数据目录放在 NFS / 网络盘上**：属主修正会失败，而账号凭证与 SQLite
-  对文件锁与延迟也敏感。
-
-### 平台说明
-
-**Linux 是目标环境**（CI 构建、测试与本文档均以 Linux 为准）。
-macOS / Windows 的 Docker Desktop 可以跑，但有两处请注意，其中一键更新在
-Windows 上**未实测**：
-
-- 一键更新的 helper 会把套件目录按**同一个绝对路径**挂进容器（compose 靠这个
-  才能解析相对路径）。Docker Desktop 在 Windows 上要做 WSL 路径转换，这条路径
-  转换没有实测过。
-- 数据目录的属主由 entrypoint 修正；Docker Desktop 的绑定挂载语义与 Linux 不同，
-  可能在日志里看到属主告警（功能不受影响）。
-
-## 与直接用上游的区别
-
-两个上游**各自都自带 Dockerfile 与 compose**，所以"能容器化"不是本项目的价值。
-本项目提供的是它们没有的那些：
-
-| 本项目的做法 | 上游的做法 | 为什么要这样 |
-|---|---|---|
-| **出口代理支持**（HTTP/SOCKS5，含鉴权） | ❌ 都没有 | 上游的 Go transport 不读代理环境变量；manager 配了代理后连自己的上游也会绕代理。两处都靠构建期补丁修（见 [`UPSTREAMS.md`](UPSTREAMS.md)） |
-| **套件一键更新**（面板里拉镜像 + 重建容器） | 裸机更新脚本（`git pull` + `systemctl restart`） | 本发行版用预构建镜像，容器内改代码会被下次 `pull` 覆盖。更新交给一个**只持有 socket 的最小侧车**，manager 本身仍不碰 socket（见 [一键更新与安全边界](#一键更新与安全边界)） |
-| **单镜像、ghcr 预构建** | 各自 `build: .` 本地构建 | 一次构建、一处版本号；部署机不需要 Go/Node 工具链，`docker compose pull` 即可 |
-| **socket 代理隔离** | 直接挂 `/var/run/docker.sock` | 上游的 manager 需要它来重启/读日志上游容器。裸挂等于把宿主 root 交给该容器；本项目用 `docker-socket-proxy` 只放行所需 API |
-| **版本锁定 + 同步机制** | 跟随各自分支 | `upstreams.json` 记录确切 commit，`sync-upstreams.sh` 一条命令同步，每日漂移检测开 issue。好处是"上游某次更新坏了"时你能明确回退到可用版本 |
-| **四容器一键起** | 各自 compose，需手工组网 | 本项目 compose 把网关、管理端、socket 代理、更新侧车一次编排好 |
-
-> **设计取舍**：上游更新很快（manager 曾从 v1.0.35 到 v1.0.57 跨 50+ 提交），
-> 因此本项目**刻意不去改上游的界面与文案** —— 那类补丁上游一重构就失效，
-> 收益又仅是措辞更贴切。目前只保留 3 处补丁（2 处在代理代码、1 处是注册我们
-> 自己的路由）。
->
-> 唯一的例外是**更新面板**：它被**整文件覆写**（不是打补丁），因为要改的是整个
-> 渲染结构。代价是放弃该文件的上游后续改进，每次同步上游要人工看一眼 ——
-> 这一条如实登记在 [`UPSTREAMS.md`](UPSTREAMS.md) 的「覆写登记」。
-> 其余「曾经打过、现已删除的补丁」的教训见同一文件。
+构建的**发行版**
 
 两个上游的代码以**未修改的快照**内置于 `vendor/`，来源 commit 完整记录于
 [`upstreams.json`](upstreams.json) 与 [`UPSTREAMS.md`](UPSTREAMS.md)。
@@ -91,16 +11,25 @@ Windows 上**未实测**：
 > 仅限本人授权账号、本机 / 私有环境测试。使用涉及目标平台服务条款与账号风险，
 > 请阅读两个上游的免责声明。
 
----
+## 建议配置（经验值，按账号数与并发调）
 
-## 快速开始
+| 资源 | 最低 | 建议 | 受什么影响 |
+|---|---|---|---|
+| CPU | 1 核 | 2 核 | 大部分时间在等 I/O（转发 SSE、等上游）；并发上去才吃 CPU |
+| 内存 | 512 MB | 1–2 GB | manager（uvicorn + SQLite）、wb2api（Go，账号池随账号数增长）、前端静态托管 |
+| 磁盘 | 2 GB 可用 | 5 GB 以上 | 镜像本身预计数百 MB 量级（内含 Python 运行时、6 个静态 Go 二进制、docker CLI 与 compose 插件、前端产物）；再加数据目录里日志与用量记录的持续增长 |
 
-### 前置条件
+> 上面的磁盘数字是**预期值**, 部署后自己量一下更准：
+> 
+>```bash
+> # 镜像大小（解压后）
+> docker image inspect ghcr.io/bpzx/workbuddy2api-suite:latest --format '{{.Size}}' \
+> | numfmt --to=iec
+>   # 各容器实时 CPU / 内存
+> docker stats --no-stream
+> ```
 
-- 一台满足 [部署机要求与建议配置](#部署机要求与建议配置) 的机器
-- 一个或多个已注册的 CodeBuddy 账号（用于 OAuth 登录）
-
-### 部署
+## 部署
 
 ```bash
 git clone https://github.com/bpzx/workbuddy2api-suite.git
@@ -188,40 +117,6 @@ docker compose exec manager curl -s -H "Authorization: Bearer <api_key>" \
                     │    组件，见「一键更新与安全边界」│
                     └───────────────────────────────┘
 ```
-
-### 为什么 wb2api 不发布 7863
-
-manager 的 `/v1` 才是对外的正式入口，它提供密钥鉴权、每密钥配额、IP 白名单与
-用量统计。若同时暴露上游 7863，任何人都能用那个**共享的单个 api_key** 绕过
-上面全部管控。默认配置下 7863 只在 compose 的内部网络中可达。
-
-### 为什么需要 dockerproxy
-
-wb2api 只在进程启动时读取 `config.json` 与扫描 `auths/`（无 SIGHUP），
-因此新增账号、改配置后必须重启容器。manager 通过 `docker restart` /
-`docker logs` 完成这件事。
-
-直接把 `/var/run/docker.sock` 挂进 manager，等于给它**宿主机 root 等价权限**
-（可 exec 进任意容器、挂载宿主目录）。所以改用 `docker-socket-proxy`，
-只放行 `CONTAINERS`、`POST`、`ALLOW_RESTARTS` 三项，
-并把 `EXEC` / `IMAGES` / `VOLUMES` / `BUILD` / `SECRETS` 等全部显式关闭。
-
-**能力边界（刻意如此）**：这套白名单足以让 manager 重启上游与读日志
-（这正是它需要的），但 **`docker info` 会失败** —— 因为 `/info`
-端点在 `INFO` 段（已关闭）。上游 manager 用 `docker info` 判断"能否操作
-docker"，于是在本发行版里该判定恒为「否」。
-
-**上游**更新走 `./scripts/sync-upstreams.sh` + 重建镜像
-（见 [`MAINTAINING.md`](MAINTAINING.md)）—— 那是维护者的流程，**不写在界面上**：
-本套件的部署方（使用者）无法自行同步上游，把维护者的步骤摆在界面上只会
-让人以为"我是不是该做点什么"。界面上只呈现"上游有没有更新"这个事实。
-
-若你确实想放开这块，需要打开 `INFO` 段并放宽容器操作权限 ——
-但那会显著扩大该容器的权限，**不建议**。
-
-> 注意区分：**上游**不能由面板更新；**本套件自己**可以（一键更新），
-> 走的是一个独立的、只持有 socket 的最小侧车 —— 见下节。这样 manager 本身
-> 仍然完全不碰 socket。
 
 ---
 
@@ -375,6 +270,80 @@ docker compose logs manager | grep -i 出口代理
 
 ---
 
+## 账号风控相关
+
+网关对外**声称自己是官方桌面客户端**（`X-Product: WorkBuddy`、`X-IDE-*`、
+UA `WorkBuddy/5.5.4 … CLI/2.137.1`）。以下几项直接关系到账号会不会被平台风控
+标记，建议逐条确认。
+
+### 设备风控凭据 `device_token`
+
+**这是最该先查的一项。** `X-Device-Token` 只在账号带 `device_token` 时才发送
+（三级回退：账号级 → 全局 `upstream.device_token` → `device_token_file`；
+都取不到就**整条头不发送**）。而**内置登录流程不写这个字段**，所以用本项目
+流程加的账号默认都缺它。
+
+上游代码对此的判据很明确（manager 侧注释）：`device_token` 是设备风控凭据，
+**丢了会静默降级风控形态**；缺失会被**按设备指纹异常关联风控**。正因为如此，
+manager 在换 token 重登时会**专门保留**该字段，避免被冲掉。
+
+**查看哪些账号缺**（只列账号名，不打印凭据本身）：
+
+```bash
+# 启动时会直接提示「N/总数 个账号缺少 device_token」
+docker compose logs wb2api | grep device_token
+# 或者逐个账号看
+docker compose exec wb2api sh -c 'for f in /data/auths/*.json; do \
+  n=$(basename "$f" .json); \
+  grep -q "\"device_token\"" "$f" && echo "$n 有" || echo "$n 缺失"; done'
+```
+
+**怎么补**：把令牌写进该账号 auth 文件的**顶层** `device_token` 键（auth 文件的
+扁平形与「插件 OAuth 嵌套形」都是放在顶层），或写全局 `upstream.device_token`
+（设置页 → 上游配置 → 高级模式）。取值只能来自官方桌面端/插件链路。
+
+### 设备标识与轮换
+
+`X-Machine-ID` / `X-Session-ID` 由 `sha256("<盐>" + 用途 + ":" + uid)[:36]` 稳定
+派生 —— 这是**有意设计**（对标官方客户端"每账号一台固定虚拟设备"），
+缺了反而会被按设备指纹缺失关联风控。
+
+代价是：某账号的设备标识一旦被上游打标，**重新登录也换不掉**（uid 不变则标识
+不变）。所以本发行版给盐留了一个后门（上游原本没有）：
+
+```bash
+# .env —— 不设 = 沿用历史默认盐 "wb2a:"（行为与以前完全一致）
+WB2A_DEVICE_ID_SALT=<随机值>
+```
+
+> ⚠️ 换盐会让**所有账号**的设备标识**同时**变化 —— 在平台看来是"全体换了设备"，
+> 本身就可能成为异常信号。**只在确有必要时**（例如确认某账号设备标识已被打标）
+> 才用，并且一次换到位。这是本套件设置的**唯一** `WB2A_*` 环境变量，
+> 理由：它是一次性轮换密钥，不适合放进设置页。
+
+### 三个容易踩的配置
+
+- **`pool.max_in_flight: 0` = 单账号在途不限**。该值只能写在 `config.json` 里，
+  误设不会有任何报错 —— 所以本发行版在你真设成 0 时会在启动日志里告警。
+  **保持 3 左右**。
+- **`pool.max_in_flight_global` 的 `0` 不等于"不分档"**：配置层会把 `0`/负数归一
+  为 `2`（国际版 WAF 更紧，恒分档）。字段注释里"0 = 回落 max_in_flight"指的是
+  **池 API 层**的语义，配置层到不了那里 —— **以 2 为准**。
+- **合成任务（签到 / 旅行 / 活跃上报）的载荷在所有账号间是同一套**。本发行版
+  只给上报**间隔**加了抖动（见 [UPSTREAMS.md](UPSTREAMS.md) 补丁 7）；载荷本身
+  仍是固定的（同模型、同长度）。要不要让它按账号变化属**未决项** —— 那等于
+  编造不同的事件数据，收益与风险需要你自己判断。
+
+### 客户端版本号会过期
+
+`upstream.client_version` / `cli_version` 决定 UA 与 `X-IDE-Version`（模板里显式
+写着契约版本）。官方客户端会升级，一年后这个版本号本身就可能是"老客户端"特征。
+可在设置页「出站标识」里改。另有一处**已知不一致**（未改）：
+`cmd/login` 登录工具发的是另一套版本号（`CLI/2.63.2 CodeBuddy/2.63.2`），
+与网关运行时不一致；改动它需要确认登录端点仍接受，属需要单独验证的项。
+
+---
+
 ## 常用操作
 
 ```bash
@@ -411,13 +380,6 @@ SUITE_UPDATER_TOKEN=<随机值>      # 生成：openssl rand -hex 24
 | **本套件** | 当前版本 → 最新正式版 | ✅ 一键更新 |
 | 上游网关 workbuddy2api | 固定 commit → 远端 HEAD | ❌ 只报告 |
 | 上游管理端 workbuddy-manager | 快照版本 → 上游最新 Release | ❌ 只报告 |
-
-> ⚠️ 第三段显示的是**上游 workbuddy-manager 自己的版本号**（如 `v1.0.60`），
-> **不是本项目的版本**。本项目的版本看第一段（形如 `v0.2.3`）。
-> 这个数字曾被误读过，所以现在明确归在「上游依赖」区块里。
-
-上游两块不能更新的原因：容器里既没有上游 git 仓库，也不该由运行中的容器去改
-自己的代码。上游更新走维护者流程，见 [`MAINTAINING.md`](MAINTAINING.md)。
 
 #### 版本语义：正式版 vs 开发构建
 
@@ -465,6 +427,10 @@ docker inspect ghcr.io/bpzx/workbuddy2api-suite:latest \
 部署方无法也不应自行同步上游：那需要重建镜像，而不是改本机配置。
 这里只放这个指向，避免把维护者的流程摆在部署方的文档里。
 
+> ⚠️ **workbuddy2api 的上游仓库已被删除**（`Sliverkiss/workbuddy2api` 现为 404）。
+> 该部分**由本项目自行维护**，不再有可同步的目标 —— 详见
+> [`UPSTREAMS.md`](UPSTREAMS.md)。`manager` 上游正常。
+
 ---
 
 ## 直连上游网关（可选，默认关闭）
@@ -480,24 +446,6 @@ docker inspect ghcr.io/bpzx/workbuddy2api-suite:latest \
 
 **安全代价**：7863 只有一个共享 api_key，且没有配额与 IP 管控；
 暴露它等于放弃 manager 提供的全部租户隔离。公网环境请勿这样做。
-
----
-
-## 已知限制
-
-| 限制 | 说明 |
-|---|---|
-| 上游更新需人工同步 | 快照不会自动跟随；用 `sync-upstreams.sh` + 漂移检测 issue 兜住 |
-| 设置页有「旧版上游」区块 | 上游设置页的「请求上限（旧版上游）／请求体上限（旧版上游）」对**本套件捆绑的版本已无作用**（上游 `9d1a21b` 起移除了 `server.max_body_mb`，该 commit 早于我们锁定的 `d1023f3`）。上游刻意保留该字段以兼容仍跑旧版上游的部署，并在界面上如实标注了「旧版上游」。本项目**不为它打补丁** —— 那属于纯外观改动，而要改的 `settings/page.tsx` 是上游改动最频繁的文件之一（本次同步它就变了 41 行），补丁锚点会持续失效。你的配置里若仍有 `server.max_body_mb`，那是历史遗留键，留着无作用也不影响启动 |
-| 单镜像体积偏大 | 同时含 Go 二进制、Python 运行时与前端产物，换来版本一致与单产物发布 |
-| **更新面板是覆写的** | `UpdatePanel.tsx` 被整文件替换（改的是整个渲染结构），因此**上游对该文件的后续改进不会自动流入**，每次同步上游要人工看一眼。已登记在 [`UPSTREAMS.md`](UPSTREAMS.md) |
-| **updater 侧车有高权限** | 它直连 `/var/run/docker.sock`（拉镜像 + 重建容器的固有要求），等价于宿主机 root。已通过"只给最小侧车、manager 不碰 socket、不发布端口、token 校验、只接受无参数固定请求"收敛，但**非零风险**。详见 [一键更新与安全边界](#一键更新与安全边界) |
-| socket 代理仍有权限 | 它允许容器重启与读日志，等于把这两项能力交给 manager 容器；已通过禁用 exec/build/volumes 与私有网络收敛，但非零风险 |
-| 容器入口以 root 启动 | 仅为 chown 数据目录后立刻 gosu 降权到 uid 10001；服务进程本身非 root。这是宿主目录挂载的必然代价（命名卷无此问题） |
-| 集成改动靠构建期施加 | 本项目与上游的差异**全部在构建期**施加（`vendor/` 始终保持上游原样），所以镜像内容与上游快照并不完全一致。任一改动的前提不成立时（上游重构了锚点 / 占用了同名 i18n 键 / 删掉了被覆写的文件）**构建会失败并指出原因**——刻意设计，静默失效比构建失败难查得多。完整的补丁与覆写登记见 [`UPSTREAMS.md`](UPSTREAMS.md)，构建细节见 [`MAINTAINING.md`](MAINTAINING.md) |
-| 上游更新按钮已移除 | 面板不再提供上游更新入口（容器里没有上游 git 仓库，也不该由运行中的容器改自己的代码）。上游两块只显示"是否有更新"；同步与重建镜像由维护者执行，见 [`MAINTAINING.md`](MAINTAINING.md) |
-| 网关不认 `ALL_PROXY` | Go 标准库只读 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`；代理只配在 `ALL_PROXY` 时网关不走代理 |
-| Python 测试在 Windows 有 2 个失败 | `test_first_token` 的临时目录清理在 Windows 上抛 `NotADirectoryError`（上游 `tearDown` 只捕获 `PermissionError`）；Linux / CI 通过。已核实与本地改动无关（未打补丁的原始快照同样失败） |
 
 ---
 

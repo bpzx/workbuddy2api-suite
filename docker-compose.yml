@@ -27,9 +27,15 @@ services:
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       WB_SUITE_DATA_DIR: /data
-      # 有意不设任何 WB2A_* 变量：上游的 applyEnv() 会在读完 config.json 后
-      # 用环境变量覆盖，一旦设置，manager 设置页写入 config.json 的对应项就会被
-      # 静默盖掉（表现为"改了不生效"）。保持 config.json 为唯一事实来源。
+      # 有意不设任何 WB2A_* 变量（唯一例外见下面）：
+      # 上游的 applyEnv() 会在读完 config.json 后用环境变量覆盖，一旦设置，
+      # manager 设置页写入 config.json 的对应项就会被静默盖掉（表现为"改了不
+      # 生效"）。保持 config.json 为唯一事实来源。
+      #
+      # ⚠️ 唯一例外：WB2A_DEVICE_ID_SALT。它**不在** applyEnv 的名单里，与设置页
+      # 无对应项，因此不存在上述覆盖问题；而且它是"一次性轮换密钥"，不适合放进
+      # 设置页。留空 = 沿用历史默认盐（行为不变）。见 README「账号风控相关」。
+      WB2A_DEVICE_ID_SALT: ${WB2A_DEVICE_ID_SALT:-}
       #
       # ── 出口代理 ──
       # 网关出站（聊天/签到等）走这里。Go 的 ProxyFromEnvironment 只认

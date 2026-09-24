@@ -413,12 +413,146 @@ def _plan_i18n(root: Path, overlay: Path) -> list[tuple[Path, dict, str, dict]]:
     return ops
 
 
+# ─────────────────────────────────────────────────────────────
+# 补丁 5：wb2api —— 设备标识派生盐可轮换
+# ─────────────────────────────────────────────────────────────
+# 上游位置：vendor/wb2api/internal/upstream/headers.go 的 deriveAccountStableID()
+#
+# 背景：`X-Machine-ID` / `X-Session-ID` = sha256("<盐>" + purpose + ":" + uid)[:36]，
+# 盐是硬编码常量 `"wb2a:"`。按 uid 稳定派生是**有意设计**（对标官方桌面端
+# "每账号一台固定虚拟设备"，缺了反而会被按设备指纹异常关联风控）。
+# 但它同时意味着：一旦某账号的设备标识被上游打标，**重新登录也换不掉**
+# （uid 不变 → 标识不变），上游没有提供任何轮换手段。
+#
+# 本补丁把盐变成可用环境变量 `WB2A_DEVICE_ID_SALT` 覆盖：
+#   * 默认仍取 `"wb2a:"` → **行为与打补丁前完全一致**（有测试断言该派生值，
+#     默认不变才安全）；
+#   * 设了才换 → 提供一个"确有需要时"的后手。
+#
+# ⚠️ 换盐会让**所有账号**的设备标识同时变化（在平台看是"全体换设备"），
+# 只在确有必要时使用。见 README「设备标识与轮换」。
+GO_IMPORT_OLD = """import (
+	"crypto/sha256"
+	"encoding/hex"
+	"net/http"
+	"strings\""""
+
+GO_IMPORT_NEW = """import (
+	"crypto/sha256"
+	"encoding/hex"
+	"net/http"
+	"os"
+	"strings\""""
+
+GO_SALT_OLD = """func deriveAccountStableID(uid, purpose string) string {
+	sum := sha256.Sum256([]byte("wb2a:" + purpose + ":" + uid))
+	return hex.EncodeToString(sum[:18]) // 36 hex chars
+}"""
+
+GO_SALT_NEW = """// deviceIDSalt 设备/会话标识的派生盐。
+//
+// 【本发行版集成补丁】默认沿用历史常量 "wb2a:"（行为不变）；可用环境变量
+// WB2A_DEVICE_ID_SALT 覆盖，以便在设备标识被上游打标时轮换
+// （见 README「设备标识与轮换」）。上游已删除，该变量属运维级参数、不进设置页。
+func deviceIDSalt() string {
+	if v := strings.TrimSpace(os.Getenv("WB2A_DEVICE_ID_SALT")); v != "" {
+		return v
+	}
+	return "wb2a:"
+}
+
+func deriveAccountStableID(uid, purpose string) string {
+	sum := sha256.Sum256([]byte(deviceIDSalt() + purpose + ":" + uid))
+	return hex.EncodeToString(sum[:18]) // 36 hex chars
+}"""
+
+
+# ─────────────────────────────────────────────────────────────
+# 补丁 6：wb2api —— max_in_flight=0（不限流）时启动告警
+# ─────────────────────────────────────────────────────────────
+# 上游位置：cmd/server/main.go 的池初始化
+#
+# `pool.max_in_flight` 的 0 表示**不限**单账号在途数（见 internal/pool/pool.go 的
+# Acquire/inFlightLimit）。这个值只能写在 config.json 里，误设不会有任何报错，
+# 而"单账号并发无上限"会显著提高账号被风控的概率 —— 因此显式告警。
+GO_MAXINFLIGHT_OLD = '	p.SetMaxInFlight(cfg.Pool.MaxInFlight)'
+
+GO_MAXINFLIGHT_NEW = """	// 【本发行版集成补丁】0 = 单账号在途**不限**；误设无报错但会显著提高
+	// 账号风控风险，故显式告警。见 README「风控相关配置」。
+	if cfg.Pool.MaxInFlight == 0 {
+		log.Printf("WARN: [pool] max_in_flight=0 表示单账号在途不限；并发无上限会显著提高账号风控风险，建议保持 3 左右")
+	}
+	p.SetMaxInFlight(cfg.Pool.MaxInFlight)"""
+
+
+# ─────────────────────────────────────────────────────────────
+# 补丁 7：wb2api —— 合成任务的固定间隔加抖动
+# ─────────────────────────────────────────────────────────────
+# 上游位置：internal/scheduler/travel.go（常量所在处）与 scheduler.go（调用点）
+#
+# 上报间隔是硬编码的 0.8s / 1.5s —— 精确等距的节奏是"机器特征"，真人操作不会
+# 这么匀。加 0..+50% 抖动后，时间密度不再落在固定周期上。
+#
+# 注意 `base <= 0` 必须原样返回：测试用「把基准置 0」来跳过等待
+# （internal/scheduler/activity_test.go、parallel_test.go），抖动也得跟着跳过，
+# 否则会拖慢甚至拖挂测试。
+GO_JITTER_ANCHOR = 'var activityReportGap = 1500 * time.Millisecond'
+
+GO_JITTER_IMPORT_OLD = """import (
+	"context"
+	"log"
+	"time\""""
+
+GO_JITTER_IMPORT_NEW = """import (
+	"context"
+	"log"
+	"math/rand"
+	"time\""""
+
+GO_JITTER_HELPER = """
+
+// jitteredDelay 在基准延迟上加 0..+50% 的抖动。
+//
+// 【本发行版集成补丁】固定间隔是"机器节奏"，真人不会这么匀；抖动让上报的时间
+// 密度不再落在固定周期上，降低按节奏做聚类的特征。
+//
+// base<=0 时**原样返回**：测试把基准置 0 来跳过等待，抖动必须一起跳过。
+//
+// 用 math/rand 而不是 time.Now().UnixNano() 取熵：后者在时钟粒度粗的平台上
+// （实测 Windows）短时间内的低位几乎不变，抖动会退化成常数 —— 这是写这段时
+// 被测试抓到的真实缺陷。Go 1.20+ 的全局 rand 已自动播种，无需手动 Seed。
+func jitteredDelay(base time.Duration) time.Duration {
+	if base <= 0 {
+		return base
+	}
+	span := int64(base) / 2
+	if span <= 0 {
+		return base
+	}
+	return base + time.Duration(rand.Int63n(span))
+}"""
+
+GO_TRAVEL_DELAY_OLD = 'if !sleepCtx(ctx, travelAccountDelay) {'
+GO_TRAVEL_DELAY_NEW = 'if !sleepCtx(ctx, jitteredDelay(travelAccountDelay)) {'
+
+GO_ACT_DELAY_OLD = 'if !sleepCtx(ctx, activityAccountDelay) {'
+GO_ACT_DELAY_NEW = 'if !sleepCtx(ctx, jitteredDelay(activityAccountDelay)) {'
+
+GO_ACT_GAP_OLD = 'if !sleepCtx(ctx, activityReportGap) {'
+GO_ACT_GAP_NEW = 'if !sleepCtx(ctx, jitteredDelay(activityReportGap)) {'
+
+
 def build_text_edits(root: Path) -> list[tuple[Path, str, str, str]]:
     """全部文本补丁：(文件, 锚点, 替换成, 说明)。
 
     抽成函数是为了让测试能在**原始 vendor** 上做预检（见 tests/test_patch_preflight.py）——
     上游一旦重构、锚点失效，本地就能先发现，不必等构建或 CI。
     """
+    go_headers = root / 'wb2api' / 'internal' / 'upstream' / 'headers.go'
+    go_main = root / 'wb2api' / 'cmd' / 'server' / 'main.go'
+    go_travel = root / 'wb2api' / 'internal' / 'scheduler' / 'travel.go'
+    go_sched = root / 'wb2api' / 'internal' / 'scheduler' / 'scheduler.go'
+
     return [
         (root / 'manager' / 'server' / 'config.py',
          MANAGER_ANCHOR, MANAGER_HELPER + MANAGER_ANCHOR,
@@ -438,6 +572,23 @@ def build_text_edits(root: Path) -> list[tuple[Path, str, str, str]]:
         (root / 'manager' / 'web' / 'components' / 'common' / 'layout' / 'ManagementBar.tsx',
          MANAGEMENT_BAR_OLD, MANAGEMENT_BAR_NEW,
          'manager: 移除"发现新版本"会话弹窗'),
+        # ── 以下三组是「上游删除后由本项目维护」的风控加固，见 UPSTREAMS.md ──
+        (go_headers, GO_IMPORT_OLD, GO_IMPORT_NEW,
+         'wb2api: 设备标识盐支持环境变量覆盖（补 import）'),
+        (go_headers, GO_SALT_OLD, GO_SALT_NEW,
+         'wb2api: 设备标识盐可轮换（WB2A_DEVICE_ID_SALT）'),
+        (go_main, GO_MAXINFLIGHT_OLD, GO_MAXINFLIGHT_NEW,
+         'wb2api: max_in_flight=0（不限）时启动告警'),
+        (go_travel, GO_JITTER_ANCHOR, GO_JITTER_ANCHOR + GO_JITTER_HELPER,
+         'wb2api: 新增上报延迟抖动助手'),
+        (go_travel, GO_JITTER_IMPORT_OLD, GO_JITTER_IMPORT_NEW,
+         'wb2api: 抖动助手需要 math/rand（补 import）'),
+        (go_travel, GO_TRAVEL_DELAY_OLD, GO_TRAVEL_DELAY_NEW,
+         'wb2api: 旅行上报延迟加抖动'),
+        (go_sched, GO_ACT_DELAY_OLD, GO_ACT_DELAY_NEW,
+         'wb2api: 活跃上报账号间延迟加抖动'),
+        (go_sched, GO_ACT_GAP_OLD, GO_ACT_GAP_NEW,
+         'wb2api: 活跃上报账号内间隔加抖动'),
     ]
 
 

@@ -6,8 +6,8 @@
 
 > 注意措辞：本项目**不是**"把两个上游合并成一个镜像"。两个上游各自都自带
 > `Dockerfile` 与 `docker-compose.yml`，所以"能容器化"本身不是本项目的价值。
-> 本项目提供的是它们没有的那些（出口代理支持、套件一键更新、socket 隔离、
-> 版本锁定与同步、四容器编排），详见 README 的「与直接用上游的区别」。
+> 本项目提供的是它们没有的那些：出口代理支持、套件一键更新、socket 隔离、
+> 版本锁定与同步、四容器编排。
 
 > 为什么用快照而不是 submodule：本项目只做容器化与集成，
 > 需要的是「上游某个确定版本」而非「跟随上游变动」。
@@ -22,8 +22,11 @@
 
 | 上游 | 仓库 | 分支 | Commit | 提交时间 | 快照位置 |
 |---|---|---|---|---|---|
-| wb2api | [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) | `master` | [`d1023f3`](https://github.com/Sliverkiss/workbuddy2api/commit/d1023f37) | 2026-09-21 09:52 | `vendor/wb2api` |
+| wb2api | `Sliverkiss/workbuddy2api` ⚠️ **已删除** | `master` | `d1023f3` | 2026-09-21 09:52 | `vendor/wb2api` |
 | manager | [ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) | `main` | [`3fb56bd`](https://github.com/ithtelab/workbuddy-manager/commit/3fb56bd0) | 2026-09-20 19:48 | `vendor/manager` |
+
+> wb2api 那一行**不再有可点的链接**：仓库已 404（见下节）。
+> 它是**我们开始自行维护时的起点**，不是"待同步的目标"。
 
 - wb2api：`Merge pull request #184 from .../fix/image-url-`（+764/−21，15 个文件）
   含图片 URL 修复、积分口径、成长任务链、WAF 403 处理等
@@ -45,6 +48,34 @@
 > 记录的是**分支 + commit**，不是 Release tag：上游的 CHANGELOG 常滞后于
 > 代码（manager 打完 v1.0.25 后仍有未发版提交），按 tag 记录会失真。
 > 权威值始终以 `upstreams.json` 为准，本表是同步脚本执行后的手工摘录。
+
+### ⚠️ wb2api 上游已删除 —— 该部分由本项目自行维护
+
+**`Sliverkiss/workbuddy2api` 已不可访问**（仓库 API 与网页均返回 404；账号本身仍在，
+其公开仓库列表中已无该项目）。因此 wb2api **不再是"待同步的上游"**：
+
+- **不再有上游可同步**：`./scripts/sync-upstreams.sh --only wb2api` 会 fetch 失败；
+  每日漂移检测（`.github/workflows/upstream-check.yml`）对它会记一行"查询失败"，
+  既不开 issue 也不失败（fail-soft），等于该监控自动失效。
+- **构建不受影响**：`vendor/wb2api` 是自包含快照，构建期**不需要**访问上游。
+  这正是当初选择 vendoring 而不是 submodule 换来的保险。
+- **我们还有一份比快照更新的历史**：本地镜像缓存
+  `.upstream-cache/wb2api.git` 的 `master` 停在 `f2ccc7b`（上游删除前的最后可见
+  HEAD），包含到那一刻的完整提交历史，可用于查阅。
+- 已知的**最后一版上游产品代码**是 `d1023f3`（我们锁定的那个 commit）；
+  之后上游只推进过自己的 CI 治理机器人（`.github/actions/ai-governance/**`，
+  与产品无关）。
+
+**因此这条界线变了**：以前"`vendor/` 一字不改 + 构建期补丁"是为了保持可同步；
+现在上游没了，补丁实际上是**永久本地改动**。当前仍走补丁机制（改动集中、
+可在 `apply.py` 一处审计），其中已有 4 组补丁属于**上游从未有过的本地风控加固**
+（见「构建期补丁登记」的补丁 5~7）。若将来本地改动继续增多，可考虑把 wb2api
+正式"收养"为一等源码目录 —— 那时「快照 == 上游 commit」只剩历史意义。
+
+**仍可参考的公开派生**：搜索可见若干与本项目同构的公开仓库（例如
+`linguo2625469/workbuddy2api-panel`，目录结构与我们的 Go 项目一致）。它们是
+**被改造过的分支**（有各自的版本号与功能），**不是忠实副本** —— 需要借鉴修复时
+请当作"参考实现"，不要直接把 `upstreams.json` 指过去，否则本项目记录的血统就失真了。
 
 ### 快照保留范围
 
@@ -97,9 +128,12 @@ internal/prompt/prompt.go:17:12: pattern defaultprompt.md: no matching files fou
 
 ## 构建期补丁登记
 
-上游代码保持原样入库，但容器化集成需要**四组**上游没有的行为，因此在**构建期**
+上游代码保持原样入库，但集成需要**七组**上游没有的行为，因此在**构建期**
 打补丁（`docker/patches/apply.py`，Dockerfile 的 `vpatch` 阶段）。
-（四组共 6 处文本替换：补丁 1 与 3 各含 2 处。）
+（七组共 14 处文本替换：补丁 1、3、5、7 各含 2 处。）
+
+**补丁 1~4 是"容器化/发行"所需；补丁 5~7 是 wb2api 上游删除后，本项目自行加的
+风控加固**（上游从未有过这些能力，见前面「wb2api 上游已删除」）。
 
 | # | 目标 | 上游位置 | 补丁内容 | 为什么需要 |
 |---|---|---|---|---|
@@ -107,13 +141,24 @@ internal/prompt/prompt.go:17:12: pattern defaultprompt.md: no matching files fou
 | 2 | wb2api | `internal/upstream/transport.go` · `newTransport()` | 给 `http.Transport` 设 `Proxy: http.ProxyFromEnvironment` | 上游未设该字段，Go 零值 = **恒不使用代理**且不读环境变量，网关出站无法走代理 |
 | 3 | manager | `server/main.py` | 加两行：导入并 `include_router(suite_router)` | 注册本项目新增的 `/api/system/suite-*`（套件自更新）路由。**上游路由实现一行未改** —— 见下面的覆写登记 |
 | 4 | manager | `web/components/common/layout/ManagementBar.tsx` | 移除"发现新版本"会话弹窗（整块 `useEffect`） | 那条提示在本发行版**两处都不成立**：① 它显示的版本号是**上游 manager** 的，不是本套件的；② 文案指向「设置 → 系统更新 一键升级」，而该页并不提供升级上游的按钮。留着只会让人误以为点一下就能升级 |
+| 5 | wb2api | `internal/upstream/headers.go` · `deriveAccountStableID()` | 派生盐支持 `WB2A_DEVICE_ID_SALT` 覆盖（**默认仍是 `wb2a:`，行为不变**） | `X-Machine-ID`/`X-Session-ID` 一旦被上游打标，重新登录也换不掉（同 uid 恒同值），上游没留任何轮换手段。这是"确有需要时"的后手，见 README「账号风控相关」 |
+| 6 | wb2api | `cmd/server/main.go` · 池初始化 | `pool.max_in_flight == 0` 时启动告警 | 0 = 单账号在途**不限**；该值只能写在 config.json 里，误设无任何报错，而并发无上限会显著提高账号风控风险 |
+| 7 | wb2api | `internal/scheduler/travel.go` + `scheduler.go` | 上报间隔（0.8s / 1.5s）加 0..+50% 抖动（新增 `jitteredDelay`） | 精确等距的节奏是"机器特征"，真人不会这么匀；抖动让时间密度不再落在固定周期上。`base<=0` 原样返回，测试靠置 0 跳过等待 |
 
-补丁 1、2 都与**出口代理**有关 —— 那是本项目相对上游的实质增量之一；
-补丁 3 只是"挂载我们自己的路由"的接线；补丁 4 是"去掉不该出现的行为"。
+补丁 1、2 都与**出口代理**有关；补丁 3 是"挂载我们自己的路由"的接线；
+补丁 4 是"去掉不该出现的行为"；补丁 5~7 是**风控加固**（本项目独有的增量）。
 
 > **注意区分「改措辞」与「去行为」**：本项目**不做**前者（见下面的教训），
 > 但做后者。补丁 4 移除的是一个**实际会弹出来的提示**，不是把某句话换个说法 ——
 > 判据是"它是否在误导用户去做一个做不到的操作"。
+
+> **补丁 5~7 的验证方式**（因为它们触及对上游的网络行为，不能只靠"测试全绿"）：
+> 补丁 5 用「与 `sha256("wb2a:machine:u1")[:36]` 手算值逐字节比对」证明默认不变、
+> 换盐生效；补丁 6 真启动服务确认 `0` 告警而 `3` 不告警；补丁 7 用 300 次采样
+> 确认抖动有 300 个不同值。**其中补丁 7 的初版正是被这个采样测试否掉的**：
+> 初版用 `time.Now().UnixNano()` 取熵，在时钟粒度粗的平台上同一值重复 300 次，
+> 已改为 `math/rand`。
+
 
 ### 覆写登记（比补丁更重的手段）
 

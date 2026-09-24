@@ -51,6 +51,7 @@ class OverlayMarkerTest(unittest.TestCase):
             _SIDECAR,
             _RUNNER,
             _OVERLAY / 'config_merge.py',
+            _OVERLAY / 'check_device_token.py',
             _OVERLAY / 'server' / 'services' / 'suite.py',
             _OVERLAY / 'server' / 'routers' / 'suite.py',
             _PANEL,

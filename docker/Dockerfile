@@ -209,8 +209,9 @@ COPY docker/entrypoint-wb2api.sh docker/entrypoint-manager.sh \
 # 容器当 entrypoint 直接执行，所以必须有可执行位（见下面的 chmod）。
 # config_merge.py 由 entrypoint-wb2api.sh 在启动时调用，把上游新增的配置项
 # 增量补齐进已有的 config.json（只补缺失键，不改已有值）。
+# check_device_token.py 同样在启动时调用，只读报告有多少账号缺设备风控凭据。
 COPY docker/overlay/suite_updater.py docker/overlay/update_runner.py \
-     docker/overlay/config_merge.py /opt/suite/
+     docker/overlay/config_merge.py docker/overlay/check_device_token.py /opt/suite/
 COPY docker/wb2api.config.template.json /opt/suite/
 # 去 CRLF（Windows 检出可能）：容器内脚本以 \r 结尾会导致 shebang 失效
 RUN sed -i 's/\r$//' /opt/suite/*.sh /opt/suite/*.py \
