@@ -19,6 +19,7 @@ import {Badge} from '@/components/ui/badge';
 import {AiChatInput, type ChatModelOption} from '@/components/ui/ai-chat-input';
 import {CopyButton} from '@/components/ui/copy-button';
 import {playgroundApi, errText} from '@/lib/api';
+import {withBasePath} from '@/lib/base-path';
 import {notify} from '@/lib/toast';
 import {useT} from '@/lib/i18n/provider';
 import {fmtCredit} from '@/lib/format';
@@ -102,7 +103,9 @@ export default function PlaygroundPage() {
     const ac = new AbortController();
     abortRef.current = ac;
     try {
-      const res = await fetch('/api/playground/chat', {
+      // 流式对话必须用原生 fetch（axios 拿不到 ReadableStream），
+      // 因此这里不走 axios 的 baseURL，要自己补 basePath。
+      const res = await fetch(withBasePath('/api/playground/chat'), {
         method: 'POST',
         credentials: 'include',
         headers: {'Content-Type': 'application/json'},

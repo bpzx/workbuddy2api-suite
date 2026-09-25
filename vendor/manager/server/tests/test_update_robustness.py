@@ -144,5 +144,202 @@ class UpstreamRefPinning(unittest.TestCase):
         self.assertEqual(updater.read_status().get('upstream_ref'), '98b5e160')
 
 
+class UpstreamRemoteGoneTest(unittest.TestCase):
+    """上游仓库没了的时候，更新日志要把原因说对。
+
+    背景：上游原仓库 Sliverkiss/workbuddy2api 自 2026-09-23 起已不可访问。
+    此前拉取失败一律写「git fetch 失败（网络问题？）」——用户会去查网络、
+    反复重试一个必然失败的地址。真正的原因与出路要写清楚：源码还在本地、
+    本次照常重建；以后要更新就指向自己的副本。
+
+    判据用**真实的 git 报文**：git 的原文是
+    `fatal: repository 'https://…' not found`（仓库地址夹在中间），
+    所以「repository…not found」不能写成连写匹配（头一版就栽在这，测试看得见）。
+    """
+
+    GONE = [
+        "remote: Repository not found.\nfatal: repository 'https://github.com/x/y.git/' not found",
+        "fatal: repository 'https://github.com/Sliverkiss/workbuddy2api.git/' not found",
+        'fatal: could not read from remote repository',
+        "fatal: 'https://example.com/x.git' does not appear to be a git repository",
+    ]
+    OTHER = [
+        'fatal: could not resolve host: github.com',
+        'fatal: unable to access ...: Connection timed out',
+        '',
+    ]
+
+    def test_repo_gone_is_named_as_such(self) -> None:
+        """远端拿不到代码时：说清「源码从发布包来」这条出路，且**不把人往网络上引**。
+
+        判据盯的是**实质**而不是某四个字：措辞会随文案调整（本轮就把「已不可访问」
+        改成了中性的「远端仓库取不到代码」），但「出路要说清、别甩锅网络」这两条不变。
+        """
+        for out in self.GONE:
+            with self.subTest(out=out.splitlines()[0] if out else ''):
+                hint = worker._fetch_failed_hint(out)
+                self.assertIn('WB_UPSTREAM_REPO', hint, '要给出可操作的出路')
+                self.assertTrue('发布包' in hint or '包内' in hint,
+                                '要说清源码随发布包分发这条正路')
+                self.assertNotIn('网络', hint, '这不是网络问题，别让人去查网络')
+
+    def test_network_failure_is_not_blamed_on_the_missing_repo(self) -> None:
+        """网络、超时这类失败不能误报成「远端没了」——那会把排查带偏。"""
+        for out in self.OTHER:
+            with self.subTest(out=out):
+                hint = worker._fetch_failed_hint(out)
+                self.assertNotIn('发布包', hint)
+                self.assertIn('网络', hint, '网络类失败要如实说是网络')
+
+    def test_pinned_target_is_mentioned(self) -> None:
+        hint = worker._fetch_failed_hint(self.GONE[1], 'v1.2.3')
+        self.assertIn('v1.2.3', hint, '固定了版本时要说明是哪一次拉取失败')
+
+
+class BundledUpstreamSyncTest(unittest.TestCase):
+    """面板更新时同步包内自带的上游源码（上游公开地址已不可用，源码随包分发）。
+
+    这里钉的是三条**不能错**的性质：
+
+      · 用户数据一个字节都不能动：`config.json`（api_key）、`auths/`（账号凭据）、
+        `data/`（运行数据）——写坏了用户就登不上、账号全丢；
+      · 用户在 compose 里加过的东西（网络 / 卷 / 端口之外）要保住 —— issue #28 就
+        是这套定制被更新抹掉，容器重建后连不上网络；
+      · 内容没变要返回 0：调用方据此跳过容器重建，否则每次更新都白等一次构建、
+        还把上游短暂停掉。
+    """
+
+    def setUp(self) -> None:
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        root = pathlib.Path(self._tmp.name)
+        self.target = root / 'upstream-target'
+        self.bundle = root / 'bundle'
+        self._orig = worker.UPSTREAM_DIR
+        worker.UPSTREAM_DIR = self.target
+
+        # 目标：一个「非 git」的上游目录（装的时候用 UPSTREAM_SRC / 包内 upstream）
+        (self.target / 'scripts').mkdir(parents=True)
+        (self.target / 'docker-compose.yml').write_text(
+            'services:\n  workbuddy2api:\n    ports: ["127.0.0.1:7863:7863"]\n',
+            encoding='utf-8')
+        (self.target / 'scripts' / 'checkin.py').write_text('OLD\n', encoding='utf-8')
+        (self.target / 'scripts' / 'keep.py').write_text('KEEP\n', encoding='utf-8')
+        # 用户数据与凭据
+        (self.target / 'config.json').write_text('{"api_key": "secret"}\n', encoding='utf-8')
+        (self.target / 'auths').mkdir()
+        (self.target / 'auths' / 'workbuddy-a.json').write_text('{"uid":"a"}', encoding='utf-8')
+        (self.target / 'data').mkdir()
+        (self.target / 'data' / 'state.json').write_text('{"x":1}', encoding='utf-8')
+
+        # 包内自带的上游源码
+        (self.bundle / 'scripts').mkdir(parents=True)
+        (self.bundle / 'docker-compose.yml').write_text(
+            'services:\n  workbuddy2api:\n    ports: ["7863:7863"]\n', encoding='utf-8')
+        (self.bundle / 'scripts' / 'checkin.py').write_text('NEW\n', encoding='utf-8')
+        (self.bundle / 'scripts' / 'brand_new.py').write_text('NEW FILE\n', encoding='utf-8')
+        # 包内不该带用户数据，但真带了也不能覆盖（防御）
+        (self.bundle / 'config.json').write_text('{"api_key": "from-bundle"}\n', encoding='utf-8')
+
+    def tearDown(self) -> None:
+        worker.UPSTREAM_DIR = self._orig
+        self._tmp.cleanup()
+
+    def _rep(self):
+        class R:
+            def __init__(self):
+                self.logs = []
+
+            def log(self, msg, level='info'):
+                self.logs.append(str(msg))
+
+        return R()
+
+    def test_syncs_code_and_counts_changes(self) -> None:
+        n = worker._sync_bundled_upstream(self.bundle, self._rep())
+        # 改写 2 个（checkin.py + docker-compose.yml）、新增 1 个。
+        # compose 也算改动是对的：包内那份是「上游原样」，同步后由调用方
+        # 重新施加端口收敛（见下一条用例）。
+        self.assertEqual(n, 3, '应改写 2 个 + 新增 1 个')
+        self.assertEqual((self.target / 'scripts' / 'checkin.py').read_text(encoding='utf-8'),
+                         'NEW\n')
+        self.assertTrue((self.target / 'scripts' / 'brand_new.py').is_file())
+        self.assertEqual((self.target / 'scripts' / 'keep.py').read_text(encoding='utf-8'),
+                         'KEEP\n', '包里没有的文件保留原地，不删')
+
+    def test_port_convergence_is_reapplied_after_sync(self) -> None:
+        """同步会采用包内那份（上游原样、公网可达）的 compose —— 安全基线必须重来一遍。
+
+        这一步在 update_manager 里紧跟同步之后：`enforce_local_bind`。漏掉
+        它，上游就会重新监听 0.0.0.0:7863，端口收敛形同虚设。
+        """
+        worker._sync_bundled_upstream(self.bundle, self._rep())
+        worker.enforce_local_bind(self._rep())
+        compose = (self.target / 'docker-compose.yml').read_text(encoding='utf-8')
+        self.assertIn('127.0.0.1:7863:7863', compose,
+                      '同步后没有重新收敛端口 —— 上游会暴露到公网')
+
+    def test_user_data_untouched(self) -> None:
+        worker._sync_bundled_upstream(self.bundle, self._rep())
+        self.assertEqual((self.target / 'config.json').read_text(encoding='utf-8'),
+                         '{"api_key": "secret"}\n', 'config.json 被覆盖 = 用户 api_key 丢了')
+        self.assertEqual((self.target / 'auths' / 'workbuddy-a.json').read_text(encoding='utf-8'),
+                         '{"uid":"a"}', 'auths 被覆盖 = 账号凭据丢了')
+        self.assertEqual((self.target / 'data' / 'state.json').read_text(encoding='utf-8'),
+                         '{"x":1}', 'data 被覆盖 = 运行数据丢了')
+
+    def test_customized_compose_is_preserved(self) -> None:
+        """除端口收敛之外的定制（加网络等）要保住——issue #28 的原样。"""
+        custom = ('services:\n  workbuddy2api:\n'
+                  '    ports: ["127.0.0.1:7863:7863"]\n'
+                  '    networks: [external-net]\n'
+                  'networks:\n  external-net:\n    external: true\n')
+        (self.target / 'docker-compose.yml').write_text(custom, encoding='utf-8')
+        worker._sync_bundled_upstream(self.bundle, self._rep())
+        self.assertIn('external-net',
+                      (self.target / 'docker-compose.yml').read_text(encoding='utf-8'),
+                      '用户加的 external 网络被抹掉了')
+
+    def test_plain_port_convergence_is_not_treated_as_customization(self) -> None:
+        """只有端口收敛（我们自己制造的差异）时，应当**采用包内那份**，不算定制。"""
+        worker._sync_bundled_upstream(self.bundle, self._rep())
+        self.assertNotIn('127.0.0.1:7863',
+                         (self.target / 'docker-compose.yml').read_text(encoding='utf-8'),
+                         '端口收敛被误判成用户定制，导致 compose 永远是旧的')
+
+    def test_second_sync_reports_no_change(self) -> None:
+        worker._sync_bundled_upstream(self.bundle, self._rep())
+        n = worker._sync_bundled_upstream(self.bundle, self._rep())
+        self.assertEqual(n, 0, '内容一致时必须返回 0（调用方据此跳过容器重建）')
+
+    def test_git_upstream_is_left_alone(self) -> None:
+        (self.target / '.git').mkdir()
+        n = worker._sync_bundled_upstream(self.bundle, self._rep())
+        self.assertEqual(n, 0)
+        self.assertEqual((self.target / 'scripts' / 'checkin.py').read_text(encoding='utf-8'),
+                         'OLD\n', 'git 部署有自己的更新通道，不该被包内源码覆盖')
+
+    def test_missing_bundle_is_noop(self) -> None:
+        empty = self.bundle.parent / 'empty'
+        empty.mkdir()
+        n = worker._sync_bundled_upstream(empty, self._rep())
+        self.assertEqual(n, 0)
+
+    def test_update_manager_reapplies_baseline_after_sync(self) -> None:
+        """接线：同步之后紧跟端口收敛，且**在重建之前**。
+
+        上面那条只证明了 `enforce_local_bind` 本身有效，没证明它被调用 ——
+        这正是我评审时栽过的那类假绿（测了函数、没测调用点与顺序）。
+        """
+        src = pathlib.Path(worker.__file__).read_text(encoding='utf-8')
+        i = src.index('_sync_bundled_upstream(new_root')
+        tail = src[i:i + 800]
+        self.assertIn('enforce_local_bind(rep)', tail,
+                      '同步了包内源码却没重新施加端口收敛 —— 上游会暴露到公网')
+        self.assertLess(tail.index('enforce_local_bind(rep)'),
+                        tail.index('rebuild_upstream(rep)'),
+                        '顺序反了：收敛必须在重建之前，否则重建时用的是公网可达那份 compose')
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -36,7 +36,7 @@ def update_status(user: dict = Depends(security.current_user)) -> dict:
 
 
 @router.post('/update')
-def start_update(body: UpdateIn, user: dict = Depends(security.require_admin)) -> dict:
+def start_update(body: UpdateIn, user: dict = Depends(security.require_session_admin)) -> dict:
     """启动一键更新。
 
     更新会在后台执行并可能重启本服务，因此立即返回，由前端轮询
@@ -49,7 +49,7 @@ def start_update(body: UpdateIn, user: dict = Depends(security.require_admin)) -
 
 
 @router.post('/upstream-ref')
-def set_upstream_ref(body: UpstreamRefIn, user: dict = Depends(security.require_admin)) -> dict:
+def set_upstream_ref(body: UpstreamRefIn, user: dict = Depends(security.require_session_admin)) -> dict:
     """固定上游版本（或取消固定），用于上游某提交自身有问题时回退。"""
     try:
         ref = updater.set_upstream_ref(body.ref)

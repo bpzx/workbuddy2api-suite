@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import signal
 import stat
@@ -358,11 +359,109 @@ def _compose_looks_customized(rep: Reporter) -> bool:
         return False
 
 
+def _sync_bundled_upstream(src: Path, rep: Reporter) -> int:
+    """把发布包内自带的上游源码同步进 `UPSTREAM_DIR`（保留用户数据与定制）。
+
+    返回**改动文件数**（改写的 + 新增的）；0 表示没变或本次不适用——
+    调用方据此决定要不要重建上游容器（源码没变就不该白等一次构建）。
+
+    上游仓库的公开地址已不可用，源码随面板的 Release 包分发（包内 `upstream/`）。
+    在这里同步而不是在 `update_upstream` 里另下载一份，是因为**包是验过签的**：
+    上游代码由此也落在签名信任链里；而 `update_upstream` 的 git 拉取没有这层保证。
+
+    三条克制：
+      · 只处理**非 git** 的上游目录 —— git 部署有自己的通道（拉远端），那份源码
+        可能比包内的新，拿包内的覆盖它是倒退；
+      · 顶层 `config.json` / `auths/` / `data/` 一律不动（api_key、账号凭据、运行数据）；
+      · 只增改、不删除：包里没有的文件保留原地（宁可留旧文件，也不误删用户的）。
+    """
+    incoming = src / 'docker-compose.yml'
+    if not incoming.is_file():
+        rep.log('本次包内未含上游源码（upstream/），跳过上游代码同步')
+        return 0
+    if not (UPSTREAM_DIR / 'docker-compose.yml').is_file():
+        rep.log(f'{UPSTREAM_DIR} 里还没有上游源码，跳过同步'
+                '（首次安装上游请用 deploy/install.sh，它会用包内的 upstream/）', 'warn')
+        return 0
+    if (UPSTREAM_DIR / '.git').is_dir():
+        rep.log('上游是 git 部署：由上面的 git 流程更新，不覆盖包内源码')
+        return 0
+
+    # 用户对 compose 的定制（加网络 / 改卷 / 改端口之外的东西）要保住。
+    # 没有 git 可比，就拿「包内那份」当基准：两边都归一化掉我们的端口收敛，
+    # 不一致就说明本地有额外改动（issue #28 的情形）。
+    local_compose = UPSTREAM_DIR / 'docker-compose.yml'
+    keep_compose: str | None = None
+    try:
+        local_text = local_compose.read_text(encoding='utf-8')
+        if _port_converged(local_text).strip() != _port_converged(
+                incoming.read_text(encoding='utf-8')).strip():
+            keep_compose = local_text
+            rep.log('检测到 docker-compose.yml 有本地定制，同步后原样恢复')
+    except OSError:
+        pass
+
+    skip_top = {'config.json', 'auths', 'data'}
+    changed = 0
+    added = 0
+    for f in sorted(src.rglob('*')):
+        if not f.is_file():
+            continue
+        rel = f.relative_to(src)
+        if rel.parts[0] in skip_top or '.git' in rel.parts or '__pycache__' in rel.parts:
+            continue
+        dst = UPSTREAM_DIR / rel
+        try:
+            if dst.is_file():
+                if dst.read_bytes() == f.read_bytes():
+                    continue
+                changed += 1
+            else:
+                added += 1
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(f, dst)
+            shutil.copymode(f, dst)
+        except OSError as exc:
+            rep.log(f'  同步 {rel} 失败：{exc}', 'warn')
+
+    if keep_compose is not None:
+        local_compose.write_text(keep_compose, encoding='utf-8')
+    if changed or added:
+        rep.log(f'上游源码已随包更新：改写 {changed} 个、新增 {added} 个文件')
+    else:
+        rep.log('上游源码与包内一致，无需改动')
+    return changed + added
+
+
+def _fetch_failed_hint(out: str, pinned: str = '') -> str:
+    """拉取上游失败时给用户的话——分清「远端没了」与「网络/引用有问题」。
+
+    上游原仓库（Sliverkiss/workbuddy2api）自 2026-09-23 起已不可访问。
+    git 在这种情况下的报错是 `Repository not found` / `could not read from remote`，
+    直接透出去容易被当成网络抖动，用户会反复重试同一个必然失败的地址。
+    """
+    low = (out or '').lower()
+    # 注意别写成「repo**sitory** not found」这种连在一起的写法：git 的原文是
+    # `repository 'https://…' not found`，中间夹着地址，连写匹配不上（头一版就栽在这）。
+    gone = (re.search(r'repository .*not found', low) is not None
+            or 'does not appear to be a git repository' in low
+            or 'could not read from remote repository' in low)
+    target = f'上游 {pinned}' if pinned else '上游'
+    if gone:
+        return (f'{target}的远端仓库取不到代码（发布包分发的那份不受影响）。\n'
+                '  本次沿用现有源码继续。要更新上游代码：管理端一键更新会带上包内那份；\n'
+                '  也可以把 WB_UPSTREAM_REPO 指向你自己的副本，或用 UPSTREAM_SRC 换一份源码\n'
+                '  （见 deploy/README.md 的「上游源码从哪来」）。')
+    return (f'{target}拉取失败（提交/标签是否存在？网络是否正常？）'
+            + (f'：{out.strip()[:200]}' if out.strip() else ''))
+
+
 def update_upstream(rep: Reporter) -> None:
     rep.step('更新上游 workbuddy2api')
 
     if not (UPSTREAM_DIR / '.git').is_dir():
-        rep.log(f'{UPSTREAM_DIR} 不是 git 仓库，跳过上游更新', 'warn')
+        rep.log(f'{UPSTREAM_DIR} 是随包分发的上游（不是 git 仓库）：'
+                '代码随管理端一起更新，本次不单独更新上游')
         return
 
     which = shutil.which('git')
@@ -413,7 +512,7 @@ def update_upstream(rep: Reporter) -> None:
             rep.log('按提交直接拉取失败，尝试完整拉取…', 'warn')
             rc, out = run(['git', 'fetch', 'origin'], cwd=UPSTREAM_DIR, rep=rep, check=False)
         if rc != 0:
-            raise RuntimeError(f'拉取上游 {pinned} 失败（提交/标签是否存在？网络是否正常？）')
+            raise RuntimeError(_fetch_failed_hint(out, pinned))
         rc, out = run(['git', 'reset', '--hard', 'FETCH_HEAD'], cwd=UPSTREAM_DIR, rep=rep, check=False)
         if rc != 0:
             rc, out = run(['git', 'reset', '--hard', pinned], cwd=UPSTREAM_DIR, rep=rep, check=False)
@@ -423,7 +522,10 @@ def update_upstream(rep: Reporter) -> None:
         rep.log('拉取上游最新代码…')
         rc, out = run(['git', 'fetch', '--depth', '1', 'origin'], cwd=UPSTREAM_DIR, rep=rep, check=False)
         if rc != 0:
-            rep.log('git fetch 失败（网络问题？）', 'warn')
+            # 拉不到不致命：下面会沿用现有代码继续重建容器（本地源码是好的）。
+            # 但**原因要如实说**——原先一律写「网络问题？」，而上游原仓库
+            # 2026-09-23 起不再可用，用户照那句话去查网络只会白费功夫。
+            rep.log(_fetch_failed_hint(out), 'warn')
         branch = 'master'
         rc, out = run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=UPSTREAM_DIR, rep=rep, check=False)
         cur = out.strip() if rc == 0 else ''
@@ -462,8 +564,25 @@ def update_upstream(rep: Reporter) -> None:
     # 4) 恢复安全基线
     enforce_local_bind(rep)
 
-    # 5) 构建前预检：上游偶尔会漏改 Dockerfile（删了文件却仍在 COPY），
-    #    提前查出来，避免只看到 docker 那串难懂的报错
+    # 5) 预检 + 重建 + 等待就绪（见 rebuild_upstream）
+    rebuild_upstream(rep)
+
+    # 6) 清版本检测缓存
+    #
+    # 缓存里存的是「更新前」查到的远端最新提交；不清的话，界面会把**已经装好的
+    # 这个版本**当成新版本继续提示「上游有更新」，一直到缓存 6 小时过期为止
+    # （用户报过这个问题：明明更新到最新了，面板还是一直说有更新）。
+    # 管理端更新那条路径早就清了，上游这条一直漏着。
+    _clear_version_cache(rep)
+
+
+def rebuild_upstream(rep: Reporter) -> None:
+    """预检 Dockerfile → 重建上游容器 → 等待就绪。
+
+    抽出来是因为它有**两个调用点**：
+      · 常规的上游更新（上面那段 git 流程之后）；
+      · 面板更新时同步了包内自带的上游源码之后（源码变了必须重建才生效）。
+    """
     missing = _missing_copy_sources()
     if missing:
         rep.log('构建预检未通过：Dockerfile 引用了不存在的文件', 'error')
@@ -475,7 +594,7 @@ def update_upstream(rep: Reporter) -> None:
 
     # 6) 重建并启动
     rep.log('重建并启动上游容器（首次可能需数分钟）…')
-    compose_cmd = _compose_cmd()
+    compose_cmd = _compose_cmd(rep)
     if compose_cmd is None:
         # 容器镜像已内置 compose 插件（见 Dockerfile）；真走到这里说明用户
         # 用的是旧镜像或**自建的**管理端镜像。给出可执行的修法，而不是
@@ -484,7 +603,8 @@ def update_upstream(rep: Reporter) -> None:
             '找不到可用的 compose 命令（docker compose / docker-compose 都没有）。\n'
             '  容器部署请更新到最新版管理端镜像（已内置 compose 插件）；\n'
             '  自建镜像请在 Dockerfile 里安装 compose；\n'
-            '  宿主机部署请安装 docker compose 插件或 docker-compose。'
+            '  宿主机部署请安装 docker compose 插件或 docker-compose。\n'
+            '  自查：容器内执行 `docker compose version` 与 `ls /usr/local/lib/docker/cli-plugins/`。'
         )
     rc, out = run(compose_cmd + ['up', '-d', '--build'], cwd=UPSTREAM_DIR, rep=rep, check=False)
     if rc != 0:
@@ -492,6 +612,15 @@ def update_upstream(rep: Reporter) -> None:
         rep.log(f'重建失败（exit {rc}）', 'error')
         if hint:
             rep.log(f'原因判断：{hint}', 'error')
+        # exit 127 = 选中的 compose 命令**实际不存在**。这只有两种可能：
+        # ① 探测通过、执行时文件没了（罕见）；② 执行的是**旧版更新器**——
+        #    旧版没有上面那段探测，会直接去跑 docker-compose（issue #55）。
+        # 两种都要把它指出来：否则用户只能看到一行「命令不存在」，无从判断。
+        if rc == 127:
+            rep.log('诊断：选中的 compose 命令在执行时不存在。'
+                    '若上面的日志里**没有**「compose 探测」那一行，说明本次执行的是'
+                    '旧版更新器（新版会先探测并打出结果）——请重新更新管理端并确认'
+                    '容器已用新镜像重启，再重试。', 'error')
         # 构建失败时 compose 不会动已在运行的容器，明确说明当前服务状态
         _report_service_state(rep)
         raise RuntimeError('上游重建失败' + (f'：{hint}' if hint else '，请查看上方日志'))
@@ -502,14 +631,6 @@ def update_upstream(rep: Reporter) -> None:
         rep.log('上游已就绪')
     else:
         rep.log('上游未在预期时间内就绪，请查看容器日志', 'warn')
-
-    # 7) 清版本检测缓存
-    #
-    # 缓存里存的是「更新前」查到的远端最新提交；不清的话，界面会把**已经装好的
-    # 这个版本**当成新版本继续提示「上游有更新」，一直到缓存 6 小时过期为止
-    # （用户报过这个问题：明明更新到最新了，面板还是一直说有更新）。
-    # 管理端更新那条路径早就清了，上游这条一直漏着。
-    _clear_version_cache(rep)
 
 
 def _clear_version_cache(rep: Reporter) -> None:
@@ -526,7 +647,7 @@ _TRUST_ANCHOR_FILES = ('update.py', 'release-signing-key.pub')
 
 
 def _explain_deploy_risk(rep: Reporter, modified: list[str], added: list[str],
-                         here: Path) -> None:
+                         here: Path, backup: Path | None = None) -> None:
     """把 deploy/ 差异翻译成「要不要紧张、下一步做什么」。
 
     为什么要单独一段说明：早先只说「已跳过同步」，管理员看到一排文件名
@@ -537,6 +658,14 @@ def _explain_deploy_risk(rep: Reporter, modified: list[str], added: list[str],
       2. 修改了非信任锚文件（如 systemd 单元）→ 看一眼即可，想要新功能就覆盖
       3. 修改了信任锚（update.py / 公钥）→ **必须人工比对**，确认是官方改动
          而非被替换，再覆盖；这是整条供应链防护的最后一关
+
+    ## 还要说清「不同步的代价」（issue #55）
+
+    只讲风险会让管理员一律选择不动手，而**更新器本身**也在 deploy/ 里：不同步
+    就意味着「更新器永远是旧的那一份」，它修过的毛病（例如 compose v2 探测）
+    不会生效 —— issue #28 修过一次、#55 又报了一次，就是同一批人始终跑着旧
+    更新器。所以这里必须给出**代价**与**一条可执行的命令**，而不是只留下
+    「需人工确认」四个字。
     """
     anchors = [f for f in modified if Path(f).name in _TRUST_ANCHOR_FILES]
     others = [f for f in modified if Path(f).name not in _TRUST_ANCHOR_FILES]
@@ -553,6 +682,81 @@ def _explain_deploy_risk(rep: Reporter, modified: list[str], added: list[str],
     if modified:
         rep.log(f'   比对方法：diff {here.parent}/<文件名> <新包目录>/deploy/<文件名>')
     rep.log(f'   覆盖位置：{here.parent}（本次未改动任何文件）')
+
+    # 「不同步的代价」：更新器就在 deploy/ 里，不换它 = 以后每次都还用旧逻辑。
+    updater = [f for f in modified if Path(f).name == 'update.py']
+    if updater:
+        rep.log('   ⚠️ 本次更新改动了**更新器本身**（deploy/update.py）。'
+                '不同步的话，从下一次起仍由旧更新器执行更新，本次修的问题不会生效。',
+                'warn')
+    rep.log('   想让它随包更新（默认就是）：去掉 WB_SYNC_DEPLOY=0 后重跑本次更新'
+            '（覆盖前会备份到数据目录），或按上面的「比对方法」人工比对后手动覆盖。')
+    if backup is not None:
+        rep.log(f'   本次备份目录：{backup}')
+
+
+def _deploy_sync_enabled() -> bool:
+    """更新管理端时，`deploy/` 是否随包更新。**默认更新**，`WB_SYNC_DEPLOY=0` 关闭。
+
+    见 `update_manager` 里那段说明：包在解压前已验签，覆盖 deploy/ 与覆盖 server/
+    同一性质；而**不**更新的代价是更新器永远是旧的（它本身就在 deploy/ 里）。
+    """
+    return os.environ.get('WB_SYNC_DEPLOY', '').strip() != '0'
+
+
+def _sync_deploy(new_deploy: Path, install_dir: Path, backup: Path,
+                 rep: Reporter) -> tuple[list[str], list[str]]:
+    """把包内的 deploy/ 覆盖到安装目录（仅在与本地不同时动手），返回 (新增, 修改)。
+
+    调用前提：包**已经通过验签**（`verify_release_signature` 在解压之前执行）。
+    因此这里的覆盖与替换 server/ 是同一性质的 —— 都是维护者签过名的内容，
+    不会降级信任链。仍然先备份，便于回退。
+
+    抽成独立函数是为了可测：它决定「更新器自己能不能被更新」，而这段逻辑
+    过去只存在于 `update_manager` 内联代码里，改错了没有测试会红。
+
+    两个刻意的取舍（审核时特意确认过，别当成疏漏）：
+      · **只增不删**：本地有、包里没有的文件不会被删掉。发布包不该替用户清理
+        目录，留着顶多是多余文件；
+      · 用 `copyfile` 而不是 `copy2`：不保留包内权限位，写出来的文件按 umask 取
+        默认权限（可预测）。deploy/ 下的脚本都以解释器调用（`bash xxx.sh`、
+        `python3 xxx.py`），不依赖可执行位；反过来说，保留包内 mode 反而会把
+        一个意外的 0777 一路带进安装目录。
+    """
+    dest = install_dir / 'deploy'
+    added: list[str] = []
+    modified: list[str] = []
+    for src in sorted(new_deploy.rglob('*')):
+        if not src.is_file():
+            continue
+        rel = src.relative_to(new_deploy)
+        dst = dest / rel
+        try:
+            if not dst.is_file():
+                added.append(str(rel))
+            elif dst.read_bytes() != src.read_bytes():
+                modified.append(str(rel))
+        except OSError:
+            modified.append(str(rel))
+    if not (added or modified):
+        return [], []
+    shutil.copytree(dest, backup / 'deploy', dirs_exist_ok=True)
+    for src in sorted(new_deploy.rglob('*')):
+        if src.is_file():
+            rel = src.relative_to(new_deploy)
+            (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dest / rel)
+    rep.log('deploy/ 已同步到包内版本（默认行为；旧文件备份在 '
+            f'{backup / "deploy"}，想保持不变可设 WB_SYNC_DEPLOY=0）', 'warn')
+    if modified:
+        rep.log('   同步（改动）：' + '、'.join(modified[:8])
+                + ('…' if len(modified) > 8 else ''), 'warn')
+    if added:
+        rep.log('   同步（新增）：' + '、'.join(added[:8])
+                + ('…' if len(added) > 8 else ''), 'warn')
+    rep.log('   注意：若本次同步改了 update.py，**下一次**更新才由新版本执行'
+            '（本次仍跑在旧代码上）。', 'warn')
+    return added, modified
 
 
 def _read_upstream_ref() -> str:
@@ -667,7 +871,38 @@ def _has_compose_v1() -> bool:
         return False
 
 
-def _compose_cmd() -> list[str] | None:
+def _compose_plugin_paths() -> list[str]:
+    """已安装的 compose 插件文件（按 docker CLI 的查找顺序，列出存在的那些）。
+
+    只用于诊断输出：compose 用不了时，最需要知道的就是「插件到底装没装、装在哪」
+    —— 否则只能对着 `docker-compose: No such file` 猜（issue #55 的报告在这里
+    卡住了）。容器镜像按 Dockerfile 会把插件放在第一个路径。
+
+    `Path.home()` 与每个 `is_file()` 都单独兜住：uid 在 /etc/passwd 里没有条目时
+    `Path.home()` 会抛 RuntimeError（某些编排器以任意 uid 跑容器就是这种情形），
+    权限异常也可能让 `is_file()` 抛。这是**诊断**用的辅助函数，绝不该因为它自己
+    出错而把更新流程带崩。
+    """
+    cands = [
+        Path('/usr/local/lib/docker/cli-plugins/docker-compose'),
+        Path('/usr/lib/docker/cli-plugins/docker-compose'),
+        Path('/usr/local/libexec/docker/cli-plugins/docker-compose'),
+    ]
+    try:
+        cands.append(Path.home() / '.docker' / 'cli-plugins' / 'docker-compose')
+    except Exception:  # noqa: BLE001
+        pass
+    out: list[str] = []
+    for p in cands:
+        try:
+            if p.is_file():
+                out.append(str(p))
+        except OSError:
+            continue
+    return out
+
+
+def _compose_cmd(rep: Reporter | None = None) -> list[str] | None:
     """解析出可用的 compose 命令；都不可用返回 None。
 
     为什么不能像原先那样「有 v2 就用 v2，否则退回 v1」：容器形态下
@@ -677,12 +912,25 @@ def _compose_cmd() -> list[str] | None:
     于是原先的写法在容器里必然走进 `['docker-compose']` 分支，
     报 `FileNotFoundError: 'docker-compose'`（issue #28 的 exit 127）。
 
-    顺序：先用宿主机已有的（v2 优先，它是官方推荐形态），
-    实在没有再用我们自带的回退实现（见 `_fallback_compose_up`）。
+    顺序：先用宿主机已有的（v2 优先，它是官方推荐形态；容器镜像自带的就是它），
+    再退到旧的 `docker-compose`。两者都没有时返回 None，由调用方**直接报错并给出
+    可执行的修法** —— 绝不去执行一个明知不存在的命令（那样用户只会看到一行
+    `命令不存在`，完全看不出该做什么，issue #55 的报告正是这个形态）。
+
+    传 `rep` 时打印探测结果（含插件文件路径）。这行日志还有一个用处：它是判断
+    **「更新器本身是不是太旧」** 的证据 —— 旧版更新器没有这段探测，日志里根本
+    不会出现它（issue #55 的报告里就没有，据此可判定执行的是旧代码）。
     """
-    if _has_compose_v2():
+    v2 = _has_compose_v2()
+    v1 = _has_compose_v1()
+    if rep:
+        found = _compose_plugin_paths()
+        rep.log('compose 探测：docker compose=%s，docker-compose=%s%s'
+                % ('可用' if v2 else '不可用', '可用' if v1 else '不可用',
+                   ('，插件文件=' + '、'.join(found)) if found else '，未发现插件文件'))
+    if v2:
         return ['docker', 'compose']
-    if _has_compose_v1():
+    if v1:
         return ['docker-compose']
     return None
 
@@ -780,21 +1028,28 @@ def update_manager(rep: Reporter) -> None:
             shutil.rmtree(target_web, ignore_errors=True)
         shutil.copytree(new_web_out, target_web)
 
-        # deploy/ 里的脚本**不自动替换**——它含本次更新用的验签逻辑与公钥，
-        # 是整条信任链的锚点。若允许包内 deploy/ 覆盖它，攻击者只要在某次
-        # 更新里带一个改过的 update.py，之后所有更新就都不验签了
-        # （等于一次得手、永久失效）。
+        # deploy/ 里的脚本**默认随包更新**（`WB_SYNC_DEPLOY=0` 可关掉）。
         #
-        # 因此：包内带了 deploy/ 就在日志里提示差异，由管理员**手动**决定是否
-        # 覆盖（例如 systemd 单元确实需要更新时）。正常发版不会改这里。
+        # 为什么默认更新（issue #55）：发布包在**解压之前**就已经验签，所以包内的
+        # deploy/ 与 server/ 属于同一批「维护者签过名的内容」——覆盖它与覆盖
+        # server/ 是同一性质，不会降级信任链（验签用的是**本地**这一份的公钥，
+        # 只有验签通过之后才会走到这里）。
         #
-        # 提示要**分清轻重**：早先无论什么差异都只说「已跳过同步」，于是
-        # 「新增了一个无害的检查脚本」与「验签逻辑被改」看起来一模一样，
-        # 管理员无从判断该紧张还是该忽略（实测：有用户为此专门来问）。
-        # 现在逐文件标注新增/修改，并把安全关键文件单独点出来。
+        # 反过来不更新的代价很实在：**更新器本身就在 deploy/ 里**。不换它意味着
+        # 以后每次都还用旧逻辑，它修过的问题永远到不了用户机器上——#28 修过的
+        # compose 探测就是这样丢的，#55 又报了一次同一个毛病。
+        #
+        # 保留关闭开关，是给少数确实手工维护 deploy/ 的部署留退路（例如自己改过
+        # systemd 单元、或另有分发流程）。
+        #
+        # 提示仍要**分清轻重**：早先无论什么差异都只说「已跳过同步」，于是
+        # 「新增了一个无害的检查脚本」与「验签逻辑被改」看起来一模一样，管理员
+        # 无从判断该紧张还是该忽略（实测：有用户为此专门来问）。现在逐文件标注
+        # 新增/修改，并把安全关键文件单独点出来。
         new_deploy = new_root / 'deploy'
         if new_deploy.is_dir():
             here = Path(__file__).resolve()
+            # 先算差异（用于提示），再决定是否同步
             added: list[str] = []
             modified: list[str] = []
             for src in sorted(new_deploy.rglob('*')):
@@ -809,18 +1064,23 @@ def update_manager(rep: Reporter) -> None:
                         modified.append(str(rel))
                 except OSError:
                     modified.append(str(rel))
-            if added or modified:
-                rep.log('⚠️ 新包内的 deploy/ 与本地不同，**已跳过同步**'
-                        '（deploy/ 含验签逻辑，是信任锚，不能随包替换）', 'warn')
+            if not (added or modified):
+                rep.log('deploy/ 与包内一致，无需同步')
+            elif _deploy_sync_enabled():
+                try:
+                    _sync_deploy(new_deploy, INSTALL_DIR, backup, rep)
+                except OSError as exc:
+                    rep.log(f'deploy/ 同步失败（继续完成本次更新）：{exc}', 'warn')
+            else:
+                rep.log('⚠️ 新包内的 deploy/ 与本地不同，已按 WB_SYNC_DEPLOY=0 '
+                        '跳过同步', 'warn')
                 if modified:
-                    rep.log('   修改（需人工确认）：' + '、'.join(modified[:8])
+                    rep.log('   修改（未覆盖）：' + '、'.join(modified[:8])
                             + ('…' if len(modified) > 8 else ''), 'warn')
                 if added:
-                    rep.log('   新增（本地没有，多半无害）：' + '、'.join(added[:8])
+                    rep.log('   新增（未覆盖）：' + '、'.join(added[:8])
                             + ('…' if len(added) > 8 else ''), 'warn')
-                _explain_deploy_risk(rep, modified, added, here)
-            else:
-                rep.log('deploy/ 与包内一致，无需同步')
+                _explain_deploy_risk(rep, modified, added, here, backup)
 
         # 版本标记：界面「当前版本」与更新提醒都以它为准，必须一并替换，
         # 否则更新后仍显示旧版本，并一直提示「发现新版本可用」
@@ -835,6 +1095,21 @@ def update_manager(rep: Reporter) -> None:
             if src.is_file():
                 shutil.copyfile(src, INSTALL_DIR / name)
                 rep.log(f'同步 {name}')
+
+        # ── 上游源码随包更新 ─────────────────────────────────────────
+        # 上游仓库的公开地址已不可用，源码随本项目的发布包分发（包内 upstream/）。放在这里
+        # 而不是 update_upstream 里另下一份，是因为**本包是验过签的**：上游代码
+        # 由此落在签名信任链内；另下一份则没有这层保证。
+        # 只有真的改动了才重建容器——上游源码在两版之间多数没变，白重建一次要等
+        # 好几分钟，还会把上游短暂停掉。
+        changed = _sync_bundled_upstream(new_root / 'upstream', rep)
+        if changed:
+            # 包内那份 compose 是**上游原样**（`7863:7863`，公网可达），而端口收敛
+            # 是在 update_upstream 里做的——那一步在本函数之前。同步会把它盖掉，
+            # 所以这里必须**重新施加**安全基线，否则上游会重新暴露到 0.0.0.0。
+            enforce_local_bind(rep)
+            rep.log('上游源码有变化，重建容器使其生效…')
+            rebuild_upstream(rep)
 
     # 4) 依赖有变化则重装
     req = INSTALL_DIR / 'server' / 'requirements.txt'

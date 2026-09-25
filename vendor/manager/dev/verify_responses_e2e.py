@@ -324,6 +324,33 @@ def main() -> int:
             assert rr.status_code == 200, f'列表给出的 {mid} 调用失败：{rr.status_code} {rr.text[:120]}'
         print(f'[模型列表] ✓ 按白名单裁成 {listed}，且逐个调用均 200')
 
+        # ── 2f. 别名 + 限定版本：映射先于鉴权（issue #47）──
+        # 用户报的现象：密钥限国际版、别名指向国际版模型，请求别名却报
+        # 「当前请求是国内版模型」——版本判定发生在别名换算之前。
+        # 这里配好真实映射后走真实 HTTP：列出的别名必须真能调用，且出站是真名。
+        r = client.post('/api/settings/model-map', cookies=cookies,
+                        json={'claude-fable-5': 'global:gpt-5.6-sol'})
+        assert r.status_code == 200, r.text[:200]
+        r = client.post('/api/keys', json={
+            'name': 'e2e-alias', 'realm': 'global', 'models': ['claude-fable-5'],
+        }, cookies=cookies)
+        alias = r.json()['key']
+        alias_auth = {'Authorization': f'Bearer {alias}'}
+
+        r = client.get('/v1/models', headers=alias_auth)
+        alias_listed = [m['id'] for m in (r.json().get('data') or [])]
+        assert alias_listed == ['claude-fable-5'], f'别名没被列进列表：{alias_listed}'
+
+        rr = client.post('/v1/chat/completions', headers=alias_auth,
+                         json={'model': 'claude-fable-5',
+                               'messages': [{'role': 'user', 'content': 'hi'}]})
+        assert rr.status_code == 200, \
+            f'别名调用被拒（issue #47 复发）：{rr.status_code} {rr.text[:200]}'
+        with _SEEN_LOCK:
+            out_model = list(_SEEN)[-1].get('model')
+        assert out_model == 'global:gpt-5.6-sol', f'出站模型名不是映射结果：{out_model}'
+        print(f'[别名映射] ✓ 别名 {alias_listed[0]} 列表可见、调用 200，出站为 {out_model}')
+
         # ── 3. 版本隔离在 Responses 路径同样生效，且真实原因不被折叠 ──
         r = client.post('/api/keys', json={'name': 'e2e-cn', 'realm': 'cn'}, cookies=cookies)
         cn = r.json()['key']

@@ -64,6 +64,11 @@ WORKDIR /src
 # 实测缓慢且会断。留空 = 官方源（失败时自动降级到 npmmirror）。
 #   docker compose build --build-arg NPM_REGISTRY=https://registry.npmmirror.com
 ARG NPM_REGISTRY=""
+# 子路径部署前缀（例如 /workbuddy-manager）。留空 = 部署在根路径。
+# 构建期写进 NEXT_PUBLIC_BASE_PATH，Next 会把它内联进前端产物：
+# 所有资源引用与 axios 请求都会带上该前缀。
+ARG BASE_PATH=""
+ENV NEXT_PUBLIC_BASE_PATH=$BASE_PATH
 
 COPY web/ /src/
 
@@ -107,7 +112,8 @@ ENV PYTHONUNBUFFERED=1 \
     WB_STATIC_DIR=/app/web/out \
     WB_AUTH_DIR=/opt/workbuddy2api/auths \
     WB_UPSTREAM_CONFIG=/opt/workbuddy2api/config.json \
-    WB2API_BASE=http://127.0.0.1:7863
+    WB2API_BASE=http://127.0.0.1:7863 \
+    WB_BASE_PATH=""
 
 # 可选：Debian 软件源镜像（留空 = 官方源 deb.debian.org）。
 #
@@ -175,6 +181,10 @@ RUN set -eu; \
 # 也是对的，不强制用户先装 buildx。
 ARG DOCKER_CLI_VERSION=27.3.1
 ARG TARGETARCH
+# 可选：docker 静态包镜像基址。官方源 download.docker.com 走国外 CDN，
+# 中国大陆实测下载极慢（构建会长时间卡在这一步）。留空 = 官方源。
+# 可选值：https://mirrors.aliyun.com/docker-ce / https://mirrors.tuna.tsinghua.edu.cn/docker-ce
+ARG DOCKER_CLI_BASE=""
 RUN set -eux; \
     case "${TARGETARCH:-$(uname -m)}" in \
         amd64 | x86_64)  DOCKER_ARCH=x86_64 ;; \
@@ -182,8 +192,13 @@ RUN set -eux; \
         arm | armv7l)    DOCKER_ARCH=armhf ;; \
         *) echo "docker-cli 静态包不支持的架构：${TARGETARCH:-$(uname -m)}" >&2; exit 1 ;; \
     esac; \
+    DOCKER_URL="https://download.docker.com/linux/static/stable/${DOCKER_ARCH}/docker-${DOCKER_CLI_VERSION}.tgz"; \
+    if [ -n "${DOCKER_CLI_BASE}" ]; then \
+        echo "docker-cli: 使用镜像 ${DOCKER_CLI_BASE}"; \
+        DOCKER_URL="${DOCKER_CLI_BASE}/linux/static/stable/${DOCKER_ARCH}/docker-${DOCKER_CLI_VERSION}.tgz"; \
+    fi; \
     curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
-        "https://download.docker.com/linux/static/stable/${DOCKER_ARCH}/docker-${DOCKER_CLI_VERSION}.tgz" \
+        "${DOCKER_URL}" \
         -o /tmp/docker.tgz; \
     tar -xzf /tmp/docker.tgz -C /tmp; \
     mv /tmp/docker/docker /usr/local/bin/docker; \
@@ -211,6 +226,10 @@ RUN set -eux; \
 #   `up --build` 上（正是 issue #28 报的那个失败）。
 #   v2 有 `build_classic.go`（内置 builder）作为回退，所以不需要 buildx。
 ARG COMPOSE_VERSION=v2.40.3
+# 可选：GitHub Releases 加速前缀。官方 GitHub 下载在国内会超时/极慢。
+# 用法是「前缀 + 原始 URL」，例如 https://ghfast.top/ （留空 = 直连 GitHub）
+#   https://ghfast.top/https://github.com/... 
+ARG COMPOSE_URL_PREFIX=""
 RUN set -eux; \
     case "${TARGETARCH:-$(uname -m)}" in \
         amd64 | x86_64)  COMPOSE_ARCH=x86_64 ;; \
@@ -218,9 +237,14 @@ RUN set -eux; \
         arm | armv7l)    COMPOSE_ARCH=armv7 ;; \
         *) echo "compose 插件不支持的架构：${TARGETARCH:-$(uname -m)}" >&2; exit 1 ;; \
     esac; \
+    COMPOSE_URL="https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-${COMPOSE_ARCH}"; \
+    if [ -n "${COMPOSE_URL_PREFIX}" ]; then \
+        echo "compose: 使用加速前缀 ${COMPOSE_URL_PREFIX}"; \
+        COMPOSE_URL="${COMPOSE_URL_PREFIX}${COMPOSE_URL}"; \
+    fi; \
     mkdir -p /usr/local/lib/docker/cli-plugins; \
     curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
-        "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-${COMPOSE_ARCH}" \
+        "${COMPOSE_URL}" \
         -o /usr/local/lib/docker/cli-plugins/docker-compose; \
     chmod +x /usr/local/lib/docker/cli-plugins/docker-compose; \
     docker compose version

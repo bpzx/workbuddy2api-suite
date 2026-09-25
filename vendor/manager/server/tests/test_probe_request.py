@@ -159,6 +159,16 @@ class ErrorCodeHintTest(unittest.TestCase):
         for code in (10001, '10001'):
             self.assertIn('今日已签到', tencent._explain_code(code))
 
+    def test_credit_exhaustion_code(self) -> None:
+        """14018 = 积分耗尽（对齐上游 2026-09-20 的分类）。
+
+        上游在 429 上只认这个结构化业务码，不靠「额度不足」这类跨计费/限流两界
+        的文案猜。本端跟着翻译：欠费号的连通性测试要说清是没积分，而不是让用户
+        以为账号坏了（对应本批适配的 upstream 提交）。
+        """
+        for code in (14018, '14018'):
+            self.assertIn('积分耗尽', tencent._explain_code(code))
+
     def test_unknown_code_does_not_crash(self) -> None:
         """未知码（含带横线的）不能抛异常 —— 之前 int() 会在这里炸。"""
         for code in ('99-1', 999999, 'weird', None):

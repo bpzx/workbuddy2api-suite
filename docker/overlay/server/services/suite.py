@@ -53,37 +53,11 @@ UPDATER_TOKEN = os.environ.get('SUITE_UPDATER_TOKEN') or ''
 # 状态文件被认为"仍在进行中"的最长时间，超过即视为异常遗留
 RUNNING_TTL = 3600
 
-# 上游 commit 展示用的缩写长度。**必须与 upstreams.json 的 commit_short 一致** ——
-# 否则面板会同时显示「固定提交 d1023f3 / 远端最新 d1023f37」这种同一个提交的
-# 两种写法，看起来就像"有更新"（已真实发生过，见下面的 same_commit）。
-SHORT_LEN = 7
-
 _SEMVER = re.compile(r'^v?(\d+(?:\.\d+)*)$')
 _GH_HEADERS = {
     'Accept': 'application/vnd.github+json',
     'User-Agent': 'workbuddy2api-suite',
 }
-
-
-def same_commit(a: str, b: str) -> bool:
-    """两个 commit 缩写是否指向**同一个提交**。
-
-    用**前缀**比较，而不是全等：拿到的缩写长度未必一致（我们的
-    upstreams.json 是 7 位，GitHub API 可能给 8 位或完整 40 位），而同一个
-    提交的任意长度前缀必然互为前缀。
-
-    这条曾经写错成 `a != b`，后果是**同一个提交被判成"有更新"**：
-    upstreams.json 里的 `d1023f3`（7 位）与 API 返回后截断的 `d1023f37`（8 位）
-    不相等，于是面板一直提示上游有更新 —— 而它其实已经是最新。
-    上游 updater.py 的判据正是前缀比较
-    （`u_latest.startswith(local_head) or local_head.startswith(u_latest)`），
-    这里与它保持一致。
-    """
-    x = str(a or '').strip().lower()
-    y = str(b or '').strip().lower()
-    if not x or not y:
-        return False
-    return x.startswith(y) or y.startswith(x)
 
 
 # ── 版本工具 ─────────────────────────────────────────────
@@ -149,12 +123,16 @@ def highest_release_tag(tags: list[str]) -> str:
     return best_tag
 
 
-# ── 上游固定版本（镜像内烤好的 upstreams.json）───────────────
+# ── 上游仓库地址（镜像内烤好的 upstreams.json）───────────────
 def pinned_upstreams() -> dict:
-    """镜像里锁定的上游 commit。读不到时返回空结构（不抛异常）。
+    """镜像里记录的上游仓库信息，按名字给出 `{name: {'repo': ...}}`。
 
-    这是容器内判断"本套件捆绑的是哪个上游版本"的唯一正确来源 ——
-    容器里没有上游 git 仓库，`git rev-parse` 走不通。
+    读不到时返回空结构（不抛异常）。
+
+    这里**只取 repo**：它用于向 GitHub 查"最新正式版"。历史上的 commit / 缩写 /
+    提交说明曾用于面板的 commit 比对，但 wb2api 上游删除后那一行已从面板移除，
+    比对逻辑也一并删掉了 —— 保留没有消费方的字段只会变成死数据。
+    完整的锁定记录仍以 `upstreams.json` 与 [`UPSTREAMS.md`](../UPSTREAMS.md) 为准。
     """
     out: dict = {}
     try:
@@ -164,15 +142,7 @@ def pinned_upstreams() -> dict:
     for name, info in (data.get('upstreams') or {}).items():
         if not isinstance(info, dict):
             continue
-        commit = str(info.get('commit') or '')
-        out[name] = {
-            'commit': commit,
-            # 与 API 侧用同一个缩写长度，避免同一个提交显示成两种写法
-            'short': str(info.get('commit_short') or commit[:SHORT_LEN])[:SHORT_LEN],
-            'subject': str(info.get('subject') or ''),
-            'date': str(info.get('commit_date') or ''),
-            'repo': str(info.get('repo') or ''),
-        }
+        out[name] = {'repo': str(info.get('repo') or '')}
     return out
 
 
@@ -198,14 +168,32 @@ async def _gh_get(path: str) -> object:
         return resp.json()
 
 
-async def _fetch_release_tag(slug: str) -> str:
-    """仓库里最新的正式版 tag。
+def _gh_reason(exc: Exception) -> str:
+    """把 GitHub 请求异常翻成可读原因。
+
+    为什么要区分：以前这里把所有异常吞掉、统一报「仓库里没有正式版 tag」，
+    而真实原因可能是「仓库私有/不存在」或「触发了未认证限流」—— 与"确实没有 tag"
+    完全是两回事，会把人引到错误的方向（这个假警报真实出现过）。
+    """
+    code = getattr(getattr(exc, 'response', None), 'status_code', None)
+    if code == 404:
+        return '仓库不可访问（不存在或为私有）'
+    if code == 403:
+        return 'GitHub 拒绝（未认证接口每小时 60 次，可能已限流）'
+    if code:
+        return f'GitHub 返回 HTTP {code}'
+    return f'{type(exc).__name__}: {str(exc)[:80]}'
+
+
+async def _fetch_release_tag(slug: str) -> tuple[str, str]:
+    """仓库里最新的正式版 tag，返回 (tag, 失败原因)。
 
     先看 tag（最可靠：CI 的镜像标签就直接来自 tag），没有再退回 Release。
-    两者都取不到就返回空串 —— 版本提示是辅助信息，拿不到不该报错。
+    两者都取不到时**带上原因**返回，供界面如实显示。
     """
     if not slug:
-        return ''
+        return '', '未配置仓库地址'
+    reason = ''
     try:
         tags = await _gh_get(f'/repos/{slug}/tags?per_page=100')
         if isinstance(tags, list):
@@ -213,36 +201,16 @@ async def _fetch_release_tag(slug: str) -> str:
                 [t.get('name') for t in tags if isinstance(t, dict)]
             )
             if found:
-                return found
-    except Exception:  # noqa: BLE001
-        pass
+                return found, ''
+    except Exception as exc:  # noqa: BLE001
+        reason = _gh_reason(exc)
     try:
         rel = await _gh_get(f'/repos/{slug}/releases/latest')
-        if isinstance(rel, dict):
-            return str(rel.get('tag_name') or '')
-    except Exception:  # noqa: BLE001
-        pass
-    return ''
-
-
-async def _fetch_head_commit(slug: str) -> dict:
-    """仓库默认分支的最新提交。"""
-    if not slug:
-        return {'latest': '', 'date': '', 'subject': ''}
-    try:
-        commits = await _gh_get(f'/repos/{slug}/commits?per_page=1')
-        if isinstance(commits, list) and commits:
-            c = commits[0]
-            commit = c.get('commit') or {}
-            return {
-                # 截断到与 upstreams.json 相同的长度（见 SHORT_LEN 的注释）
-                'latest': str(c.get('sha') or '')[:SHORT_LEN],
-                'date': str((commit.get('committer') or {}).get('date') or ''),
-                'subject': str(commit.get('message') or '').split('\n')[0][:120],
-            }
-    except Exception:  # noqa: BLE001
-        pass
-    return {'latest': '', 'date': '', 'subject': ''}
+        if isinstance(rel, dict) and rel.get('tag_name'):
+            return str(rel['tag_name']), ''
+    except Exception as exc:  # noqa: BLE001
+        reason = reason or _gh_reason(exc)
+    return '', reason or '仓库里没有正式版 tag'
 
 
 # ── 版本检查 ─────────────────────────────────────────────
@@ -265,43 +233,28 @@ def _write_cache(data: dict) -> None:
 
 
 async def _fetch_all() -> dict:
-    """向 GitHub 查套件与两个上游的最新版本（不做缓存判断）。"""
+    """向 GitHub 查套件与上游管理端的最新版本（不做缓存判断）。
+
+    **只查这两项。** wb2api 的仓库已被删除，面板上那一行也一并移除了 ——
+    继续查它只会得到 404，而下面的"保留上次成功结果"逻辑会把它**永久**留成
+    "有新版本可更新"的假象（仓库都不存在了，谈不上更新）。
+    """
     pins = pinned_upstreams()
     suite_repo = (os.environ.get('WB_SUITE_REPO') or '').strip()
-    gw_repo = str((pins.get('wb2api') or {}).get('repo') or 'Sliverkiss/workbuddy2api')
     mg_repo = str((pins.get('manager') or {}).get('repo') or 'ithtelab/workbuddy-manager')
 
     result: dict = {
         'checked_at': int(time.time()),
         'suite': {'latest': '', 'error': '', 'repo': suite_repo},
-        'wb2api': {'latest': '', 'date': '', 'subject': '', 'error': '', 'repo': gw_repo},
         'manager': {'latest': '', 'error': '', 'repo': mg_repo},
     }
 
     if not suite_repo:
         result['suite']['error'] = '未配置套件仓库（WB_SUITE_REPO）'
     else:
-        try:
-            result['suite']['latest'] = await _fetch_release_tag(suite_repo)
-            if not result['suite']['latest']:
-                result['suite']['error'] = '仓库里没有正式版 tag'
-        except Exception as exc:  # noqa: BLE001
-            result['suite']['error'] = str(exc)[:120]
+        result['suite']['latest'], result['suite']['error'] = await _fetch_release_tag(suite_repo)
 
-    try:
-        result['wb2api'].update(await _fetch_head_commit(gw_repo))
-        if not result['wb2api']['latest']:
-            result['wb2api']['error'] = '取不到远端提交'
-    except Exception as exc:  # noqa: BLE001
-        result['wb2api']['error'] = str(exc)[:120]
-
-    try:
-        result['manager']['latest'] = await _fetch_release_tag(mg_repo)
-        if not result['manager']['latest']:
-            result['manager']['error'] = '仓库里没有正式版 tag'
-    except Exception as exc:  # noqa: BLE001
-        result['manager']['error'] = str(exc)[:120]
-
+    result['manager']['latest'], result['manager']['error'] = await _fetch_release_tag(mg_repo)
     return result
 
 
@@ -311,16 +264,21 @@ async def check(force: bool = False) -> dict:
     age = time.time() - float(cache.get('checked_at') or 0)
     if force or not cache or age > CHECK_TTL:
         fresh = await _fetch_all()
-        # 保留上次成功的结果：临时网络故障不该让界面从"有新版本"掉成"未知"
-        for key in ('suite', 'wb2api', 'manager'):
+        # 保留上次成功的结果：**临时**网络故障不该让界面从"有新版本"掉成"未知"。
+        # 但必须说清"这个版本号是上次检测的" —— 否则界面会同时显示一个版本号和
+        # 一条报错却不解释两者关系（"仓库里没有正式版 tag"配上具体 tag 就是这么来的，
+        # 真实原因是那一次查询失败）。
+        for key in ('suite', 'manager'):
             if (fresh.get(key) or {}).get('error') and (cache.get(key) or {}).get('latest'):
-                fresh[key] = {**cache[key], 'error': fresh[key]['error']}
+                fresh[key] = {
+                    **cache[key],
+                    'error': fresh[key]['error'] + '；显示的版本号来自上次成功检测',
+                }
         _write_cache(fresh)
         cache = fresh
     else:
         fresh = cache
 
-    pins = pinned_upstreams()
     cur = current_version()
 
     s_latest = str((fresh.get('suite') or {}).get('latest') or '')
@@ -328,13 +286,6 @@ async def check(force: bool = False) -> dict:
     # 开发构建（无版本号）时，只要仓库存在正式版就算"可切换到该版本"；
     # 有版本号时严格比较，避免把降级当更新。
     s_has = bool(s_latest) and (s_dev or version_newer(s_latest, cur))
-
-    gw = fresh.get('wb2api') or {}
-    gw_pin = (pins.get('wb2api') or {}).get('short') or ''
-    gw_latest = str(gw.get('latest') or '')
-    # 用前缀比较（same_commit），不能用全等：两边缩写长度可能不同，
-    # 全等会把同一个提交判成"有更新" —— 这个假阳性真实出现过。
-    gw_has = bool(gw_pin and gw_latest) and not same_commit(gw_pin, gw_latest)
 
     mg = fresh.get('manager') or {}
     mg_cur = updater.current_version()
@@ -352,15 +303,6 @@ async def check(force: bool = False) -> dict:
             'repo': str((fresh.get('suite') or {}).get('repo') or ''),
             'error': str((fresh.get('suite') or {}).get('error') or ''),
         },
-        'wb2api': {
-            'current': gw_pin,
-            'latest': gw_latest,
-            'has_update': gw_has,
-            'date': str(gw.get('date') or ''),
-            'subject': str(gw.get('subject') or ''),
-            'repo': str(gw.get('repo') or ''),
-            'error': str(gw.get('error') or ''),
-        },
         'manager': {
             'current': mg_cur,
             'latest': mg_latest,
@@ -368,7 +310,7 @@ async def check(force: bool = False) -> dict:
             'repo': str(mg.get('repo') or ''),
             'error': str(mg.get('error') or ''),
         },
-        'has_any': s_has or gw_has or mg_has,
+        'has_any': s_has or mg_has,
     }
 
 

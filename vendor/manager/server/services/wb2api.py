@@ -8,7 +8,9 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import socket
+import tempfile
 import time
 from pathlib import Path
 
@@ -494,6 +496,321 @@ async def set_manual_disabled(uid: str, disabled: bool, reason: str = '') -> tup
                   else '已通过上游状态位启用'), 'ok'
 
 
+def upstream_state_file() -> Path:
+    """读取上游 config.json 并解析 state_file 的真实路径。
+
+    上游允许 `state_file` 使用相对路径，且相对的是上游进程的工作目录。
+    管理端与上游共享同一个上游仓库目录，因此这里按 `WB_UPSTREAM_DIR`
+    解析；配置缺失或非法时拒绝操作，避免猜错路径后改到别的文件。
+    """
+    try:
+        cfg = json.loads(config.UPSTREAM_CONFIG.read_text(encoding='utf-8'))
+    except FileNotFoundError as exc:
+        raise ValueError(f'未找到上游配置文件：{config.UPSTREAM_CONFIG}') from exc
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f'读取上游配置失败：{exc}') from exc
+    if not isinstance(cfg, dict):
+        raise ValueError('上游配置不是 JSON 对象')
+    raw = str(cfg.get('state_file') or 'data/state.json').strip()
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = config.UPSTREAM_DIR / path
+    return path.resolve()
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    """原子写回状态文件，并保留原文件的权限与属主。"""
+    st = path.stat()
+    encoded = (json.dumps(payload, ensure_ascii=False, indent=2) + '\n').encode('utf-8')
+    fd, tmp_name = tempfile.mkstemp(prefix=f'.{path.name}.', suffix='.tmp', dir=path.parent)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, 'wb') as fh:
+            fh.write(encoded)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, st.st_mode & 0o777)
+        try:
+            # Windows 上**没有** os.chown（该 API 仅 Unix 提供）——直接调用会抛
+            # AttributeError。原生模式部署在 Windows 上也会走到这里（评审实测：
+            # 在 Windows 跑本 PR 自带的测试，四条里三条就是这个错）。
+            # 权限模式已经 chmod 保留；属主在 Windows 上本来也没有 uid/gid 语义。
+            chown = getattr(os, 'chown', None)
+            if chown is not None:
+                chown(tmp, st.st_uid, st.st_gid)
+        except OSError:
+            # 非 root 部署若本来就是文件属主，chown 到同一个 uid/gid 也可能在
+            # 某些平台上被拒绝；权限模式已经保留，失败不应阻断写入。
+            pass
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def clear_account_cooling_state(uid: str) -> dict:
+    """清除一个账号在 state.json 中的冷却、熔断、降权与模型级限流。
+
+    只修改 target uid 对应条目，`disabled` / `manual_disabled` / 凭证 / 积分
+    等正交状态保持不变。调用方必须先停止上游，否则周期 Flush 会覆盖本改动。
+    """
+    uid = str(uid or '').strip()
+    if not uid:
+        raise ValueError('uid 为空')
+    path = upstream_state_file()
+    try:
+        state = json.loads(path.read_text(encoding='utf-8'))
+    except FileNotFoundError as exc:
+        raise ValueError(f'未找到上游状态文件：{path}') from exc
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f'上游状态文件不是合法 JSON（{path}）：{exc}') from exc
+    accounts = state.get('accounts') if isinstance(state, dict) else None
+    if not isinstance(accounts, dict) or not isinstance(accounts.get(uid), dict):
+        raise ValueError('该账号不在上游状态文件中')
+
+    # 保留一份最近一次强制清除前的快照，便于人工回退。state.json 不含凭证。
+    backup = path.with_name(path.name + '.force-clear.bak')
+    shutil.copy2(path, backup)
+
+    account = accounts[uid]
+    before = {
+        'until': account.get('until'),
+        'reason': account.get('reason'),
+        'model_cooldowns': account.get('model_cooldowns'),
+        'breaker_until': account.get('breaker_until'),
+        'degrade_until': account.get('degrade_until'),
+    }
+    account['until'] = '0001-01-01T00:00:00Z'
+    # `cool_kind` 要**删掉**而不是写 0（评审修正）：它在 state.json 里是 int 枚举
+    # （0 = hard_credit），而「没有冷却」的规范表示是**不写这个键** —— 上游自己的
+    # 落盘逻辑就这么做，其注释写明是为了避免「until 零值 + cool_kind」的不一致快照。
+    # 写 0 不会立刻出问题（until 是零值，上游下次 Flush 也会按规范抹掉），但没必要
+    # 在别人的文件里留一个自己造的非规范形态。
+    account.pop('cool_kind', None)
+    account['soft_streak'] = 0
+    account.pop('model_cooldowns', None)
+    account.pop('breaker_until', None)
+    account['retry_count'] = 0
+    account.pop('degrade_until', None)
+    account['consecutive_fails'] = 0
+    # disabled=true 时 reason 是禁用原因，不属于冷却域，不能误清。
+    if not bool(account.get('disabled')):
+        account.pop('reason', None)
+
+    _atomic_write_json(path, state)
+    return {'uid': uid, 'state_file': str(path), 'backup': str(backup), 'before': before}
+
+
+async def _set_upstream_running(running: bool) -> tuple[bool, str]:
+    """停止或启动上游，供需要离线修改 state.json 的运维动作使用。"""
+    if config.WB2API_MODE == 'native':
+        script = config.WB2API_START_SCRIPT if running else config.WB2API_STOP_SCRIPT
+        if not script.is_file():
+            return False, f'未找到原生上游脚本：{script}'
+        cmd = (('cmd.exe', '/d', '/c', str(script)) if os.name == 'nt' else (str(script),))
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=str(script.parent),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=_NATIVE_RESTART_TIMEOUT)
+            if proc.returncode != 0:
+                return False, f'{script.name} 退出码 {proc.returncode}'
+            return True, f'{script.name} 执行成功'
+        except asyncio.TimeoutError:
+            _kill_quietly(proc)
+            return False, f'{script.name} 执行超时'
+        except Exception as exc:  # noqa: BLE001
+            return False, f'执行 {script.name} 失败：{exc}'
+
+    action = 'start' if running else 'stop'
+    cmd = ['docker', action]
+    if not running:
+        cmd.extend(['--time', '15'])
+    cmd.append(config.WB2API_CONTAINER)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, err = await proc.communicate()
+        if proc.returncode == 0:
+            return True, f'容器已{"启动" if running else "停止"}'
+        detail = err.decode(errors='ignore').strip()
+        return False, detail or f'docker {action} 退出码 {proc.returncode}'
+    except FileNotFoundError:
+        return False, '未找到 docker 命令'
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
+
+
+async def _wait_for_upstream(timeout: float = 35.0) -> dict:
+    deadline = time.monotonic() + timeout
+    last: dict = {'connected': False, 'error': '等待上游重启超时'}
+    while time.monotonic() < deadline:
+        last = await get_status()
+        if last.get('connected'):
+            return last
+        await asyncio.sleep(1)
+    return last
+
+
+async def force_clear_account_cooling(uid: str) -> tuple[bool, str, dict]:
+    """强制清除账号冷却与模型级限流，并重启上游使离线修改生效。"""
+    uid = str(uid or '').strip()
+    if not uid:
+        return False, 'uid 为空', {}
+
+    initial = await get_status()
+    if initial.get('connected'):
+        account = next(
+            (x for x in initial.get('accounts') or [] if str(x.get('uid') or '') == uid),
+            None,
+        )
+        if account is None:
+            return False, '该账号不在上游账号池里', {}
+        if not account.get('cooling') and not account.get('rate_limited_models'):
+            return True, '该账号当前没有冷却或模型级限流状态，无需清除', {}
+
+    stopped, stop_message = await _set_upstream_running(False)
+    if not stopped:
+        return False, f'停止上游失败：{stop_message}', {}
+
+    try:
+        changed = clear_account_cooling_state(uid)
+    except Exception as exc:  # noqa: BLE001
+        # 修改失败也必须尽力把上游拉回来，不能让它停在 maintenance 状态。
+        await _set_upstream_running(True)
+        return False, f'清除状态失败：{exc}', {}
+
+    started, start_message = await _set_upstream_running(True)
+    if not started:
+        return False, f'状态已清除，但启动上游失败：{start_message}', changed
+
+    status = await _wait_for_upstream()
+    if not status.get('connected'):
+        return False, f'上游重启后未就绪：{status.get("error") or "未知错误"}', changed
+    account = next(
+        (x for x in status.get('accounts') or [] if str(x.get('uid') or '') == uid),
+        None,
+    )
+    if account is None:
+        return False, '状态已清除且上游已启动，但账号尚未进入账号池', changed
+    if account.get('cooling') or account.get('rate_limited_models'):
+        return False, '上游已重启，但冷却或模型限流状态仍然存在', changed
+
+    return True, '已强制清除冷却与模型限流状态，上游已重启生效', changed
+
+
+def admin_enabled_in_config() -> tuple[bool | None, str]:
+    """本面板读到的上游配置里 `admin.enabled` 是否为真。返回 `(值, 说明)`。
+
+    值 `None` = 读不到，`说明` 里带原因与路径；否则 `说明` 是配置文件的路径。
+
+    为什么需要它（issue #45 的追问）：状态位路径拿到 `no_route` 时有两种成因，
+    处理方式完全相反，而用户从界面上看不出是哪一种：
+
+      · 配置里**没开** → 去「设置 → 账号管理接口」打开；
+      · 配置里**已开** → 说明**运行中的上游没加载到它**。上游只在启动时读这个
+        开关，改完配置必须重启容器；若已重启仍如此，说明上游镜像早于
+        2026-09-19（那版还没有这组接口）。实测有用户手改了配置文件里的一处，
+        面板读到的却是另一处，于是「明明开了却还是不行」——所以这条文案里
+        必须带上**面板实际读的那个路径**，用户一对就知道是不是同一个文件。
+    """
+    path = config.UPSTREAM_CONFIG
+    try:
+        raw = path.read_text(encoding='utf-8')
+    except FileNotFoundError:
+        return None, f'未找到上游配置文件 {path}'
+    except OSError as exc:
+        return None, f'读取上游配置文件失败 {path}：{exc}'
+    try:
+        cfg = json.loads(raw)
+    except Exception as exc:  # noqa: BLE001
+        return None, f'上游配置文件不是合法 JSON（{path}）：{exc}'
+    if not isinstance(cfg, dict):
+        return None, f'上游配置文件不是 JSON 对象（{path}）'
+    admin = cfg.get('admin')
+    return bool(isinstance(admin, dict) and admin.get('enabled')), str(path)
+
+
+# 上游统计里**允许下发**的字段（白名单）。为什么不整包透传：与
+# `load_upstream_config` 那条同源的理由（见那里的注释）——透传的失效模式是
+# 「上游给统计载荷加了新字段 → 原样下发给每个登录用户（含只读账号）」，
+# 而且**不会有任何报错**；白名单的失效模式相反：新字段不显示（界面少一列），
+# 这个方向的失效是可见、可控的。下面就是界面要显示的计数字段，多一个都不带。
+_STATS_ROW_FIELDS = ('requests', 'success', 'failed', 'streaming',
+                     'prompt_tokens', 'completion_tokens', 'total_tokens',
+                     'cache_hit_tokens', 'cache_miss_tokens', 'cache_write_tokens',
+                     'cache_hit_rate', 'credit', 'credit_per_req')
+_STATS_MODEL_FIELDS = ('model',) + _STATS_ROW_FIELDS
+
+
+def _pick_stats_row(row: object, fields: tuple[str, ...]) -> dict:
+    """从上游的统计行里只挑白名单字段。"""
+    if not isinstance(row, dict):
+        return {}
+    return {k: row[k] for k in fields if k in row}
+
+
+async def get_upstream_stats() -> dict:
+    """读上游自己的 `/v1/stats`（它按模型累计的官方统计，issue #59）。
+
+    **与面板自己的统计不是一回事，别混着看**：
+
+      · 面板的用量统计（`/api/stats/*`）统计的是**经过本网关**的调用，
+        按密钥归属、可按时段筛选；
+      · 上游这份是「上游进程自己看到的全部调用」——**直连 7863 的调用只在这里**，
+        而且它是**自上游进程启动以来**的累计，没有时段概念。
+
+    用户要的「原有密钥的用量」只能在后者里看到（那把密钥直连上游，面板看不见它），
+    所以如实说明口径比数字本身更重要。
+
+    返回 `{'available': False, 'error': ...}` 表示取不到（上游没起来、版本太旧没有
+    这个端点、或 api_key 不一致）——界面据此说明情况，而不是显示一片空白。
+    """
+    try:
+        async with config.http_client(10, connect=3) as client:
+            resp = await client.get(f'{config.WB2API_BASE}/v1/stats',
+                                    headers=_auth_headers())
+    except Exception as exc:  # noqa: BLE001
+        return {'available': False, 'error': _err_text(exc)}
+    if resp.status_code == 401:
+        return {'available': False, 'error': '上游拒绝了鉴权（api_key 不一致）'}
+    if resp.status_code == 404:
+        return {'available': False,
+                'error': '该上游版本没有这个端点（需要较新的上游镜像）'}
+    if resp.status_code >= 400:
+        return {'available': False, 'error': f'上游返回 {resp.status_code}'}
+    try:
+        data = resp.json()
+    except Exception as exc:  # noqa: BLE001
+        return {'available': False, 'error': f'上游返回的不是 JSON：{_err_text(exc)}'}
+    if not isinstance(data, dict):
+        return {'available': False, 'error': '上游返回的结构无法识别'}
+    # 只挑白名单字段下发（见 _STATS_ROW_FIELDS 的说明）
+    out: dict = {
+        'available': True,
+        'enabled': data.get('enabled'),
+        'since': data.get('since'),
+        'uptime_sec': data.get('uptime_sec'),
+    }
+    if isinstance(data.get('message'), str):
+        out['message'] = data['message']
+    if isinstance(data.get('total'), dict):
+        out['total'] = _pick_stats_row(data['total'], _STATS_ROW_FIELDS)
+    models = data.get('models')
+    if isinstance(models, list):
+        out['models'] = [_pick_stats_row(m, _STATS_MODEL_FIELDS)
+                         for m in models if isinstance(m, dict)]
+    return out
+
+
 async def get_models() -> tuple[bool, list | dict]:
     try:
         async with config.http_client(15, connect=3) as client:
@@ -849,6 +1166,37 @@ def _sanitize_section(section: str, incoming: dict) -> dict:
             if not _DURATION_RE.match(raw.strip()):
                 raise ValueError(f'{key} 时长格式有误，应为 30s / 10m / 2h / 1d')
             out[key] = raw.strip()
+        elif section == 'prompt' and key == 'mode':
+            # 上游对非法值是**启动报错**（cmd/server/config.go:429
+            # 「prompt.mode: %q 不是合法值」），所以这里必须拦——填错就保存成功、
+            # 然后上游起不来，正是本节注释里点名的最坏形态。
+            # 可达路径：`POST /api/settings/upstream` 直接透传 body，不经前端表单。
+            val = str(raw or '').strip().lower()
+            if val not in ('passthrough', 'custom', 'append'):
+                raise ValueError('系统提示词模式只能是 passthrough / custom / append')
+            out[key] = val
+        elif section == 'prompt' and key == 'file':
+            # 这是**文件路径**，不是提示词正文（issue #62）。上游对它是 fail-fast：
+            # 路径非空但读不到 → 启动直接报错退出（其 normalizePrompt 注释写明
+            # 「避免静默回落到内置默认」）。把正文粘进来会让上游进入 Restarting
+            # 崩溃循环，整个反代不可用——实测就有用户这么踩了。
+            #
+            # 两条判据都来自「文件名不是正文」这个事实：
+            #   · 含换行/控制字符 —— 路径不可能有；
+            #   · 超过 255 字节 —— 文件名的硬上限（用户看到的报错就是 file name too long）。
+            # 长度按**字节**算：中文一个字三字节，几十个字的提示词就超了。
+            val = str(raw or '')
+            if any(ch in val for ch in ('\n', '\r', '\x00')):
+                raise ValueError(
+                    '这一栏要填文件路径，不是提示词正文。正文请先写进一个文件，'
+                    '再填该文件在上游容器内的路径，例如 /app/data/prompt-custom.txt'
+                )
+            if len(val.encode('utf-8')) > 255:
+                raise ValueError(
+                    '文件路径不能超过 255 字节（文件名上限）——看起来是把提示词正文'
+                    '粘进来了。正文请先写进一个文件，再填它的路径'
+                )
+            out[key] = val.strip()
         elif section == 'pool' and key == 'cost_explore_interval':
             # 成本档位条件探索的周期（上游 2026-09-17 新增，默认 "30m"）。
             #

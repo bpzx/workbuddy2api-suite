@@ -65,34 +65,71 @@ class SemverTest(unittest.TestCase):
         self.assertFalse(suite.version_newer('', ''))
 
 
-class SameCommitTest(unittest.TestCase):
-    """commit 缩写比较必须容忍长度不同 —— 这里曾出过一个真实假阳性。"""
+class GhReasonTest(unittest.TestCase):
+    """把 GitHub 异常翻成可读原因。
 
-    def test_same_commit_across_abbreviation_lengths(self) -> None:
-        """7 位与 8 位缩写是同一个提交。
+    这里以前把所有异常吞掉、统一报「仓库里没有正式版 tag」—— 真实原因可能是
+    「仓库私有/不存在」或「触发了未认证限流」，与"确实没有 tag"完全是两回事。
+    这个假警报真实出现过：面板同时显示了一个具体 tag 和"没有 tag"。
+    """
 
-        真实事故：面板同时显示「固定提交 d1023f3 / 远端最新 d1023f37」并标
-        「有新版本可更新」—— 因为 upstreams.json 的 commit_short 是 7 位，
-        而 API 返回值被截成了 8 位，全等比较判定为不同。
-        """
-        self.assertTrue(suite.same_commit('d1023f3', 'd1023f37'))
-        self.assertTrue(suite.same_commit('d1023f37', 'd1023f3'))
-        # 与完整 40 位 sha 比也要成立
-        self.assertTrue(suite.same_commit('b08f518c9bb21cdf90f93fb671fe99a0637c8e8b', 'b08f518'))
-        self.assertTrue(suite.same_commit('b08f518', 'b08f518c9bb21cdf90f93fb671fe99a0637c8e8b'))
+    @staticmethod
+    def _status_error(status: int) -> Exception:
+        import httpx
 
-    def test_different_commits_are_not_same(self) -> None:
-        self.assertFalse(suite.same_commit('b08f518', 'fc9ae1a7'))
-        self.assertFalse(suite.same_commit('d1023f3', 'd1023f4'))
+        req = httpx.Request('GET', 'https://api.github.com/repos/o/r/tags')
+        resp = httpx.Response(status, request=req)
+        return httpx.HTTPStatusError('boom', request=req, response=resp)
 
-    def test_empty_never_matches(self) -> None:
-        """拿不到值时不能算"同一个提交"（否则会漏报真实更新）。"""
-        self.assertFalse(suite.same_commit('', 'd1023f3'))
-        self.assertFalse(suite.same_commit('d1023f3', ''))
-        self.assertFalse(suite.same_commit('', ''))
+    def test_404_says_inaccessible(self) -> None:
+        self.assertIn('不可访问', suite._gh_reason(self._status_error(404)))
 
-    def test_case_and_whitespace_tolerated(self) -> None:
-        self.assertTrue(suite.same_commit(' D1023F3 ', 'd1023f37'))
+    def test_403_mentions_rate_limit(self) -> None:
+        self.assertIn('限流', suite._gh_reason(self._status_error(403)))
+
+    def test_other_status_keeps_code(self) -> None:
+        self.assertIn('500', suite._gh_reason(self._status_error(500)))
+
+    def test_network_error_falls_back_to_type_name(self) -> None:
+        self.assertIn('ConnectError', suite._gh_reason(RuntimeError('ConnectError: down')))
+
+
+class FetchReleaseTagTest(unittest.TestCase):
+    """`_fetch_release_tag` 返回 (tag, 失败原因)，界面直接显示这个原因。"""
+
+    def test_success_picks_highest_and_has_no_reason(self) -> None:
+        async def fake(path: str):
+            self.assertIn('/tags', path)
+            return [{'name': 'v1.0.9'}, {'name': 'v1.0.10'}, {'name': 'nightly'}]
+
+        with mock.patch.object(suite, '_gh_get', new=mock.AsyncMock(side_effect=fake)):
+            tag, reason = _run_async(suite._fetch_release_tag('o/r'))
+        self.assertEqual(tag, 'v1.0.10')
+        self.assertEqual(reason, '')
+
+    def test_failure_returns_reason_instead_of_empty(self) -> None:
+        with mock.patch.object(
+            suite, '_gh_get',
+            new=mock.AsyncMock(side_effect=RuntimeError('ConnectError: down')),
+        ):
+            tag, reason = _run_async(suite._fetch_release_tag('o/r'))
+        self.assertEqual(tag, '')
+        self.assertIn('ConnectError', reason)
+
+    def test_accessible_but_no_release_tag_is_a_distinct_message(self) -> None:
+        """仓库能访问、只是没有正式版 tag —— 这才是"没有 tag"，要与查询失败分开。"""
+        async def fake(path: str):
+            return [{'name': 'nightly'}] if '/tags' in path else {}
+
+        with mock.patch.object(suite, '_gh_get', new=mock.AsyncMock(side_effect=fake)):
+            tag, reason = _run_async(suite._fetch_release_tag('o/r'))
+        self.assertEqual(tag, '')
+        self.assertIn('没有正式版 tag', reason)
+
+    def test_empty_slug_is_reported(self) -> None:
+        tag, reason = _run_async(suite._fetch_release_tag(''))
+        self.assertEqual(tag, '')
+        self.assertIn('未配置', reason)
 
 
 class HighestReleaseTagTest(unittest.TestCase):
@@ -133,7 +170,7 @@ class CurrentVersionTest(unittest.TestCase):
 
 
 class PinnedUpstreamsTest(unittest.TestCase):
-    """容器里没有上游 git 仓库，upstreams.json 是唯一正确的事实来源。"""
+    """读 upstreams.json —— 现在只取 `repo`（用于向 GitHub 查"最新正式版"）。"""
 
     def _with_file(self, payload) -> dict:
         with tempfile.TemporaryDirectory() as td:
@@ -142,19 +179,17 @@ class PinnedUpstreamsTest(unittest.TestCase):
             with mock.patch.object(suite, 'UPSTREAMS_FILE', f):
                 return suite.pinned_upstreams()
 
-    def test_reads_pins(self) -> None:
+    def test_exposes_repo_only(self) -> None:
         pins = self._with_file({'upstreams': {
-            'wb2api': {'commit': 'b08f518c9bb2', 'commit_short': 'b08f518',
-                       'repo': 'Sliverkiss/workbuddy2api', 'subject': 'x'},
-            'manager': {'commit': '8bc9b0d95975', 'commit_short': '8bc9b0d',
+            'wb2api': {'commit': 'x' * 40, 'commit_short': 'x' * 7,
+                       'repo': 'Sliverkiss/workbuddy2api'},
+            'manager': {'commit': 'y' * 40, 'commit_short': 'y' * 7,
                         'repo': 'ithtelab/workbuddy-manager'},
         }})
-        self.assertEqual(pins['wb2api']['short'], 'b08f518')
         self.assertEqual(pins['manager']['repo'], 'ithtelab/workbuddy-manager')
-
-    def test_derives_short_from_commit(self) -> None:
-        pins = self._with_file({'upstreams': {'wb2api': {'commit': 'abcdef1234567890'}}})
-        self.assertEqual(pins['wb2api']['short'], 'abcdef1')
+        # commit / 缩写 / 提交说明那几个字段已随面板那一行的移除而删除：
+        # 没有消费方的字段留着就是死数据（完整锁定记录仍以 upstreams.json 为准）
+        self.assertEqual(set(pins['manager']), {'repo'})
 
     def test_degrades_on_missing_or_broken_file(self) -> None:
         """版本提示是辅助信息，文件缺失/损坏不该抛异常把接口带崩。"""
@@ -162,8 +197,39 @@ class PinnedUpstreamsTest(unittest.TestCase):
             self.assertEqual(suite.pinned_upstreams(), {})
 
 
+class FetchAllRepoTest(unittest.TestCase):
+    """`_fetch_all` 只查套件与 manager 的仓库。"""
+
+    def test_does_not_query_the_deleted_wb2api_repo(self) -> None:
+        """wb2api 仓库已删除：再查它只会 404，并被"保留上次成功结果"逻辑**永久**
+        留成"有新版本可更新"的假象。这里钉住"不再查它"。"""
+        calls: list[str] = []
+
+        async def fake(slug: str):
+            calls.append(slug)
+            return 'v1.0.0', ''
+
+        up = {'upstreams': {
+            'wb2api': {'repo': 'Sliverkiss/workbuddy2api'},
+            'manager': {'repo': 'ithtelab/workbuddy-manager'},
+        }}
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / 'up.json'
+            f.write_text(json.dumps(up), encoding='utf-8')
+            with mock.patch.object(suite, 'UPSTREAMS_FILE', f), \
+                 mock.patch.dict(os.environ, {'WB_SUITE_REPO': 'o/suite'}), \
+                 mock.patch.object(suite, '_fetch_release_tag',
+                                   new=mock.AsyncMock(side_effect=fake)):
+                out = _run_async(suite._fetch_all())
+        self.assertEqual(sorted(calls), ['ithtelab/workbuddy-manager', 'o/suite'])
+        self.assertNotIn('Sliverkiss/workbuddy2api', calls)
+        self.assertNotIn('wb2api', out)
+        # 仓库地址取自 upstreams.json（容器内没有上游 git 仓库，这是唯一来源）
+        self.assertEqual(out['manager']['repo'], 'ithtelab/workbuddy-manager')
+
+
 class CheckTest(unittest.TestCase):
-    """check() 的组装逻辑：三块各自的 has_update 语义。"""
+    """check() 的组装逻辑：套件与上游管理端两块。"""
 
     def setUp(self) -> None:
         self._td = tempfile.TemporaryDirectory()
@@ -177,20 +243,12 @@ class CheckTest(unittest.TestCase):
         self.addCleanup(lambda: [p.stop() for p in self.patches])
         self.addCleanup(self._td.cleanup)
 
-    def _pin(self, wb2api_short: str, manager: str = 'ithtelab/workbuddy-manager') -> None:
-        (Path(self._td.name) / 'up.json').write_text(json.dumps({'upstreams': {
-            'wb2api': {'commit': 'x' * 40, 'commit_short': wb2api_short,
-                       'repo': 'Sliverkiss/workbuddy2api'},
-            'manager': {'commit': 'y' * 40, 'commit_short': 'y' * 7, 'repo': manager},
-        }}), encoding='utf-8')
-
-    def _fetch(self, **over):
+    def _fetch(self, **over) -> dict:
         base = {
             'checked_at': 1_700_000_000,
             'suite': {'latest': 'v1.2.4', 'error': '', 'repo': 'o/r'},
-            'wb2api': {'latest': 'e4f5g6h', 'date': '', 'subject': 's',
-                       'error': '', 'repo': 'Sliverkiss/workbuddy2api'},
-            'manager': {'latest': 'v1.0.58', 'error': '', 'repo': 'ithtelab/workbuddy-manager'},
+            'manager': {'latest': 'v1.0.58', 'error': '',
+                        'repo': 'ithtelab/workbuddy-manager'},
         }
         for k, v in over.items():
             base[k] = {**base[k], **v}
@@ -203,65 +261,42 @@ class CheckTest(unittest.TestCase):
             return _run_async(suite.check(force=True))
 
     def test_release_current_uses_semver_compare(self) -> None:
-        self._pin('b08f518')
         out = self._run('v1.2.3', self._fetch())
         self.assertTrue(out['suite']['has_update'])
         self.assertFalse(out['suite']['is_dev'])
 
     def test_release_current_up_to_date(self) -> None:
-        self._pin('b08f518')
         out = self._run('v1.2.4', self._fetch())
         self.assertFalse(out['suite']['has_update'])
 
     def test_dev_build_can_switch_to_release(self) -> None:
         """main 产出的 sha-* 没有版本号：如实标为开发构建，但存在正式版时算可切换。"""
-        self._pin('b08f518')
         out = self._run('sha-a1b2c3d', self._fetch())
         self.assertTrue(out['suite']['is_dev'])
         self.assertTrue(out['suite']['has_update'])
 
-    def test_upstream_gateway_compares_commits(self) -> None:
-        self._pin('b08f518')
-        same = self._run('v1.2.3', self._fetch(wb2api={'latest': 'b08f518'}))
-        self.assertFalse(same['wb2api']['has_update'])
-        diff = self._run('v1.2.3', self._fetch(wb2api={'latest': 'e4f5g6h'}))
-        self.assertTrue(diff['wb2api']['has_update'])
-
-    def test_upstream_gateway_no_pin_is_not_an_update(self) -> None:
-        """读不到固定 commit 时不能报"有更新"（避免假阳性）。"""
-        out = self._run('v1.2.3', self._fetch())
-        self.assertEqual(out['wb2api']['current'], '')
-        self.assertFalse(out['wb2api']['has_update'])
-
-    def test_upstream_gateway_same_commit_shorter_abbrev(self) -> None:
-        """端到端复现那个假阳性：固定提交 7 位、远端 8 位、其实是同一个提交。
-
-        修复前这里会返回 True（面板显示"有新版本可更新"）。
-        """
-        self._pin('d1023f3')
-        out = self._run('v1.2.3', self._fetch(wb2api={'latest': 'd1023f37'}))
-        self.assertFalse(out['wb2api']['has_update'],
-                         '同一个提交的不同长度缩写被误判成"有更新"')
-        self.assertEqual(out['wb2api']['current'], 'd1023f3')
-        self.assertEqual(out['wb2api']['latest'], 'd1023f37')
-
     def test_upstream_manager_uses_its_own_version(self) -> None:
-        self._pin('b08f518')
         out = self._run('v1.2.3', self._fetch(), mg_current='v1.0.58')
         self.assertFalse(out['manager']['has_update'])
         out2 = self._run('v1.2.3', self._fetch(), mg_current='v1.0.57')
         self.assertTrue(out2['manager']['has_update'])
 
+    def test_response_no_longer_carries_wb2api(self) -> None:
+        """wb2api 那一行已从面板移除，接口也不该再返回它。
+
+        它现在由本项目自行维护（原仓库已删除）；继续返回"上游网关"的版本对比，
+        只会让人以为还有个上游在跑。对应的查询逻辑也已删掉（见 FetchAllRepoTest）。
+        """
+        out = self._run('v1.2.3', self._fetch())
+        self.assertNotIn('wb2api', out)
+
     def test_has_any_aggregates(self) -> None:
-        self._pin('b08f518')
-        out = self._run('v1.2.4', self._fetch(wb2api={'latest': 'b08f518'},
-                                             manager={'latest': 'v1.0.57'}),
+        out = self._run('v1.2.4', self._fetch(manager={'latest': 'v1.0.57'}),
                         mg_current='v1.0.57')
         self.assertFalse(out['has_any'])
 
     def test_uses_cache_unless_forced(self) -> None:
         """未 force 且缓存新鲜时不再请求 GitHub（未授权 API 限流很紧）。"""
-        self._pin('b08f518')
         # checked_at 必须是"刚刚"：否则缓存过期，走的是重新拉取的分支
         self.cache.write_text(
             json.dumps({**self._fetch(), 'checked_at': int(time.time())}),
@@ -275,16 +310,19 @@ class CheckTest(unittest.TestCase):
         fetch.assert_not_awaited()
         self.assertTrue(out['cached'])
 
-    def test_cached_failure_keeps_last_good_latest(self) -> None:
-        """临时网络故障不该让界面从"有新版本"掉成"未知"。"""
-        self._pin('b08f518')
-        self.cache.write_text(json.dumps({
-            'checked_at': 1, **self._fetch(),
-        }), encoding='utf-8')
-        fresh = self._fetch(suite={'latest': '', 'error': '网络不通'})
+    def test_cached_failure_keeps_last_good_latest_and_says_so(self) -> None:
+        """查询失败时保留上次成功的结果，但必须**说明**这是上次的。
+
+        否则界面会同时显示一个版本号和一条报错、却不解释两者关系 ——
+        「仓库里没有正式版 tag」配上具体 tag 就是这么来的（真实出现过的假警报）。
+        """
+        self.cache.write_text(json.dumps({'checked_at': 1, **self._fetch()}),
+                              encoding='utf-8')
+        fresh = self._fetch(suite={'latest': '', 'error': 'GitHub 拒绝（可能已限流）'})
         out = self._run('v1.2.3', fresh)
         self.assertEqual(out['suite']['latest'], 'v1.2.4')
-        self.assertEqual(out['suite']['error'], '网络不通')
+        self.assertIn('GitHub 拒绝', out['suite']['error'])
+        self.assertIn('上次成功检测', out['suite']['error'])
 
 
 def _run_async(coro):

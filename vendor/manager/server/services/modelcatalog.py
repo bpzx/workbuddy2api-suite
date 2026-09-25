@@ -19,7 +19,7 @@ import json
 import time
 
 from .. import config
-from . import tencent, wb2api
+from . import tencent, wb2api, native_modality
 
 # 成功缓存 5 分钟：模型清单变化很慢，没必要每次进页面都打腾讯
 _TTL_OK = 300
@@ -167,6 +167,7 @@ def _decorate(items: list[dict], realm: str = 'cn') -> list[dict]:
             eff_default = ''
         out.append({
             'id': mid,
+            **native_modality.describe(mid),
             'name': m.get('name') or '',
             'context_length': int(m.get('context_length') or 0),
             'max_output_tokens': int(m.get('max_output_tokens') or 0),
@@ -174,8 +175,10 @@ def _decorate(items: list[dict], realm: str = 'cn') -> list[dict]:
             'series': series_of(mid),
             # 默认推理档位；空 = 未声明（由上游自行回退到硬编码默认）
             'default_effort': eff_default,
-            # 多模态能力（官方 /v1/models 也透出 supports_images）
-            'supports_images': bool(m.get('supports_images')),
+            # 平台图片输入声明保留 true/false/unknown 与官方来源冲突。
+            'supports_images': m.get('supports_images') if type(m.get('supports_images')) is bool else None,
+            'image_input_conflict': m.get('image_input_conflict') is True,
+            'image_input_sources': dict(m.get('image_input_sources') or {}),
             # ── 上游 2026-09-15 补齐的目录字段 ──
             # 模型描述（腾讯的 descriptionZh，中文）
             'description': str(m.get('description') or ''),
@@ -314,7 +317,8 @@ def _map_upstream_model_fields(m: dict) -> dict:
             else:
                 out[dst] = str(m.get(src) or '')
     if 'supports_images' in m:
-        out['supports_images'] = bool(m.get('supports_images'))
+        out['supports_images'] = m.get('supports_images') if type(m.get('supports_images')) is bool else None
+        out['image_input_sources'] = {'upstream_models': out['supports_images']}
     return out
 
 

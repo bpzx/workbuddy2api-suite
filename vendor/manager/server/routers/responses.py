@@ -1266,7 +1266,9 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
         return _failed('model 必须是字符串', 400, 'invalid_request_error', 'invalid_model')
 
     # 鉴权：与 gateway._authorize 同一套检查、同一顺序（含版本隔离与配额）
-    key, ip, auth_err = gateway._authorize(request, model)
+    # 映射先算：版本归属判的是**映射后**的实际模型名（issue #47）
+    mapped = gateway._map_model(model)
+    key, ip, auth_err = gateway._authorize(request, model, mapped=mapped)
     if auth_err:
         return auth_err
 
@@ -1278,14 +1280,13 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
     try:
         payload = to_chat_request(body, custom_tool_names, bridge)
     except Exception as exc:  # noqa: BLE001
-        gateway._record(key, ip, model, '', 400, 0, 0, 0, ua, str(exc), False)
+        gateway._record(key, ip, model, mapped or '', 400, 0, 0, 0, ua, str(exc), False)
         return _failed(f'请求转换失败：{exc}', 400)
 
     if not payload.get('messages'):
         return _failed('input 为空：Responses 请求必须带 input 或 instructions',
                        400, 'invalid_request_error', 'empty_input')
 
-    mapped = gateway._map_model(model)
     if mapped:
         payload['model'] = mapped
     if stream:
@@ -1308,11 +1309,13 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                 usage = data.get('usage') or {}
             except Exception:  # noqa: BLE001
                 data = None
+            # 整份 usage 交过去（而不是只取 credit）：扣费与提示词缓存三段
+            # 都在这一份里，分开取就会出现「某条协议缓存永远是空的」（issue #69）。
             gateway._record(
                 key, ip, model, mapped or '', resp.status_code,
                 _as_int(usage.get('prompt_tokens')), _as_int(usage.get('completion_tokens')),
                 latency, ua, None if resp.status_code < 400 else str(data)[:500], False,
-                credit=gateway._usage_credit(usage),
+                usage=usage,
             )
             if resp.status_code >= 400:
                 return _failed(_upstream_error_text(data, resp), resp.status_code,
@@ -1461,7 +1464,7 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                 _as_int(usage.get('prompt_tokens')),
                 _as_int(usage.get('completion_tokens')),
                 latency, ua, error_text, True,
-                credit=gateway._usage_credit(usage), first_token=first_token_ms,
+                usage=usage, first_token=first_token_ms,
             )
 
     return StreamingResponse(gen(), status_code=200, media_type='text/event-stream')

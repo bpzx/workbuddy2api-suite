@@ -8,6 +8,10 @@ A web frontend for [`workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api
 bulk account onboarding via QR code, automatic daily check-in, API key distribution,
 IP access control, request logs and usage stats — all in one panel.
 
+> The upstream workbuddy2api source **ships inside this project's release package**
+> (MIT). Existing deployments are unaffected — for reinstall/migration, see the
+> [deployment guide](deploy/README.md#〇上游源码从哪来随发布包分发).
+
 ![Next.js](https://img.shields.io/badge/Next.js-15-000000?logo=nextdotjs&logoColor=white)
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=white)
 ![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white)
@@ -33,7 +37,7 @@ Published and discussed in the [**LINUX DO**](https://linux.do) community — �
 
 ## What is this
 
-[`workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api) wraps a Tencent CodeBuddy
+`workbuddy2api` (its original repository has been deleted by its author) wraps a Tencent CodeBuddy
 account pool into an OpenAI-compatible API (written in Go). Its capabilities are complete,
 but they are command-line only: adding an account means running a script, checking status
 means `curl /status`, and handing out API keys has no interface at all.
@@ -65,9 +69,9 @@ it makes a capable upstream gateway visible and manageable. The two fit together
 - **The upstream stays focused on its core**: the panel does not ask the upstream to change
   code for it, so the upstream can stay lean
 
-Contributions are welcome: upstream improvements go to
-[workbuddy2api](https://github.com/Sliverkiss/workbuddy2api), while panel-related issues and
-ideas belong in [this repository](https://github.com/ithtelab/workbuddy-manager/issues).
+Contributions are welcome: both panel and upstream-source issues and ideas belong in
+[this repository](https://github.com/ithtelab/workbuddy-manager/issues) — the original
+upstream repo is gone, and its source is now maintained here.
 
 ---
 
@@ -153,7 +157,8 @@ ideas belong in [this repository](https://github.com/ithtelab/workbuddy-manager/
 - **Inbound IP control** — global allow/deny lists with CIDR support; allowlist mode can
   restrict access to trusted sources only
 - **Full audit trail** — per call: key, IP, model, status code, **time to first token**,
-  total latency, token usage and **actual credit charged** (from upstream `usage.credit`;
+  total latency, token usage, **actual credit charged** and **prompt-cache hits**
+  (credit comes from upstream `usage.credit`;
   shown as `—` when the upstream does not report it, which is different from charging 0)
 
 ### Visual settings
@@ -219,7 +224,9 @@ ideas belong in [this repository](https://github.com/ithtelab/workbuddy-manager/
 - **Release packages are always signature-verified** (supply-chain protection): the
   updater embeds the maintainer's public key and verifies before extracting. A missing,
   tampered or mismatched signature aborts the install. The panel shows a "verified" badge,
-  and `deploy/` (the verification logic itself) is never replaced from a package.
+  Once verification passes, `deploy/` is updated from the package too (the updater
+  itself lives there and needs to be upgradeable). Set `WB_SYNC_DEPLOY=0` to keep
+  your local `deploy/` untouched.
   See [docs/release-signing.md](docs/release-signing.md)
 
 ### Changelog
@@ -289,12 +296,25 @@ ideas belong in [this repository](https://github.com/ithtelab/workbuddy-manager/
 <img src="docs/images/keys.png" alt="API keys" width="100%" />
 
 ### Request logs
-> Filter by time / key / status / model / IP, with **time to first token**, total latency and tokens
+> Filter by time / key / status / model / IP, with **the account actually used**, **time to first token**, total latency, tokens and **prompt-cache hits**
 
 "First token" = from sending the upstream request to the first delta containing content.
 It reflects **how fast the upstream starts responding**. "Total latency" includes the whole
 generation, so it grows with answer length — useful for overall cost per request.
 Non-streaming requests have no intermediate steps, so the first-token column shows `—`.
+
+**Account** is which upstream account served this call, shown as `nickname(uid8)`. The upstream
+picks it and does not return it in the response, so the panel reads the upstream's container log
+and matches entries by time — that is why it **appears a few seconds after** the request (a
+just-finished one may still show `—`). When the container log is unavailable (upstream on another
+host, no `docker.sock`, native deployment) the column stays `—`; nothing else is affected.
+
+The cache marker after the token count (green "cache N%" / amber "no cache hit") comes from the
+usage data the upstream returns; it tells you whether a repeated prefix is **actually hitting the
+cache**, which is billed much cheaper. Prefix caches are stored **per account**, so "the account
+changed" and "no cache hit" often show up together — read the two columns side by side. When the
+upstream does not return this data the marker is omitted (the detail view says "not captured") —
+that is not the same as "no cache hit".
 
 <img src="docs/images/logs.png" alt="Request logs" width="100%" />
 
@@ -503,6 +523,34 @@ docker pull ghcr.io/ithtelab/workbuddy-manager:latest
 > cloud hosts can pull it directly, with no QEMU emulation). `docker pull` picks the
 > right one for your machine automatically.
 
+**Want an image you built yourself? Just fork the repo** — the one above is built by the
+maintainer on each release. If you need to change something for your own use (different
+defaults, an extra dependency, or you simply prefer not to depend on someone else's
+registry), fork this repository, drop the fork-only workflow into `.github/workflows/`
+and push once:
+
+```bash
+mkdir -p .github/workflows
+cp deploy/fork-image/build-image.yml .github/workflows/
+git add .github/workflows/build-image.yml && git commit -m "ci: build my own image" && git push
+```
+
+The workflow needs **no edits at all**: the image's namespace, the branch it watches, and
+the provenance labels baked into the image are all derived from your fork at run time
+(whoever forks publishes under their own name, and renaming the default branch does not
+break it). Once the build finishes (a few minutes), pull your own copy — the run summary
+prints the real username:
+
+```bash
+docker pull ghcr.io/<your-username>/workbuddy-manager-multiarch:latest
+```
+
+> The extra `-multiarch` suffix is **not a typo**: the `workbuddy-manager` package name
+> may already be taken in the namespace by a package that is not linked to your repo, and
+> a fork has no write access to that one, so the push would fail. You can also publish to
+> Docker Hub at the same time (two secrets enable it automatically). Full details in
+> [deploy/fork-image/README.md](deploy/fork-image/README.md).
+
 **The container build has the same capabilities as a host install** — the compose file
 mounts three things to make that true:
 
@@ -534,8 +582,10 @@ Two other differences from a host install (both surfaced in the UI):
 
 ### 4. Server deployment (one-click script)
 
-This project depends on the upstream [`workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api)
-(account pool and OpenAI-compatible API) — **cloning this repo alone will not run**.
+This project depends on the upstream workbuddy2api (account pool and OpenAI-compatible
+API) — **cloning this repo alone will not run**. The release package **ships the upstream source**, so the script installs both.
+To use your own copy instead, see the
+[deployment guide](deploy/README.md#〇上游源码从哪来随发布包分发).
 A one-click script installs both on a clean machine:
 
 ```bash
@@ -593,6 +643,9 @@ Full deployment notes (Nginx config, hardening, FAQ) are in [deploy/README.md](d
 | `WB_STATIC_DIR` | `./web/out` | Static export directory |
 | `WB_ADMIN_PASSWORD` | random | Initial admin password |
 | `WB_SECURE_COOKIE` | `auto` | Decided from `X-Forwarded-Proto` |
+| `WB_GATEWAY_RATE_PER_MIN` | `120` | Outbound gateway per-key limit: admitted requests per 60s (`0` = unlimited) |
+| `WB_GATEWAY_MAX_BODY_MB` | `32` | Outbound gateway request body limit (MB) |
+| `WB_SYNC_DEPLOY` | `1` | Update `deploy/` together with the manager (`0` = leave it untouched) |
 | `WB_HTTP_PROXY` | empty | Outbound proxy; empty means direct |
 
 The full list is in [`.env.example`](.env.example).
@@ -740,7 +793,8 @@ Check Settings → Available models for the live list. Commonly (all with a 1310
 | `POST` | `/api/auth/start` `/api/auth/poll` | admin | QR authorisation flow |
 | `POST` | `/api/accounts/{file}/checkin` `/test` `/refresh` | admin | Check-in / probe / refresh |
 | `DELETE` | `/api/accounts/{file}` | admin | Delete an account |
-| `GET/POST/PATCH/DELETE` | `/api/keys[/{id}]` | session / admin | Key management |
+| `GET/POST/PATCH/DELETE` | `/api/keys[/{id}]` | session / admin | Key management (handed to downstream callers) |
+| `GET/POST/PATCH/DELETE` | `/api/tokens[/{id}]` | session (admin) | Admin API tokens (for scripts / CI, see [docs/api-tokens.md](docs/api-tokens.md)) |
 | `GET` | `/api/logs` `/api/stats/*` | session | Logs and usage |
 | `GET/POST/DELETE` | `/api/security/*` | session / admin | IP rules and audit |
 | `GET/POST` | `/api/settings/*` | session / admin | Upstream config, model mapping |
@@ -789,6 +843,11 @@ workbuddy-manager/
   and login lockout cannot be spoofed
 - Failed logins are locked **per IP and per username**, blocking both single-host and
   distributed brute force
+- The admin API supports **scoped API tokens** (read-only / admin, revocable, expiring;
+  only a hash is stored and every use is auditable) so scripts / CI can call it without
+  logging in. **High-risk endpoints and token management itself accept sessions only**,
+  so a leaked token cannot escalate privileges or persist itself
+  (see [docs/api-tokens.md](docs/api-tokens.md))
 - `/docs` and `/openapi.json` are disabled in production (`WB_ENABLE_DOCS=1` to enable)
 - The gateway limits request body size (8 MiB) and per-key request rate (120/min by default)
 - Security headers (CSP, `X-Frame-Options`, `X-Content-Type-Options`, …) are set
@@ -841,7 +900,8 @@ workbuddy-manager/
 
 > Please include the version and error logs, and **remove any keys or tokens first**.
 > For issues with the upstream workbuddy2api itself, use
-> [its repository](https://github.com/Sliverkiss/workbuddy2api).
+> [this repository](https://github.com/ithtelab/workbuddy-manager/issues) — the upstream
+> source ships with our releases.
 
 ### Release process
 
@@ -878,13 +938,26 @@ release notes, and creates a Release with the archives attached.
 
 ---
 
+## Related projects
+
+- [**sanguine886/workbuddy-sdk**](https://github.com/sanguine886/workbuddy-sdk) (Go, MIT) —
+  a community-maintained Go client library covering both of this project's API surfaces:
+  the control plane `/api/*` (accounts, keys, stats, logs, security, settings, users,
+  updates) and the data plane `/v1/*` (Chat Completions / Responses / Anthropic
+  Messages / Models). Handy for Go tooling — `go get` it instead of wiring HTTP and
+  session auth by hand.
+
+> A community project with **no code dependency on this repository**; please report
+> issues to [its tracker](https://github.com/sanguine886/workbuddy-sdk/issues).
+
 ## Credits
 
 - [**LINUX DO**](https://linux.do) — the community where this project is published and discussed
 - [**linux-do/cdk**](https://github.com/linux-do/cdk) (MIT) — design tokens and floating
   dock component; this project's UI follows its visual language
 - [**Sliverkiss/workbuddy2api**](https://github.com/Sliverkiss/workbuddy2api) — the account
-  pool and OpenAI-compatible proxy underneath
+  pool and OpenAI-compatible proxy underneath (MIT; its source is distributed with
+  this project's releases)
 - [**lbjlaq/Antigravity-Manager**](https://github.com/lbjlaq/Antigravity-Manager) — feature
   reference for the console
 

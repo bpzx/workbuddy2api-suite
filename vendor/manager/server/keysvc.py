@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+import sqlite3
 import time
 
 from . import db
@@ -165,8 +166,24 @@ def _parse(row) -> dict:
 
 
 def list_keys() -> list[dict]:
-    rows = db.query('SELECT * FROM api_keys ORDER BY id DESC')
-    return [_parse(r) for r in rows]
+    """全部密钥，附带 `packet_id`（来源红包）。
+
+    为什么要在列表里带这个：红包一次生成一批、额度零碎，混在手工建的密钥里
+    很难看，界面上要能单独分组。用**标量子查询**而不是 JOIN —— JOIN 在
+    「一个 key 意外对应多条 share」时会把同一把密钥返回两遍（接口返回重复行
+    是最难查的一类问题），子查询天然只取一条。
+    """
+    rows = db.query(
+        'SELECT k.*, (SELECT s.packet_id FROM red_packet_shares s '
+        '             WHERE s.key_id = k.id LIMIT 1) AS packet_id '
+        'FROM api_keys k ORDER BY k.id DESC'
+    )
+    out = []
+    for r in rows:
+        item = _parse(r)
+        item['packet_id'] = r['packet_id']      # None = 手工建的
+        out.append(item)
+    return out
 
 
 def create_key(
@@ -178,26 +195,42 @@ def create_key(
     quota: int = 0,
     realm: str = '',
     quota_credit: float = 0,
+    *,
+    _conn: sqlite3.Connection | None = None,
 ) -> dict:
+    """创建一个密钥。返回含**明文 token** 的字典（库里只存哈希）。
+
+    `_conn`：传入一个**已开启事务**的连接时，本函数在它上面执行且**不自行提交**，
+    由调用方负责 commit/rollback。红包（`redpacket.create_packet`）用它来保证
+    「N 个密钥 + 红包记录」整批原子——中途失败必须整体回滚，否则会留下几个
+    没人知道出处的密钥。默认 None 时行为与从前完全一致（自己提交）。
+
+    之所以做成参数而不是让红包自己写一份 INSERT：SQL 抄第二遍就是第二份事实，
+    改一处漏一处——本项目在 count_tokens 的鉴权上正是这么漂移出真漏洞的。
+    """
     token = TOKEN_PREFIX + secrets.token_urlsafe(32)
-    key_id = db.execute(
-        'INSERT INTO api_keys(name, key_hash, prefix, enabled, expires_at, max_ips, ip_allowlist, models, realm, quota, used_tokens, quota_credit, used_credit, created_at) '
-        'VALUES(?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?)',
-        (
-            name,
-            _hash(token),
-            token[:12],
-            expires_at,
-            max_ips,
-            json.dumps(_norm_cidrs(ip_allowlist)),
-            json.dumps(models or []),
-            _norm_realm(realm),
-            quota,
-            _norm_credit_quota(quota_credit),
-            int(time.time()),
-        ),
+    sql = ('INSERT INTO api_keys(name, key_hash, prefix, enabled, expires_at, max_ips, '
+           'ip_allowlist, models, realm, quota, used_tokens, quota_credit, used_credit, '
+           'created_at) VALUES(?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?)')
+    args = (
+        name,
+        _hash(token),
+        token[:12],
+        expires_at,
+        max_ips,
+        json.dumps(_norm_cidrs(ip_allowlist)),
+        json.dumps(models or []),
+        _norm_realm(realm),
+        quota,
+        _norm_credit_quota(quota_credit),
+        int(time.time()),
     )
-    row = db.query_one('SELECT * FROM api_keys WHERE id = ?', (key_id,))
+    if _conn is not None:
+        key_id = int(_conn.execute(sql, args).lastrowid or 0)
+        row = _conn.execute('SELECT * FROM api_keys WHERE id = ?', (key_id,)).fetchone()
+    else:
+        key_id = db.execute(sql, args)
+        row = db.query_one('SELECT * FROM api_keys WHERE id = ?', (key_id,))
     out = _parse(row)
     out['key'] = token  # 仅此一次返回明文
     return out
@@ -370,12 +403,24 @@ def unknown_whitelist_entries(models: list[str], known_by_realm: dict,
 
 
 def validate(key: dict, ip: str, model: str | None,
-             *, is_model_list: bool = False) -> str | None:
+             *, is_model_list: bool = False,
+             mapped_model: str | None = None) -> str | None:
     """返回 None 表示放行，否则返回拒绝原因（`Rejection`，自带状态码）。
 
     is_model_list：请求是 `/v1/models`（模型发现，不带 model）。版本归属在这种
     请求上不拦——它没有版本可言，拦了会让限定版本的密钥连「我有哪些模型」都
     问不到；真正的隔离由调用时的模型名把关（见下）。
+
+    mapped_model：`model` 经「模型映射」后的名字（issue #47）。**两处判据的对象
+    不同，不能混为一谈**：
+
+      · **版本归属判映射后的名字**——真正发往上游、决定走哪个账号池的是它。
+        用请求名判，配了别名映射的密钥会永远被 realm 检查打回（issue #47：
+        别名 `claude-fable-5 → global:deepseek-v4.1-flash` 被判成国内版模型）。
+      · **模型白名单判请求名**——白名单约束的是「客户端可以发哪些名字」，而
+        `/v1/models` 的裁剪就是这么算的（别名条目以**别名**为 id 下发，见
+        `gateway._scope_models`）。改成判映射后的名字，会让「白名单里写别名」
+        的密钥反被拒掉，与列表自相矛盾——issue #46 修的正是这处一致性。
     """
     if not key['enabled']:
         return Rejection('密钥已停用', 403, 'permission_error', 'key_disabled')
@@ -411,23 +456,29 @@ def validate(key: dict, ip: str, model: str | None,
     # 版本归属：密钥限定版本后，只能调用该版本的模型。
     #
     # 判定依据与实际路由**同一来源**：上游按模型名的 `global:` 前缀选账号池，
-    # 所以「这次请求走哪个版本」由 model 决定（见 db.realm_of_model，日志与
-    # 统计也用它）。用别的东西判（比如当前界面切到哪版）会与真实流量对不上。
+    # 所以「这次请求走哪个版本」由**实际要用的那个名字**决定（见 db.realm_of_model，
+    # 日志与统计也用它）。用别的东西判（比如当前界面切到哪版）会与真实流量对不上。
     #
-    # 缺 model 时不放行：那会走上游默认模型，而默认模型属于国内版——限定
-    # 国际版的密钥反而能借此打到国内池，隔离就成了摆设。（模型白名单同理，
-    # 下面那段是同一个道理的另一处。）
+    # 而「实际要用的名字」是**映射之后**的：请求名可能是个别名，上游看不懂它，
+    # 真正路由的是映射目标（issue #47）。所以这里用 mapped_model —— 否则配了
+    # 「别名 → 带前缀的真名」的密钥永远被判成错版本。
+    effective = (mapped_model or model)
     want = _norm_realm(key.get('realm'))
     if want and not is_model_list:
-        if not isinstance(model, str) or not model.strip():
+        if not isinstance(effective, str) or not effective.strip():
             return Rejection(
                 f'该密钥限定了{"国际版" if want == "global" else "国内版"}模型，请求必须指定 model',
                 400, 'invalid_request_error', 'realm_mismatch')
-        got = 'global' if model.strip().lower().startswith('global:') else 'cn'
+        got = 'global' if effective.strip().lower().startswith('global:') else 'cn'
         if got != want:
             label = {'cn': '国内版', 'global': '国际版'}[want]
             other = '国际版' if want == 'cn' else '国内版'
-            hint = '模型名需带 global: 前缀' if want == 'global' else '请去掉 global: 前缀'
+            # 配了映射时，正确的做法是改映射或改密钥的版本，不是给请求名加前缀
+            # （那个名字客户端根本不发到上游）——所以提示分两种。
+            if mapped_model and mapped_model != model:
+                hint = f'{model} 按「模型映射」指向 {mapped_model}'
+            else:
+                hint = '模型名需带 global: 前缀' if want == 'global' else '请去掉 global: 前缀'
             return Rejection(
                 f'该密钥仅限{label}模型，当前请求是{other}模型（{hint}）',
                 400, 'invalid_request_error', 'realm_mismatch')

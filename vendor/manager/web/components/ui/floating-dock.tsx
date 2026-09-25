@@ -5,6 +5,7 @@
  **/
 
 import {cn} from '@/lib/utils';
+import {withBasePath} from '@/lib/base-path';
 import {IconLayoutNavbarCollapse} from '@tabler/icons-react';
 import {
   AnimatePresence,
@@ -113,7 +114,7 @@ const FloatingDockMobile = memo(
                         </div>
                       ) : item.href ? (
                       <a
-                        href={item.href}
+                        href={withBasePath(item.href)}
                         key={item.title}
                         className={cn(
                             'flex h-8 w-8 items-center justify-center rounded-full bg-gray-50 dark:bg-neutral-900',
@@ -322,7 +323,8 @@ const IconContainer = memo(
       const Element = customComponent ? 'div' : href ? 'a' : 'button';
       const elementProps = customComponent ? {} : href ?
       {
-        href,
+        // 原生 <a> 不经过 next/link，basePath 不会自动生效
+        href: withBasePath(href),
         ...((external || href.startsWith('https://')) ?
             {target: '_blank', rel: 'noopener noreferrer'} :
             {}),

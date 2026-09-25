@@ -152,6 +152,40 @@ class WebLocaleTest(unittest.TestCase):
         ]
         self.assertEqual(offenders, [], f'en 里有 {len(offenders)} 处未翻译的中文：{offenders[:10]}')
 
+    def test_no_duplicate_keys(self) -> None:
+        """同一个段里**不能出现重复键**——JSON 会静默取最后一条，界面于是显示错的那句。
+
+        为什么单独一条：上面所有检查都走 `json.loads`，而它遇到重复键**不报错**、
+        直接保留最后一个（`object_pairs_hook` 才看得到）。所以「两个分支各加了同名
+        键、合并时挤在一起」这种事故，键集、空译文、占位符全都查不出来，
+        只有肉眼看 diff 才发现 —— 评审一次真实合并时就撞上过（同一个键一个写
+        「缓存命中」一个写「缓存命中 Token」，最终库里留下的取决于行序）。
+
+        做法是**按文本**逐行找，不用 json：每行 `"key": ...` 记一次出现。
+        """
+        offenders: dict[str, list[str]] = {}
+        for locale in _LOCALES:
+            path = _LOCALES_DIR / f'{locale}.json'
+            section = '?'
+            seen: dict[tuple[str, str], int] = {}
+            for lineno, line in enumerate(
+                    path.read_text(encoding='utf-8').splitlines(), start=1):
+                m = re.match(r'^  "([^"]+)": \{\s*$', line)   # 顶层段名
+                if m:
+                    section = m.group(1)
+                    continue
+                m = re.match(r'^    "([^"]+)":', line)        # 段内键
+                if not m:
+                    continue
+                key = (section, m.group(1))
+                if key in seen:
+                    offenders.setdefault(f'{locale}.{section}.{m.group(1)}',
+                                         []).append(f'第 {seen[key]} 行与第 {lineno} 行')
+                else:
+                    seen[key] = lineno
+        self.assertEqual(offenders, {},
+                         f'语言文件里有重复键（JSON 只会保留最后一条）：{offenders}')
+
 
 class WebKeyUsageTest(unittest.TestCase):
     """源码里写死的 t('...') 键必须真的存在于字典。

@@ -88,7 +88,7 @@ def me(user: dict = Depends(security.current_user)) -> dict:
 
 @router.post('/sessions/revoke')
 def revoke_own_sessions(request: Request,
-                        user: dict = Depends(security.require_admin)) -> dict:
+                        user: dict = Depends(security.require_session_admin)) -> dict:
     """吊销**当前用户**的全部会话（含本机这次），并清除本机 cookie。
 
     用途：怀疑会话被盗用（在别人电脑上登录过、旧设备没退出、备份里有 cookie）时，

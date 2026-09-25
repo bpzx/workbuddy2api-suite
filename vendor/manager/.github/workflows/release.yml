@@ -100,6 +100,25 @@ jobs:
           # 不替换根目录文件。放进 server/ 后，任何部署（含从旧版升上来的）
           # 都拿得到更新日志，避免界面报「未找到更新日志文件」。
           cp CHANGELOG.md "$STAGE/server/CHANGELOG.md"
+          # ── 上游源码随包分发 ─────────────────────────────────────────
+          # 上游源码不放进本仓库（不是我们的代码），其公开地址也已不可用。
+          # 用户要能装，所以源码从固定的载体 Release（tag upstream-src，
+          # 标为 pre-release 以免影响 releases/latest）取回来塞进包里：
+          #   · 新装：install.sh 见到 upstream/ 直接用（离线可装）
+          #   · 升级：update.py 把它同步进上游目录（保留 config/auths/data）
+          # 取不到**不致命**（网络抖动、载体未建）：记一条醒目日志继续打包，
+          # 用户仍可用 UPSTREAM_SRC 自己指定源码。
+          UPSTREAM_SRC_URL="${UPSTREAM_SRC_URL:-https://github.com/${{ github.repository }}/releases/download/upstream-src/workbuddy2api-src.tar.gz}"
+          mkdir -p "$STAGE/upstream"
+          if curl -fsSL --retry 3 --retry-delay 2 --max-time 120 \
+                 "$UPSTREAM_SRC_URL" -o /tmp/upstream-src.tar.gz \
+             && tar -xzf /tmp/upstream-src.tar.gz -C "$STAGE/upstream" --strip-components=1 \
+             && [ -f "$STAGE/upstream/docker-compose.yml" ]; then
+            echo "已内嵌上游源码：$(find "$STAGE/upstream" -type f | wc -l) 个文件"
+          else
+            echo "::warning::取不到上游源码包（$UPSTREAM_SRC_URL）——本次发布包不含 upstream/，新装用户需自备源码（UPSTREAM_SRC）"
+            rmdir "$STAGE/upstream" 2>/dev/null || true
+          fi
           # 写入版本标记：管理端「系统更新」页与安装流程据此显示当前版本
           echo "${TAG}" > "$STAGE/.version"
           # 不含运行时数据与凭据

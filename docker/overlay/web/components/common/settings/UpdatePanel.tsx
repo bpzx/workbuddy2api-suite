@@ -68,7 +68,6 @@ type SuiteCheck = {
   checked_at: number;
   cached: boolean;
   suite: VersionSide & {is_dev: boolean};
-  wb2api: VersionSide & {date: string; subject: string};
   manager: VersionSide;
   has_any: boolean;
 };
@@ -195,7 +194,6 @@ export function UpdatePanel() {
       setCheck(c);
       const parts: string[] = [];
       if (c.suite.has_update && c.suite.latest) parts.push(`${t('suiteUpdate.title')} ${c.suite.latest}`);
-      if (c.wb2api.has_update && c.wb2api.latest) parts.push(`workbuddy2api ${c.wb2api.latest}`);
       if (c.manager.has_update && c.manager.latest) parts.push(`workbuddy-manager ${c.manager.latest}`);
       if (parts.length) notify.warn(t('suiteUpdate.hasUpdate'), parts.join(' · '));
       else notify.ok(t('suiteUpdate.upToDate'));
@@ -231,7 +229,6 @@ export function UpdatePanel() {
   }, []);
 
   const suite = check?.suite;
-  const gw = check?.wb2api;
   const mg = check?.manager;
 
   return (
@@ -404,29 +401,11 @@ export function UpdatePanel() {
         </div>
 
         <div className="space-y-3">
-          <div className="rounded-2xl bg-background/60 p-3">
-            <div className="mb-2 flex items-center justify-between gap-2">
-              <span className="text-xs font-medium">{t('suiteUpdate.upstreamGw')}</span>
-              {gw &&
-                (gw.has_update ? (
-                  <Badge variant="secondary" className="rounded-full text-amber-600">
-                    {t('suiteUpdate.hasUpdate')}
-                  </Badge>
-                ) : (
-                  <Badge variant="secondary" className="rounded-full text-emerald-600">
-                    {t('suiteUpdate.noUpdate')}
-                  </Badge>
-                ))}
-            </div>
-            <VersionRow label={t('suiteUpdate.pinned')} value={gw?.current || ''} />
-            <VersionRow label={t('suiteUpdate.remote')} value={gw?.latest || ''} />
-            {gw?.subject && (
-              <div className="mt-1.5 truncate text-[11px] text-muted-foreground" title={gw.subject}>
-                {gw.subject}
-              </div>
-            )}
-          </div>
-
+          {/* 这里原本还有一块「上游网关 workbuddy2api（固定提交 → 远端最新）」。
+              已移除：那个仓库已被删除，查询必然失败，而"保留上次成功结果"的缓存
+              逻辑会把它**永久**留成「有新版本可更新」—— 仓库都不存在了，谈不上更新。
+              wb2api 现在由本项目自行维护，事实记录在 README / UPSTREAMS.md，
+              不在这个只讲"有无更新"的面板上。 */}
           <div className="rounded-2xl bg-background/60 p-3">
             <div className="mb-2 flex items-center justify-between gap-2">
               <span className="text-xs font-medium">{t('suiteUpdate.upstreamMgr')}</span>

@@ -7,6 +7,7 @@ import {
   Users,
   ClipboardList,
   KeyRound,
+  Gift,
   Boxes,
   MessageSquare,
   ScrollText,
@@ -452,6 +453,13 @@ export function ManagementBar() {
       title: t('nav.keys'),
       icon: <KeyRound {...IconOptions} />,
       href: '/keys',
+    },
+    {
+      // 红包紧挨着密钥：它产出的是密钥（一份一个 key），只是多了「一次建一批、
+      // 额度随机分配」这层封装
+      title: t('nav.redPackets'),
+      icon: <Gift {...IconOptions} />,
+      href: '/red-packets',
     },
     {
       title: t('nav.models'),

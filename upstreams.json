@@ -30,10 +30,10 @@
       "repo": "ithtelab/workbuddy-manager",
       "repo_url": "https://github.com/ithtelab/workbuddy-manager.git",
       "branch": "main",
-      "commit": "3fb56bd08c52257ab589f23a8aaa18c2658cf39b",
-      "commit_short": "3fb56bd",
-      "commit_date": "2026-09-20T19:48:02+08:00",
-      "subject": "docs: issue 回复的写法——与更新日志同一条规矩，配自检脚本与守卫",
+      "commit": "1a4876122d2691436877f6e5d175f2b1349e3b2b",
+      "commit_short": "1a48761",
+      "commit_date": "2026-09-25T09:14:58+08:00",
+      "subject": "Merge PR #83: 仪表盘首屏如实呈现状态（骨架 / 错误态 / 刷新失败提示）",
       "vendor_path": "vendor/manager",
       "license": "MIT",
       "license_file": "vendor/manager/LICENSE",
@@ -41,7 +41,7 @@
         ".git"
       ],
       "note": "镜像内置于 /opt/manager；deploy/update.py 在构建期由 docker/stub/update.py 覆盖（容器内无 git/systemctl）。保留 .github：上游测试会读 .github/workflows/release.yml",
-      "synced_at": "2026-09-21T10:50:23+08:00"
+      "synced_at": "2026-09-25T09:46:23+08:00"
     }
   }
 }

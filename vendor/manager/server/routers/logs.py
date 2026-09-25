@@ -86,10 +86,22 @@ def list_logs(
             'latency_ms': r['latency_ms'],
             # 首字延迟：NULL 表示未采集（非流式请求或旧记录）
             'first_token_ms': r['first_token_ms'],
+            # 提示词缓存三段（issue #69）：NULL = 上游没给这三个字段（老上游），
+            # 与「给了 0」不同 —— 界面据此显示「—」而不是 0%。
+            'cache_hit_tokens': r['cache_hit_tokens'],
+            'cache_miss_tokens': r['cache_miss_tokens'],
+            'cache_write_tokens': r['cache_write_tokens'],
             'ua': r['ua'],
             'error': r['error'],
             'stream': bool(r['stream']),
             'credit': r['credit'],
+            # 本次实际用了哪个上游账号（issue #69）。NULL = 尚未回填 ——
+            # 账号是采集上游日志后按时间对回来的，比请求本身晚几秒，
+            # 所以刚打完的请求这一列可能是空的（界面显示「—」，刷新即可）。
+            'account': r['account'],
+            # 输入侧命中缓存的 token 数。NULL 与 0 含义不同：
+            # NULL = 上游没给这个字段，0 = 这次确实没命中（见 db 的列说明）。
+            'cache_hit_tokens': r['cache_hit_tokens'],
         }
         for r in rows
     ]
@@ -97,6 +109,6 @@ def list_logs(
 
 
 @router.post('/clear')
-def clear_logs(user: dict = Depends(security.require_admin)) -> dict:
+def clear_logs(user: dict = Depends(security.require_session_admin)) -> dict:
     db.execute('DELETE FROM request_logs')
     return {'ok': True}

@@ -18,18 +18,22 @@ import {
   Loader2,
   DownloadCloud,
   FileText,
+  KeyRound,
 } from 'lucide-react';
 import {notify} from '@/lib/toast';
+import {getExpiryDailyGroup, setExpiryDailyGroup} from '@/lib/display-prefs';
 import {useI18n} from '@/lib/i18n/provider';
 import {t as tGlobal, tp as tpGlobal} from '@/lib/i18n';
 import {RichText} from '@/lib/i18n/rich-text';
 import {settingsApi, upstreamApi, errText} from '@/lib/api';
+import {BASE_PATH} from '@/lib/base-path';
 import type {ModelInfo, ModelSource, UpstreamConfig, UserItem} from '@/lib/types';
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {EmptyState} from '@/components/common/layout/EmptyState';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
 import {useAuth} from '@/lib/auth-context';
 import {UpdatePanel} from '@/components/common/settings/UpdatePanel';
+import {TokensPanel} from '@/components/common/settings/TokensPanel';
 import {ChangelogPanel} from '@/components/common/settings/ChangelogPanel';
 import {CopyButton} from '@/components/ui/copy-button';
 import {Button} from '@/components/ui/button';
@@ -801,6 +805,20 @@ export default function SettingsPage() {
   const [modelSource, setModelSource] = useState<ModelSource>('unknown');
   const [modelsLoading, setModelsLoading] = useState(false);
 
+  /**
+   * 「到期积分按天模糊统计」——**界面偏好**，存在浏览器本地而不是上游配置里。
+   *
+   * 它决定仪表盘那个数字怎么算，不改变系统的任何行为，所以不进 GROUPS：
+   * 那套分组每条都对应 config.json 的一个段，混进来会被当成上游配置去保存
+   * （保存时还会因为段名对不上而被拒）。与语言、版本切换同类。
+   *
+   * 首屏后读 localStorage：直接读会让服务端渲染与客户端不一致。
+   */
+  const [expiryDaily, setExpiryDaily] = useState(false);
+  useEffect(() => {
+    setExpiryDaily(getExpiryDailyGroup());
+  }, []);
+
   /** 可视化表单状态 */
   const [form, setForm] = useState<Record<Group, Record<string, FieldValue>>>({
     schedule: defaultValues(SCHEDULE_FIELDS),
@@ -1079,6 +1097,7 @@ export default function SettingsPage() {
           <TabsTrigger value="upstream"><Server className="mr-1.5 h-3.5 w-3.5" />{t('settings.tabUpstream')}</TabsTrigger>
           <TabsTrigger value="models"><Shuffle className="mr-1.5 h-3.5 w-3.5" />{t('settings.tabModels')}</TabsTrigger>
           <TabsTrigger value="users"><Users className="mr-1.5 h-3.5 w-3.5" />{t('settings.tabUsers')}</TabsTrigger>
+          <TabsTrigger value="tokens"><KeyRound className="mr-1.5 h-3.5 w-3.5" />{t('settings.tabTokens')}</TabsTrigger>
           <TabsTrigger value="system"><DownloadCloud className="mr-1.5 h-3.5 w-3.5" />{t('settings.tabSystem')}</TabsTrigger>
           <TabsTrigger value="changelog"><FileText className="mr-1.5 h-3.5 w-3.5" />{t('settings.tabChangelog')}</TabsTrigger>
           <TabsTrigger value="about"><Info className="mr-1.5 h-3.5 w-3.5" />{t('settings.tabAbout')}</TabsTrigger>
@@ -1207,6 +1226,32 @@ export default function SettingsPage() {
                   )}
                 </p>
               )}
+            </div>
+          </div>
+
+          {/* 界面偏好：下面那些卡片都是**上游配置**（每条对应 config.json 的一个段、
+              有保存按钮）；这一张只决定界面怎么摆，存在浏览器本地、改完立即生效，
+              所以既没有保存按钮也不受「上游不可用」影响。 */}
+          <div className="rounded-[20px] bg-muted px-3.5 py-3">
+            <div className="mb-2.5">
+              <div className="text-sm font-medium">{t('settings.displayTitle')}</div>
+              <RichText className="text-[11px] text-muted-foreground" text={t('settings.displayDesc')} />
+            </div>
+            <div className="flex items-center justify-between gap-3 rounded-2xl bg-background/60 px-3 py-2">
+              <div className="min-w-0">
+                <div className="text-xs font-medium">{t('settings.expiryDailyLabel')}</div>
+                <RichText
+                  className="mt-0.5 block text-[11px] leading-4 text-muted-foreground"
+                  text={t('settings.expiryDailyDesc')}
+                />
+              </div>
+              <Switch
+                checked={expiryDaily}
+                onCheckedChange={(v) => {
+                  setExpiryDaily(v);
+                  setExpiryDailyGroup(v);
+                }}
+              />
             </div>
           </div>
 
@@ -1836,7 +1881,7 @@ export default function SettingsPage() {
                                 if (r?.relogin_required) {
                                   notify.ok(t('settings.passwordUpdated'), t('settings.passwordRelogin'));
                                   window.setTimeout(() => {
-                                    window.location.href = '/login';
+                                    window.location.href = `${BASE_PATH}/login`;
                                   }, 1800);
                                   return;
                                 }
@@ -1884,6 +1929,11 @@ export default function SettingsPage() {
               />
             )}
           </div>
+        </TabsContent>
+
+        {/* ═══ 访问令牌 ═══ */}
+        <TabsContent value="tokens" className="mt-4 space-y-4">
+          <TokensPanel />
         </TabsContent>
 
         {/* ═══ 系统更新 ═══ */}

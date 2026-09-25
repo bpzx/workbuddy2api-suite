@@ -2,6 +2,7 @@ import {clsx, type ClassValue} from 'clsx';
 import {twMerge} from 'tailwind-merge';
 
 import {intlLocale, t} from '@/lib/i18n';
+import {copyText} from '@/lib/format';
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -67,26 +68,18 @@ export function formatDateTimeWithSeconds(dateString: string): string {
 }
 
 /**
- * 复制文本到剪贴板
+ * 复制文本到剪贴板（失败时抛错）。
+ *
+ * **实现只有一份**：委托给 `format.copyText`。这里原先自己写了一遍同样的
+ * 「Clipboard API + execCommand 回退」，而那条回退同样忽略了 execCommand 的
+ * 返回值 —— 同一个 bug 存了两份（issue #57）。合并成一份，免得下次只修一处。
+ *
  * @param text - 要复制的文本
- * @returns Promise<void>
+ * @throws 复制未真正成功时抛出（调用方据此如实提示，而不是报「已复制」）
  */
 export async function copyToClipboard(text: string): Promise<void> {
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch {
-    try {
-      const textArea = document.createElement('textarea');
-      textArea.value = text;
-      textArea.style.position = 'fixed';
-      textArea.style.opacity = '0';
-      document.body.appendChild(textArea);
-      textArea.focus();
-      textArea.select();
-      document.execCommand('copy');
-      document.body.removeChild(textArea);
-    } catch {
-      throw new Error(t('common.copyFailed'));
-    }
+  const ok = await copyText(text);
+  if (!ok) {
+    throw new Error(t('common.copyFailed'));
   }
 }

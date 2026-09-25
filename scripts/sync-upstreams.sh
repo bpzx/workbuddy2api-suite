@@ -352,7 +352,12 @@ else
   2) 检查是否需要同步集成层（见 UPSTREAMS.md 的检查清单）：
        - 上游改了 Dockerfile 依赖  → docker/Dockerfile
        - 上游改了 config.example   → docker/wb2api.config.template.json
-       - 上游改了 /api/system 约定 → docker/stub/update.py
+       - 上游改了 server/services/updater.py（**读取端**，不是被我们覆盖的
+         deploy/update.py）→ docker/stub/update.py 的状态 JSON 契约要对齐
+
+  2b) 只需确认「补丁锚点 / 覆写目标 / i18n 前提」仍成立 —— 预检测试会在本地
+      立刻报出（比等 CI 或 docker build 快得多）：
+       python -m unittest discover -s tests -t tests -p test_patch_preflight.py
 
   3) 同步 UPSTREAMS.md 的表格与套件 CHANGELOG.md，然后提交。
 EOF

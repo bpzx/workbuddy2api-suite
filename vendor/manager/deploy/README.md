@@ -1,11 +1,69 @@
 # 部署指南
 
-本项目管理端**依赖上游 [`workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api)**
-（提供账号池调度与 OpenAI 兼容接口）。单独 clone 本仓库是跑不起来的 ——
-为此我们提供了一键脚本，会在干净机器上自动安装好两者。
+本项目管理端**依赖上游 workbuddy2api**（提供账号池调度与 OpenAI 兼容接口）。
+单独 clone 本仓库是跑不起来的 —— 为此我们提供了一键脚本，会在干净机器上安装好两者。
 
 > **重要**：请勿把本项目管理端的数据目录与上游账号目录提交或公开分享，
 > 其中含账号授权凭据。
+
+---
+
+## 〇、上游源码从哪来（随发布包分发）
+
+上游 workbuddy2api 的源码**随本项目的发布包一起分发**（包内 `upstream/`），
+装的时候不用去任何外部地址取。影响如下：
+
+| 场景 | 现在的状态 |
+|---|---|
+| **已经在跑**的部署 | **不受影响**。上游源码在你机器上、镜像也是本地构建的；面板的一键更新会沿用现有源码重建上游，面板自己照常更新 |
+| **新装** | 直接用包内那份（下面的脚本会自动识别） |
+| **更新上游代码** | 跟着管理端一起更新（一键更新会把包内那份同步进来）；要改代码就改本地那份，或用 `UPSTREAM_SRC` 换一份 |
+
+### 包内自带，开箱即用
+
+最新版本的 Release 包内含 `upstream/`（上游源码），装的时候直接用，
+**不需要联网取任何外部源码**：
+
+```bash
+wget https://github.com/ithtelab/workbuddy-manager/releases/latest/download/workbuddy-manager-<版本>.tar.gz
+tar xzf workbuddy-manager-*.tar.gz && cd workbuddy-manager-*
+sudo bash deploy/install.sh          # 自动使用包内的 upstream/
+```
+
+要改用你自己那份源码（或机器上已有的 `/opt/workbuddy2api`），按下面的优先级覆盖：
+
+```bash
+# 1) 显式指定本地源码（目录 / .tar.gz / .zip 都行）
+sudo UPSTREAM_SRC=/opt/workbuddy2api bash deploy/install.sh
+sudo UPSTREAM_SRC=/path/to/workbuddy2api-<版本>.tar.gz bash deploy/install.sh
+
+# 2) 从你自己的 git 副本拉
+sudo UPSTREAM_REPO=https://github.com/<你的账号>/workbuddy2api.git bash deploy/install.sh
+
+# 3) 上游已手工装好，只想装面板
+sudo bash deploy/install.sh --skip-upstream
+```
+
+优先级：`UPSTREAM_SRC` → 发布包自带的 `upstream/` → 目标目录里已有的 git 仓库
+→ `UPSTREAM_REPO` 克隆。`UPSTREAM_DIR` 默认 `/opt/workbuddy2api`。
+
+### 以后怎么更新上游代码
+
+用面板里的**一键更新**即可 —— 它会把包内那份上游源码同步进 `/opt/workbuddy2api`
+（只增改，不动 `config.json` / `auths/` / `data/`），**有变化才重建容器**。
+随包分发的上游没有 `git pull` 可拉；要改代码请改本地那份（或用 `UPSTREAM_SRC`
+覆盖一份新的），再：
+
+```bash
+cd /opt/workbuddy2api && docker compose up -d --build
+```
+
+这三样务必保留：`config.json`（含 `api_key`）、`auths/`（账号授权）、`data/`。
+
+### 许可
+
+上游为 MIT 许可（版权归原作者）。继续使用、修改、再分发都需保留它的 `LICENSE`
+与版权声明 —— 源码目录里那份 `LICENSE` 不要删。
 
 ---
 
@@ -17,15 +75,15 @@ wget https://github.com/ithtelab/workbuddy-manager/releases/latest/download/work
 tar xzf workbuddy-manager-*.tar.gz
 cd workbuddy-manager-*
 
-# 2) 一键部署（会自动检测并安装上游 workbuddy2api）
+# 2) 一键部署（自动检测上游；上游源码用 UPSTREAM_SRC 指定，见上一节）
 sudo bash deploy/install.sh
 ```
 
 脚本会自动完成：
 
 1. 环境预检（Python ≥3.9、Docker、端口占用检查）
-2. **安装上游 workbuddy2api** —— 克隆、生成随机 `api_key`、设置目录属主、
-   构建并启动容器、等待就绪
+2. **安装上游 workbuddy2api** —— 取源码（本地目录或 git 地址）、生成随机 `api_key`、
+   设置目录属主、构建并启动容器、等待就绪
 3. 安装管理端 —— 部署代码、装依赖、注册 systemd 服务
 4. 验证两条链路并打印访问地址与初始密码
 
@@ -133,7 +191,89 @@ server {
 > 首段可被客户端伪造）。若前面还叠了 CDN，请把服务端
 > `WB_TRUSTED_PROXY_HOPS` 设为 CDN + 反代的层数。
 
-### 4. 加固建议
+### 4. 子路径部署（可选）
+
+如果域名根路径已被别的站点占用（例如 `https://example.com/` 是另一个系统），
+管理端可以挂在子路径下，例如 `https://example.com/workbuddy-manager/`。
+
+需要**两处**同时配置，缺一不可。
+
+**① 把前缀交给前端构建**
+
+宿主机 / 源码部署：
+
+```bash
+cd /opt/workbuddy-manager/web
+NEXT_PUBLIC_BASE_PATH=/workbuddy-manager npm run build:export
+```
+
+容器部署时前端是**在镜像构建阶段**编译的（宿主机上没有 `web/out`），所以前缀要传给
+构建而不是运行时：
+
+```bash
+docker compose build --build-arg BASE_PATH=/workbuddy-manager
+docker compose up -d
+```
+
+也可以直接写进 `docker-compose.yml` 的 `build.args.BASE_PATH`（留空 = 根路径部署，与
+改动前一致）。
+
+**② 后端与反代对齐前缀**
+
+加到 **systemd unit 的 `Environment=`** 里（容器部署则把 compose 的 `environment:` 里
+那行 `WB_BASE_PATH` 取消注释），取值与上面完全一致：
+
+```
+WB_BASE_PATH=/workbuddy-manager
+```
+
+> **别写进 `.env`。** 服务端只读进程环境变量：仓库里没有任何地方调用 `load_dotenv`，
+> `deploy/workbuddy-web.service` 没有 `EnvironmentFile=`，`docker-compose.yml` 用的是
+> 内联 `environment:` 而不是 `env_file:`——写进 `.env` 不会生效。
+> 这个坑的麻烦之处在于**症状很隐蔽**：配置看起来加了，但前缀没被剥掉，
+> 表现为「页面能打开、接口全 404」，容易误判成反代写错了。
+>
+> （唯一的例外是 Windows 原生部署：`start.ps1` 用 `uvicorn --env-file .env` 显式读取 `.env`。）
+
+**③ 反向代理：两种 `proxy_pass` 写法都可以**
+
+带尾斜杠（反代自己把前缀剥掉）：
+
+```nginx
+location /workbuddy-manager/ {
+    proxy_pass http://127.0.0.1:7864/;   # 末尾这个 / 就是「剥掉前缀」
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade    $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 300s;
+}
+```
+
+不带尾斜杠（反代原样转发，前缀由服务端自己剥掉）：
+
+```nginx
+location /workbuddy-manager/ {
+    proxy_pass http://127.0.0.1:7864;    # 没有尾斜杠：请求带着前缀进来
+    ...同样那几个 header 与超时...
+}
+```
+
+> 第二种写法值得单独说明：**面板类工具（如 1Panel）新建反向代理时，界面拼出来的
+> `proxy_pass` 常常是不带尾斜杠的那种**，而手写配置的人也很容易漏掉那个 `/`。
+> 两种都能用的意义是——不必先搞清楚「该不该带尾斜杠」才能配通。
+
+> 网关（`/v1`）会一起挂到前缀下：接入地址是
+> `https://example.com/workbuddy-manager/v1`。密钥页展示的地址会自动带上前缀。
+
+> 症状好认：页面能打开，但随即跳到域名根的 `/login` 并 404 —— 根路径属于另一个
+> 站点，自然没有这个路由。这说明 ① 或 ② 漏了一个：前缀只在前端和后端**都**知道
+> 的情况下才成立。
+
+### 5. 加固建议
 
 - 用防火墙或安全组只放行 `22 / 80 / 443`；`7863`、`7864` 保持仅本机
 - 可在 1Panel 为站点配置 IP 白名单，或叠加 Cloudflare Access

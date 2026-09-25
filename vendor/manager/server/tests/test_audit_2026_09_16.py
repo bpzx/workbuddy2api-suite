@@ -130,11 +130,36 @@ class RequestLogHardeningTest(_DbCase):
 
     def test_normal_model_untouched(self) -> None:
         """正常模型名不能被改动 —— 否则统计/日志按模型聚合会错。"""
-        self._record(model='global:gpt-5.6-sol', mapped='gpt-5.6-sol')
+        self._record(model='global:gpt-5.6-sol', mapped='global:gpt-5.6-sol')
         row = db.query_one('SELECT model, mapped_model, realm FROM request_logs')
         self.assertEqual(row['model'], 'global:gpt-5.6-sol')
-        self.assertEqual(row['mapped_model'], 'gpt-5.6-sol')
+        self.assertEqual(row['mapped_model'], 'global:gpt-5.6-sol')
         self.assertEqual(row['realm'], 'global')
+
+    def test_realm_follows_the_outbound_model(self) -> None:
+        """`realm` 判**实际发往上游**的那个名字（issue #47 的连带面）。
+
+        上游按模型名的 `global:` 前缀选账号池，所以走哪个池由**出站**名字决定。
+        配了模型映射时两者可能不同：
+
+          · 请求 `global:gpt-5.6-sol`、映射成裸名 `gpt-5.6-sol`
+            → 上游按裸名路由（国内池），日志就该记 cn。记成 global 会让
+            「按版本筛选日志」把一次真实的国内版调用列到国际版那一栏。
+          · 反向（裸名 → `global:...`）同理记 global。
+
+        注：改这一条是因为 issue #47 之后**跨版本别名调用被放行**了——此前那样
+        的请求直接被 400 拒掉，压根不会产生日志行，口径不一致看不出来。
+        """
+        self._record(model='global:gpt-5.6-sol', mapped='gpt-5.6-sol')
+        self.assertEqual(db.query_one('SELECT realm FROM request_logs')['realm'], 'cn')
+        db.execute('DELETE FROM request_logs')
+        self._record(model='claude-fable-5', mapped='global:deepseek-v4.1-flash')
+        self.assertEqual(db.query_one('SELECT realm FROM request_logs')['realm'], 'global')
+
+    def test_realm_from_request_when_no_mapping(self) -> None:
+        """没有映射（`mapped` 为空）时仍按请求名判 —— 行为不变。"""
+        self._record(model='global:gpt-5.6-sol', mapped='')
+        self.assertEqual(db.query_one('SELECT realm FROM request_logs')['realm'], 'global')
 
 
 class ConfigMaskingAllowlistTest(unittest.TestCase):

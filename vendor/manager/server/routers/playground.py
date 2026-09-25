@@ -111,13 +111,14 @@ async def chat(body: ChatIn, request: Request, user: dict = Depends(security.req
                 usage = parsed['usage']
         except Exception:  # noqa: BLE001
             pass
+        # 整份 usage 交过去（而不是只取 credit）：扣费与提示词缓存三段都在这一份里
         gateway._record(
             None, ip, model_sent, '', resp.status_code,
             int(usage.get('prompt_tokens') or 0),
             int(usage.get('completion_tokens') or 0),
             int((time.time() - started) * 1000),
             request.headers.get('user-agent'), None, False,
-            credit=gateway._usage_credit(usage),
+            usage=usage,
         )
         return StreamingResponse(iter([raw]), media_type='application/json',
                                  status_code=resp.status_code)
@@ -156,7 +157,7 @@ async def chat(body: ChatIn, request: Request, user: dict = Depends(security.req
                 int(usage.get('completion_tokens') or 0),
                 int((time.time() - started) * 1000),
                 request.headers.get('user-agent'), error_text, True,
-                credit=gateway._usage_credit(usage),
+                usage=usage,
                 first_token=first_token_ms,
             )
 

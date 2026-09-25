@@ -196,25 +196,59 @@ export function fmtAgo(ts: number | null | undefined): string {
   return t('format.daysAgo', {count: ds, n: ds});
 }
 
+/**
+ * 复制文本到剪贴板，返回**是否真的复制成功**。
+ *
+ * 为什么必须检查回退路径的返回值（issue #57）：`document.execCommand('copy')`
+ * 是**有布尔返回值**的 —— 被浏览器拒绝时返回 `false`（非安全上下文、权限被拒、
+ * 不在用户手势之内都会这样）。原先忽略它、直接 `return true`，于是「根本没复制
+ * 成功」也会提示「已复制到剪贴板」，用户对着空剪贴板反复点，只能来报「提示成功
+ * 但复制不上」。
+ *
+ * 两条路径的判据都落在「真的写进去了」：
+ *   1. 优先 Clipboard API —— 它只在**安全上下文**（HTTPS 或 localhost）可用，
+ *      普通 HTTP 访问时 `navigator.clipboard` 是 undefined；
+ *   2. 回退到 `execCommand('copy')`，并**检查它的布尔返回值**。
+ * 都失败返回 `false`，由调用方如实提示（文案引导手动选择复制）。
+ */
 export async function copyText(text: string): Promise<boolean> {
-  try {
-    await navigator.clipboard.writeText(text);
-    return true;
-  } catch {
+  if (navigator.clipboard?.writeText) {
     try {
-      const ta = document.createElement('textarea');
-      ta.value = text;
-      ta.style.position = 'fixed';
-      ta.style.opacity = '0';
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand('copy');
-      document.body.removeChild(ta);
+      await navigator.clipboard.writeText(text);
       return true;
     } catch {
-      return false;
+      /* 落到下面的回退路径 */
     }
   }
+
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  // 只读：避免移动端弹键盘；移出可视区且透明：不闪、不占位
+  ta.setAttribute('readonly', '');
+  ta.style.position = 'fixed';
+  ta.style.top = '0';
+  ta.style.left = '-9999px';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+
+  const sel = document.getSelection();
+  const saved = sel && sel.rangeCount > 0 ? sel.getRangeAt(0) : null;
+  let ok = false;
+  try {
+    ta.select();
+    ta.setSelectionRange(0, text.length);
+    ok = document.execCommand('copy') === true;
+  } catch {
+    ok = false;
+  } finally {
+    document.body.removeChild(ta);
+    // 恢复用户原来的选区：复制是旁路动作，不该把界面上已有的选择弄丢
+    if (saved && sel) {
+      sel.removeAllRanges();
+      sel.addRange(saved);
+    }
+  }
+  return ok;
 }
 
 /**

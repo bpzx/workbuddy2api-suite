@@ -201,8 +201,8 @@ class DeployDiffCallerTest(unittest.TestCase):
         self.assertIsNotNone(m)
         body = m.group(0)
         # 两类必须分别输出，且带可读前缀
-        self.assertIn('修改（需人工确认）', body, '修改类未单独标注')
-        self.assertIn('新增（本地没有', body, '新增类未单独标注')
+        self.assertIn('修改（未覆盖）', body, '修改类未单独标注')
+        self.assertIn('新增（未覆盖）', body, '新增类未单独标注')
         # 分类必须按「本地是否存在」判定，不能只看内容差异
         self.assertIn("if not dst.is_file():", body)
         self.assertIn('added.append', body)

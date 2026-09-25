@@ -11,7 +11,8 @@ import time
 
 from fastapi import Depends, HTTPException, Request
 
-from . import config
+from . import config, tokensvc
+from .iputil import client_ip
 
 _fail: dict[str, list] = {}
 MAX_FAILS = 5
@@ -407,23 +408,13 @@ def audit(actor: dict | None, action: str, target: str = '', detail: str = '') -
 
 
 # ── FastAPI 依赖 ─────────────────────────────────────────
-def current_user(request: Request) -> dict:
-    """解析请求身份。**这是管理端唯一的身份入口**。
-
-    仅接受签名 cookie，并且必须**回查用户表**：
+def _cookie_identity(request: Request, cfg: dict) -> dict:
+    """会话 Cookie 的身份解析（**既有逻辑，逐字保留**）。
 
       - role 以表里的为准，不用 cookie 里的快照（否则降权后旧 cookie 仍是管理员）
       - 用户已被删除 → 拒绝（否则删号后其 cookie 在有效期内仍然通行）
       - 会话版本不匹配 → 拒绝（改密码 / 吊销后旧 cookie 立即失效）
-
-    安全事件记录（2026-09-14）：这里**曾经**接受 `X-API-Key` 头，只要它出现在
-    `users.json` 的 `api_keys` 数组里就直接授予 admin。那个数组没有任何代码
-    去写、没有管理界面，唯一作用就是这条提权后门；而它在早前的路径穿越里
-    与 secret 一起泄露，直接导致生产站管理员被改密码。**已彻底移除**：
-    管理端身份只认签名 cookie。下游调用请用网关的 `/v1/*`（那套密钥走
-    SQLite api_keys 表、只授权模型调用，与后台权限无关）。
     """
-    cfg = load_users()
     token = request.cookies.get(config.COOKIE_NAME)
     if not token:
         raise HTTPException(status_code=401, detail='未登录')
@@ -454,7 +445,88 @@ def current_user(request: Request) -> dict:
     return user
 
 
+def _bearer_token(request: Request) -> str:
+    """取管理面 API Token（`Authorization: Bearer wbt_...`，也接受 `X-API-Key`）。
+
+    只认 `wbt_` 前缀的形态，其余一律当「没有」——避免把网关密钥（`wbk_`）或
+    别的东西误当管理凭据。
+    """
+    auth = request.headers.get('authorization', '') or ''
+    tok = auth[7:].strip() if auth.lower().startswith('bearer ') else ''
+    if not tok:
+        tok = (request.headers.get('x-api-key') or '').strip()
+    return tok if tok.startswith(tokensvc.TOKEN_PREFIX) else ''
+
+
+def _token_identity(request: Request, token: str) -> dict:
+    """作用域化 API Token 的身份解析（见 docs/api-tokens.md）。
+
+    角色由 token 的 **scope** 决定（不查用户表，避免与用户表产生暧昧耦合）；
+    失败时**不区分**「不存在 / 已停用 / 已过期」，只回一个笼统的 401，不给探测者
+    信号。失败同样计入既有的按 IP 失败计数（与登录共用），成功则清除。
+    """
+    ip = client_ip(request)
+    row = tokensvc.resolve(token)
+    if not row or not tokensvc.usable(row):
+        record_fail(ip)
+        audit(None, 'token_rejected', '', f'来源 {ip}')
+        raise HTTPException(status_code=401, detail='未登录')
+    clear_fail(ip)
+    tokensvc.touch(int(row['id']), ip)
+    # 标记来源，供 require_session_admin 识别并拒绝高危接口。
+    request.state.token_id = int(row['id'])
+    return {
+        'username': f"token:{row['name']}",
+        'role': tokensvc.scope_to_role(row['scope']),
+    }
+
+
+def current_user(request: Request) -> dict:
+    """解析请求身份。**这是管理端唯一的身份入口**。
+
+    两条凭据路径，**会话优先**：
+
+      1. **签名 Cookie**（浏览器）——既有行为逐字保留，含改密码 / 吊销 / 闲置
+         超时的专门提示；role 以用户表为准，用户被删或会话版本不匹配即拒绝。
+      2. **`Authorization: Bearer wbt_...`**（作用域化 API Token，见
+         docs/api-tokens.md）——角色由 token 的 scope 决定，并在 `request.state`
+         上标记来源，供 `require_session_admin` 拒绝高危接口。
+
+    安全事件记录（2026-09-14）：这里**曾经**接受 `users.json` 里 `api_keys`
+    数组中的 `X-API-Key`，只要命中就直接授予 admin。那是一条提权后门，已彻底
+    移除。现在的 token 走 SQLite `api_tokens` 表：**只存哈希**、有 scope、
+    可吊销、有审计——与那次事故的形态刻意不同（见设计文档的「必须避免重蹈的
+    覆辙」一节）。下游调用请用网关的 `/v1/*`（那套密钥走 `api_keys` 表、
+    只授权模型调用，与后台权限无关）。
+    """
+    cfg = load_users()
+    session_err: HTTPException | None = None
+    if request.cookies.get(config.COOKIE_NAME):
+        try:
+            return _cookie_identity(request, cfg)
+        except HTTPException as exc:
+            session_err = exc
+    token = _bearer_token(request)
+    if token:
+        return _token_identity(request, token)
+    raise session_err or HTTPException(status_code=401, detail='未登录')
+
+
 def require_admin(user: dict = Depends(current_user)) -> dict:
     if user.get('role') != 'admin':
         raise HTTPException(status_code=403, detail='需要管理员权限')
+    return user
+
+
+def require_session_admin(request: Request,
+                          user: dict = Depends(require_admin)) -> dict:
+    """要求**会话**管理员：拒绝用 API Token 调用。
+
+    用于高危 / 不可逆接口（一键更新、删账号、清日志、改安全策略，以及管理
+    token 自身的接口）。原则是「能改代码、能扩大权限、或能抹掉痕迹的入口只对
+    真人开放」——这样即便 token 泄露，攻击面也不包含这些。（见 docs/api-tokens.md）
+    """
+    if getattr(request.state, 'token_id', None) is not None:
+        raise HTTPException(status_code=403,
+                            detail='该接口不接受 API Token，请用会话登录后操作')
     return user

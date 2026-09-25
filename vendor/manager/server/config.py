@@ -50,6 +50,16 @@ DB_PATH = Path(_env('WB_DB', str(DATA_DIR / 'manager.db')))
 USERS_FILE = Path(_env('WB_USERS_FILE', str(DATA_DIR / 'users.json')))
 STATIC_DIR = Path(_env('WB_STATIC_DIR', str(ROOT / 'web' / 'out')))
 
+# 子路径部署时的 URL 前缀，留空 = 根路径部署（默认）。
+#
+# 反向代理把 `/workbuddy-manager/...` 剥掉前缀再转发给本服务，所以路由本身不需要
+# 感知前缀；但**服务端主动发出的绝对地址**会漏掉它——目前只有 RSC 兜底重定向
+# （`main._rsc_page_for`）会发出 `Location: /dashboard` 这种根路径，浏览器跟过去就
+# 落到域名根上（通常是另一个站点，404）。该值须与前端构建时的
+# `NEXT_PUBLIC_BASE_PATH` 保持一致。
+_BASE_PATH_RAW = _env('WB_BASE_PATH', '').strip('/')
+BASE_PATH = f'/{_BASE_PATH_RAW}' if _BASE_PATH_RAW else ''
+
 # 网络
 UPSTREAM_TIMEOUT = _env_int('WB_UPSTREAM_TIMEOUT', 120)
 TENCENT_TIMEOUT = _env_int('WB_TENCENT_TIMEOUT', 15)

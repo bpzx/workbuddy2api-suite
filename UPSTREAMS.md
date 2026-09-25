@@ -23,18 +23,25 @@
 | 上游 | 仓库 | 分支 | Commit | 提交时间 | 快照位置 |
 |---|---|---|---|---|---|
 | wb2api | `Sliverkiss/workbuddy2api` ⚠️ **已删除** | `master` | `d1023f3` | 2026-09-21 09:52 | `vendor/wb2api` |
-| manager | [ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) | `main` | [`3fb56bd`](https://github.com/ithtelab/workbuddy-manager/commit/3fb56bd0) | 2026-09-20 19:48 | `vendor/manager` |
+| manager | [ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) | `main` | [`1a48761`](https://github.com/ithtelab/workbuddy-manager/commit/1a487612) | 2026-09-25 09:14 | `vendor/manager` |
 
 > wb2api 那一行**不再有可点的链接**：仓库已 404（见下节）。
 > 它是**我们开始自行维护时的起点**，不是"待同步的目标"。
 
 - wb2api：`Merge pull request #184 from .../fix/image-url-`（+764/−21，15 个文件）
   含图片 URL 修复、积分口径、成长任务链、WAF 403 处理等
-- manager：`docs: issue 回复的写法——与更新日志同一条规矩，配自检脚本与守卫`
-  （+6528/−269，55 个文件）**面板显示版本 v1.0.60**；期间跨 v1.0.58 / v1.0.59 /
-  v1.0.60 三个发版，含 `/v1/models` 按模型白名单裁剪、账号管理接口开关、
-  Responses API custom 工具桥接、token 续期、i18n 补齐（新增一条机械检查
-  `test_setting_field_concats_have_translations`）等
+- manager：`Merge PR #83: 仪表盘首屏如实呈现状态`（142 文件 / +18092 −455）
+  **面板显示版本 v1.0.70**；期间跨 **10 个发版**（v1.0.61~v1.0.70）：红包（批量生成
+  带额度的密钥 + 公开抽奖页）、作用域化 API Token、请求日志显示实际调用账号与
+  缓存命中、`thinking.type=adaptive`、账号备注、密钥列错位修复、仪表盘骨架/错误态、
+  模型中心按厂商资料区分原生文本与多模态等。
+  上游还在 v1.0.67 明确记录了「上游（wb2api）已停更」，并支持 `UPSTREAM_SRC`
+  本地源码安装 —— 与我们的"自行维护"判断一致。
+
+> **本次同步触发的锚点更新（1 处）**：`main.py` 导入块（上游新增 redpackets /
+> tokens 两个路由模块，收尾行变了）。预检测试在同步后**立刻**报出，正是它存在的
+> 意义。另注意上游新增了 `test_issue69_cache_tokens`，其中两个用例在 Windows 上
+> 与既有 `test_first_token` 一样报目录错误（已核实与我们的改动无关）。
 
 > 本次同步顺带修掉一处**配置模板漂移**（此前一直存在，非本次引入）：
 > 上游已 BREAKING 移除 `server.max_body_mb`（请求体改为无上限），而我们的

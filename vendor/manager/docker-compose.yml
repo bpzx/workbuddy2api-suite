@@ -39,6 +39,20 @@ services:
         # 官方 registry 国内访问慢且会断。
         #   docker compose build --build-arg NPM_REGISTRY=https://registry.npmmirror.com
         NPM_REGISTRY: ""
+        # 可选：镜像里要装 docker CLI（供容器内「重载上游 / 读上游日志 / 一键更新」用），
+        # 它的静态包固定从 download.docker.com 取——国外 CDN，国内实测很慢，
+        # 构建会长时间停在这一步。填国内镜像基址可绕开。
+        # 可选值：https://mirrors.aliyun.com/docker-ce / https://mirrors.tuna.tsinghua.edu.cn/docker-ce
+        DOCKER_CLI_BASE: ""
+        # 可选：compose 插件从 GitHub Releases 下载（官方地址国内会超时）。
+        # 用法是「加速前缀 + 原始 URL」，例如 https://ghfast.top/
+        COMPOSE_URL_PREFIX: ""
+        # 可选：子路径部署前缀（如 /workbuddy-manager）。留空 = 部署在根路径。
+        #
+        # 容器版的前端是**构建期**编译进镜像的，所以前缀必须在 build 时传进来；
+        # 与下面 environment 里的 WB_BASE_PATH 取值必须一致。
+        #   docker compose build --build-arg BASE_PATH=/workbuddy-manager
+        BASE_PATH: ""
     image: workbuddy-manager:latest
     container_name: workbuddy-manager
     # 这个 restart 策略是容器版「一键更新」能生效的前提：
@@ -52,6 +66,10 @@ services:
       #   - 同网络（推荐）：http://workbuddy2api:7863
       #   - 用宿主机 Docker 网关：http://host.docker.internal:7863
       WB2API_BASE: http://host.docker.internal:7863
+      # 可选：子路径部署前缀，必须与上面 build.args.BASE_PATH 完全一致（留空则都不填）。
+      # 服务端用它补回响应里漏掉的站内地址，并在反代保留前缀时把前缀剥掉。
+      # 详见 deploy/README.md 的「子路径部署」。
+      # WB_BASE_PATH: /workbuddy-manager
       # 反向代理在后面时，真实 IP 取自它覆盖写入的 X-Real-IP
       WB_TRUST_PROXY: "1"
       # 生产环境不暴露 /docs 与 /openapi.json

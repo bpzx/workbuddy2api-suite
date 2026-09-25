@@ -135,6 +135,56 @@ class ReplyCheckerBitesTest(unittest.TestCase):
             self.mod.check(draft, issue_text='点刷新后返回 404：POST /api/accounts/refresh failed'),
             [], '引用了报告原文却被拦下 —— 例外通道失效')
 
+    def test_env_vars_are_allowed(self) -> None:
+        """环境变量不算内部标识符 —— 规范明写「用户要动手的东西可以写」。
+
+        这里钉住的是**检查器自己的一个 bug**：它一度把 `WB_GATEWAY_RATE_PER_MIN`
+        这类环境变量也拦下来，而那正是用户必需的一步（回复里省掉它，用户就配不成）。
+        环境变量是全大写、内部标识符是小写蛇形/点号路径，按形状区分得开。
+
+        已知残留风险：内部的全大写常量（如 `RATE_MAX_PER_MIN`）会一起放行。
+        可接受——它极少出现在回复里，也不是这套规矩要治的毛病。
+        """
+        for text in ('设置 `WB_GATEWAY_RATE_PER_MIN` 后重启容器',
+                     '设置 WB_GATEWAY_RATE_PER_MIN 后重启容器',
+                     '用它提供的 `TW2A_API_KEY`'):
+            with self.subTest(text=text):
+                self.assertEqual(self.mod.check(text), [],
+                                 f'环境变量被误拦：{text}')
+
+    def test_internal_ids_still_caught_after_env_carveout(self) -> None:
+        """放行环境变量**不能**把内部标识符一起放过（否则守卫形同虚设）。"""
+        for text in ('修了 `_scope_models` 的判据',
+                     '走 `keysvc.model_allowed` 判定',
+                     '看 `server/main.py` 那行',
+                     '提交 `f20e6f9` 已包含'):
+            with self.subTest(text=text):
+                self.assertTrue(self.mod.check(text), f'内部标识符漏放了：{text}')
+
+    def test_ai_boilerplate_is_flagged(self) -> None:
+        """客套与模板腔要拦下（维护者反馈：「回复口吻不要太 ai」）。
+
+        这类句子对用户零信息量，还会把真话稀释掉。判据写进
+        docs/release-process.md 的「口吻：像维护者本人在说话，别像客服」。
+        """
+        for text in ('感谢您的反馈！已修复。',
+                     '希望这能帮助到您。',
+                     '如有任何疑问，请随时与我们联系。',
+                     '需要注意的是，该行为已改变。',
+                     '首先列出结论，其次说明步骤。',
+                     '给您带来不便，敬请谅解。'):
+            with self.subTest(text=text):
+                self.assertTrue(self.mod.check(text), f'模板腔漏放了：{text}')
+
+    def test_plain_voice_passes(self) -> None:
+        """人话版要放行 —— 这条规则**不能**把正常的技术说明也一起拦掉。"""
+        for text in ('修好了，1.0.63 里。',
+                     '只读账号现在跟管理员看到的是同一份积分，查不到时标「上游快照」。',
+                     '有问题再开。',
+                     '设 WB_SYNC_DEPLOY=0 就保持不动。'):
+            with self.subTest(text=text):
+                self.assertEqual(self.mod.check(text), [], f'误拦了正常回复：{text}')
+
     def test_urls_are_not_mistaken_for_paths(self) -> None:
         """URL 里的点号/斜杠不能被当成模块路径，否则每条带链接的回复都误报。"""
         self.assertEqual(self.mod.check('详见 https://github.com/ithtelab/workbuddy-manager/issues/46'), [])

@@ -175,8 +175,12 @@ def _resolve_key(request: Request):
     return None, (max(candidates, key=len) if candidates else '')
 
 
-def _authorize(request: Request, model: str | None) -> tuple[dict | None, str, JSONResponse | None]:
+def _authorize(request: Request, model: str | None, *,
+               mapped: str | None = None) -> tuple[dict | None, str, JSONResponse | None]:
     """完整鉴权：密钥 → 全局 IP 管控 → 密钥约束 → 限流。返回 `(key, ip, error)`。
+
+    mapped：`model` 经「模型映射」后的名字，版本归属判它（issue #47，
+    见 `keysvc.validate` 的说明）。与 `gateway._authorize` 同名同义。
 
     ⚠️ 这套检查与 `gateway._authorize` **必须保持同序同项**——同一把密钥在两个
     协议下得出不同结论是最难查的一类问题。之所以没直接复用：本层要遍历**多个
@@ -210,6 +214,9 @@ def _authorize(request: Request, model: str | None) -> tuple[dict | None, str, J
         )
         return None, ip, _err('API Key 无效', 401, 'authentication_error')
 
+    # 供记账用（IP 拦截早于下面的映射归一化，这里先算一份）
+    _mapped_for_log = gateway._map_model(model) if mapped is None else mapped
+
     sec = get_security_config()
     if sec.get('enabled'):
         rules = [
@@ -218,7 +225,7 @@ def _authorize(request: Request, model: str | None) -> tuple[dict | None, str, J
         ]
         if not iputil.evaluate(ip, rules, sec.get('mode', 'blacklist')):
             gateway._log_ip(ip, path, True, ua, 'ip_blocked')
-            gateway._record(key, ip, model or '', '', 403, 0, 0, 0, ua, 'IP 被拦截', False)
+            gateway._record(key, ip, model or '', _mapped_for_log or '', 403, 0, 0, 0, ua, 'IP 被拦截', False)
             return None, ip, _err(f'来源 IP {ip} 被安全策略拦截', 403, 'permission_error')
 
     # 注意：`blocked=False` 的这一行现在默认**不写库**（审计日志只留拦截，
@@ -226,14 +233,19 @@ def _authorize(request: Request, model: str | None) -> tuple[dict | None, str, J
     # 与 gateway 行为一致，不多一条分叉。
     gateway._log_ip(ip, path, False, ua)
 
+    # 映射只算一次：拒绝路径也要用它记账（口径见 gateway._authorize 的说明——
+    # 日志的 realm 按实际要用的那个名字归档，别名不带前缀，按请求名记会归错栏）。
+    mapped = gateway._map_model(model) if mapped is None else mapped
+
     # model 为 None 时按「模型发现类请求」处理：跳过版本与模型白名单
     # （没有 model 就无从判定版本），但停用/过期/配额/IP 这些照常校验。
-    reason = keysvc.validate(key, ip, model, is_model_list=(model is None))
+    reason = keysvc.validate(key, ip, model, is_model_list=(model is None),
+                             mapped_model=mapped)
     if reason:
         # 与 gateway._authorize 同口径：状态码来自 keysvc，不再一律 403
         # （403 会被客户端显示成「API 密钥无效」，掩盖真实原因）。
         status = getattr(reason, 'status', 403)
-        gateway._record(key, ip, model or '', '', status, 0, 0, 0, ua, reason, False)
+        gateway._record(key, ip, model or '', mapped or '', status, 0, 0, 0, ua, reason, False)
         # 也记进安全页的入站日志：走 /v1/messages 的客户端被拒时，此前在
         # 「IP 访问日志」里**完全看不到**（只有 gateway 那条路记），两套协议
         # 的审计口径不一致。原因码复用 gateway 的归类，避免两处写法漂移。
@@ -243,7 +255,7 @@ def _authorize(request: Request, model: str | None) -> tuple[dict | None, str, J
     limited, _count = gateway._rate_limited(key)
     if limited:
         msg = f'请求过于频繁（{gateway.RATE_WINDOW}s 内超过 {gateway.RATE_MAX_PER_MIN} 次）'
-        gateway._record(key, ip, model or '', '', 429, 0, 0, 0, ua, msg, False)
+        gateway._record(key, ip, model or '', mapped or '', 429, 0, 0, 0, ua, msg, False)
         gateway._log_ip(ip, path, True, ua, 'rate_limited')
         return None, ip, _err(msg, 429, 'rate_limit_error')
 
@@ -542,6 +554,15 @@ def _thinking_enabled(body: dict) -> bool:
     Anthropic 的形状是 `thinking: {'type': 'enabled', 'budget_tokens': N}`；
     关闭时客户端会写 `{'type': 'disabled'}` 或干脆不带这个字段。两种都算没启用。
 
+    **`adaptive` 同样算启用**：新版 Claude Code 对「模型自适应决定思考量」的模型
+    发 `{'type': 'adaptive', 'display': ...}`（无 `budget_tokens`）。而它判断一个
+    模型是否支持 adaptive 的依据是**模型名是否在它的官方能力表里**——本地网关
+    后面挂的 `cn:deepseek-v4-flash` 这类第三方模型名一律查不到，于是**全部**回落
+    到 `adaptive`。只认 `enabled` 会让这些请求的推理在网关这一跳被整段丢弃：
+    上游照常思考（`output_config.effort` 也照常传），但客户端一个 `thinking_delta`
+    都收不到，表现为「思考过程不可见、`thinking_tokens` 恒为 0」。
+    两种 type 对网关的语义相同——客户端能接受 thinking 块——因此都回。
+
     宽容处理**畸形值**：不是 dict、或缺 type，都按「没启用」—— 宁可少回一个
     thinking 块（客户端拿不到凭据时只是多花点 token 重新思考），也不要对着
     一个不认这种块的客户端硬塞。
@@ -549,7 +570,7 @@ def _thinking_enabled(body: dict) -> bool:
     think = body.get('thinking')
     if not isinstance(think, dict):
         return False
-    return str(think.get('type') or '').lower() == 'enabled'
+    return str(think.get('type') or '').lower() in ('enabled', 'adaptive')
 
 
 # Anthropic 的 `output_config.effort` → 上游 `reasoning_effort` 的档位映射。
@@ -958,7 +979,9 @@ async def messages(request: Request):
         return _err('缺少必填字段 max_tokens')
 
     # 鉴权：与 gateway._authorize 同一套检查、同一顺序（见该函数说明）
-    key, ip, auth_err = _authorize(request, model)
+    # 映射先算：版本归属判的是**映射后**的实际模型名（issue #47）
+    mapped = gateway._map_model(model)
+    key, ip, auth_err = _authorize(request, model, mapped=mapped)
     if auth_err:
         return auth_err
 
@@ -972,10 +995,9 @@ async def messages(request: Request):
     try:
         payload = to_openai_request(body)
     except Exception as exc:  # noqa: BLE001
-        gateway._record(key, ip, model, '', 400, 0, 0, 0, ua, str(exc), False)
+        gateway._record(key, ip, model, mapped or '', 400, 0, 0, 0, ua, str(exc), False)
         return _err(f'请求转换失败：{exc}')
 
-    mapped = gateway._map_model(model)
     if mapped:
         payload['model'] = mapped
     if stream:
@@ -997,11 +1019,13 @@ async def messages(request: Request):
                 usage = data.get('usage') or {}
             except Exception:  # noqa: BLE001
                 data = None
+            # 整份 usage 交过去（而不是只取 credit）：扣费与提示词缓存三段
+            # 都在这一份里，分开取就会出现「某条协议缓存永远是空的」（issue #69）。
             gateway._record(
                 key, ip, model, mapped or '', resp.status_code,
                 _as_int(usage.get('prompt_tokens')), _as_int(usage.get('completion_tokens')),
                 latency, ua, None if resp.status_code < 400 else str(data)[:500], False,
-                credit=gateway._usage_credit(usage),
+                usage=usage,
             )
             if resp.status_code >= 400:
                 msg = ''
@@ -1140,7 +1164,7 @@ async def messages(request: Request):
                 key, ip, model, mapped or '', status_code,
                 _as_int(usage.get('prompt_tokens')), _as_int(usage.get('completion_tokens')),
                 latency, ua, error_text, True,
-                credit=gateway._usage_credit(usage), first_token=first_token_ms,
+                usage=usage, first_token=first_token_ms,
             )
 
     return StreamingResponse(gen(), status_code=200, media_type='text/event-stream')
@@ -1183,7 +1207,10 @@ async def count_tokens(request: Request):
     # count_tokens 允许不带 model（那是常态），故 model 为 None 时按「模型发现
     # 类请求」处理：跳过版本与模型白名单，其余约束照常生效。
     model = body.get('model') if isinstance(body.get('model'), str) else None
-    _key, _ip, auth_err = _authorize(request, model)
+    # 同样是「映射先于鉴权」：客户端在发消息前先数 token，用的还是别名——
+    # 若这里按请求名判版本，配了别名映射的密钥会在这一步就被打回（issue #47）
+    _mapped = gateway._map_model(model)
+    _key, _ip, auth_err = _authorize(request, model, mapped=_mapped)
     if auth_err:
         return auth_err
 

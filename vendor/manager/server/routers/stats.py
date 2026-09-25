@@ -6,6 +6,7 @@ import time
 from fastapi import APIRouter, Depends
 
 from .. import db, security
+from ..services import wb2api
 
 router = APIRouter(prefix='/api/stats', tags=['stats'])
 
@@ -26,6 +27,12 @@ def _clamp_days(days: int | None, default: int) -> int:
 
 
 def _since(days: int) -> str:
+    """这段时间范围的**起始日期**（本地时区，含首日）。
+
+    语义是「近 N 天」且**含今天**：`days=1` 正好就是「今天一天」（起始日 = 今天），
+    `days=7` 是今天与前 6 天。所以界面上的「今日」传 1 就够，不必另开参数——
+    趋势图、按模型、按密钥三处与时段选择器因此天然同一口径（issue #53）。
+    """
     d = _clamp_days(days, 30)
     return time.strftime('%Y-%m-%d', time.localtime(time.time() - (d - 1) * 86400))
 
@@ -352,3 +359,19 @@ def by_key(days: int = 30, realm: str | None = None,
         }
         for r in rows
     ]
+
+
+@router.get('/upstream')
+async def upstream_stats(user: dict = Depends(security.current_user)) -> dict:
+    """上游自己那份统计（`/v1/stats`，issue #59）。
+
+    **口径与这一页其它数字不同，界面上必须分开摆**：本页的汇总 / 趋势 / 按模型 /
+    按密钥都来自本网关的库、只含经过本网关的调用、且跟时段选择器走；这里返回的是
+    上游进程自己的累计（含**直连 7863** 的调用），并且是从上游启动算起，没有时段
+    可言。用户要看「原有那把密钥用了多少」只能从这里看——那把密钥直连上游，
+    本网关看不见它。
+
+    取不到时返回 `available=False` 与原因（上游没起来 / 版本太旧没这个端点 /
+    api_key 不一致），界面据此说明，而不是显示一片空白让人以为「用量是 0」。
+    """
+    return await wb2api.get_upstream_stats()

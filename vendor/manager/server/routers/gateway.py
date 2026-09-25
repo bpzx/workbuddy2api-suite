@@ -145,19 +145,33 @@ RATE_MAX_PER_MIN = _env_int('WB_GATEWAY_RATE_PER_MIN', 120)
 
 
 def _rate_limited(key: dict) -> tuple[bool, int]:
-    """返回 (是否限流, 当前窗口内计数)。"""
+    """返回 (是否限流, 窗口内计数)。
+
+    **只有放行的请求才占用窗口额度**（issue #52）。此前不分放行与拒绝一律
+    `append()`，被拒的请求同样计入，于是与客户端重试构成正反馈：客户端以高于
+    阈值的速率持续重试时，窗口计数永远降不回阈值以下，表现为「凑满一窗之后
+    持续全拒、永不恢复」——限流器本该限速，却变成了熔断。
+
+    现在的语义是「滑动窗口内**放行**了多少次」：超出的请求被拒且不占额度，
+    因此客户端把速率降到阈值以下能立刻恢复，保持高于阈值则稳定放行到上限
+    （多余的被拒，不会雪崩）。放行数上限仍是 `RATE_MAX_PER_MIN`。
+    """
     kid = int(key['id'])
     if RATE_MAX_PER_MIN <= 0:
         return False, 0
     now = time.time()
     hits = [t for t in _rate.get(kid, []) if now - t < RATE_WINDOW]
-    hits.append(now)
+    limited = len(hits) >= RATE_MAX_PER_MIN
+    if not limited:
+        hits.append(now)
+    # 拒绝的分支也要回写：窗口内已过期的记录要顺手清掉，否则长期被限的密钥
+    # 会一直拖着一串陈旧时间戳（金额上限看不出问题，但内存是白占的）。
     _rate[kid] = hits
     # 顺带清理过期键，避免长期运行后字典无限增长
     if len(_rate) > 2000:
         for k in [k for k, v in _rate.items() if not v or now - v[-1] > RATE_WINDOW]:
             _rate.pop(k, None)
-    return len(hits) > RATE_MAX_PER_MIN, len(hits)
+    return limited, len(hits)
 
 
 def _log_ip(ip: str, path: str, blocked: bool, ua: str | None,
@@ -239,11 +253,45 @@ def _usage_credit(usage: dict | None) -> float | None:
     return val if val >= 0 else None
 
 
-def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt: int, ct: int, latency: int, ua: str | None, error: str | None, stream: bool, *, credit: float | None = None, first_token: int | None = None) -> None:
+def _usage_cache(usage: dict | None) -> tuple[int | None, int | None, int | None]:
+    """从 usage 里取提示词缓存的三段 token（issue #69）。
+
+    腾讯在流式末帧 usage 里给 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`
+    / `prompt_cache_write_tokens`；**上游自己的缓存统计就是从这三个字段来的**
+    （其 `/v1/stats` 的 cache_hit_rate 同源），所以我们不必自己估算。
+
+    三个都要能区分「没给」与「给了 0」：老上游不给 = None（界面上显示「—」），
+    给了 0 = 这次真的没命中缓存。混为一谈会让用户以为缓存生效了。
+    """
+
+    def _one(name: str) -> int | None:
+        if not isinstance(usage, dict):
+            return None
+        raw = usage.get(name)
+        # bool 是 int 的子类，`True` 不能当成 1 个 token
+        if raw is None or isinstance(raw, bool):
+            return None
+        try:
+            val = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return val if val >= 0 else None
+
+    return (_one('prompt_cache_hit_tokens'),
+            _one('prompt_cache_miss_tokens'),
+            _one('prompt_cache_write_tokens'))
+
+
+def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt: int, ct: int, latency: int, ua: str | None, error: str | None, stream: bool, *, credit: float | None = None, first_token: int | None = None, usage: dict | None = None) -> None:
     """记录调用日志与用量。
 
     credit 为上游返回的真实扣费（usage.credit）。None 表示上游没给，
     与「扣了 0」是两回事，因此用 NULL 存而不是 0。
+
+    `usage` 可以直接把上游那份 usage 传进来：扣费与**提示词缓存三段**都从它里面取
+    （issue #69）。之所以整份传进来而不是在各调用点各取一遍——四条协议路径
+    （chat 流式/非流式、Responses、Anthropic）都各自有一份 usage，分开取迟早漏一处，
+    而漏的表现是「某个协议的缓存统计永远是空的」。传 `credit` 仍然有效（显式值优先）。
 
     first_token 为首字延迟（毫秒）。None 表示未采集到：非流式请求本来就没有
     中间过程，历史记录也没这个值，因此同样用 NULL 存，而不是 0。
@@ -252,9 +300,17 @@ def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt:
     （曾因统计函数缺失导致流式响应在收尾阶段中断，客户端看到
     内容正常但报 terminated）。因此这里整体兜底。
     """
+    if credit is None:
+        credit = _usage_credit(usage)
+    cache_hit, cache_miss, cache_write = _usage_cache(usage)
+
     try:
-        # realm 由**请求的模型名**判定（上游按 `cn:` / `global:` 前缀路由）：
+        # realm 由**实际发往上游的模型名**判定（上游按 `cn:` / `global:` 前缀路由）：
         # 它决定这次调用实际走了哪个账号池，也是界面按版本切换日志/统计的依据。
+        #
+        # 有「模型映射」时判**映射后**的名字（issue #47）：请求名可能是个别名，
+        # 别名本身不带前缀，按它判会把一次真实的国际版调用记成国内版，界面按
+        # 版本筛选时这条就跑到另一栏去了。没有映射时 mapped 为空，判请求名。
         #
         # **所有外部来源的文本都要清洗 + 截断**（`db._clean`）：
         #   * `model` 来自请求体，长度无上限。此前一个 1 MiB 的 model 会被写进
@@ -265,7 +321,7 @@ def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt:
         #     在日志页伪造出额外行，污染排查。
         # 清洗只影响入库文本，**不影响转发给上游的内容**（body 早已发走）。
         model_clean = db._clean(model, 128)
-        realm = db.realm_of_model(model_clean)
+        realm = db.realm_of_model(db._clean(mapped, 128) or model_clean)
         db.add_request_log(
             ts=int(time.time()),
             key_id=key['id'] if key else None,
@@ -282,6 +338,9 @@ def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt:
             stream=1 if stream else 0,
             credit=credit,
             realm=realm,
+            cache_hit_tokens=cache_hit,
+            cache_miss_tokens=cache_miss,
+            cache_write_tokens=cache_write,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning('写入请求日志失败（不影响请求）: %s', exc)
@@ -300,8 +359,15 @@ def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt:
 
 
 def _authorize(request: Request, model: str | None,
-               *, is_model_list: bool = False) -> tuple[dict | None, str, JSONResponse | None]:
-    """返回 (key, ip, error_response)。"""
+               *, is_model_list: bool = False,
+               mapped: str | None = None) -> tuple[dict | None, str, JSONResponse | None]:
+    """返回 (key, ip, error_response)。
+
+    mapped：`model` 经「模型映射」后的名字。**默认在这里算**，因为版本归属判的
+    是映射后的名字（issue #47，见 `keysvc.validate`）——调用方算好了可以传进来
+    省一次设置读取，但漏传不会退回旧行为。调用方仍要自己再算一次用于改写 body
+    （或把这里的算法抽出去共用）。
+    """
     ip = iputil.client_ip(request)
     ua = request.headers.get('user-agent')
     path = request.url.path
@@ -318,6 +384,13 @@ def _authorize(request: Request, model: str | None,
         _log_ip(ip, path, True, ua, 'invalid_key')
         return None, ip, _oai_error('API Key 无效', 401, 'authentication_error', 'invalid_api_key')
 
+    # 映射只算一次，后面三处拒绝路径都要用它记账（见下）。
+    # 为什么拒绝路径也要传：日志的 `realm` 按**实际要用的那个名字**归档（issue #47
+    # 的统一口径）。别名不带 `global:` 前缀，若拒绝路径按请求名归档，一次「别名指向
+    # 国际版、却被国内版密钥拒绝」的记录会落在国内版栏目里——按版本筛日志的人会看到
+    # 一条本不该在那儿的记录，且看不出它原本指向国际版。
+    mapped = _map_model(model) if mapped is None else mapped
+
     # 全局入站 IP 规则
     sec = get_security_config()
     if sec.get('enabled'):
@@ -327,19 +400,21 @@ def _authorize(request: Request, model: str | None,
         ]
         if not iputil.evaluate(ip, rules, sec.get('mode', 'blacklist')):
             _log_ip(ip, path, True, ua, 'ip_blocked')
-            _record(key, ip, model or '', '', 403, 0, 0, 0, ua, 'IP 被拦截', False)
+            _record(key, ip, model or '', mapped or '', 403, 0, 0, 0, ua, 'IP 被拦截', False)
             return None, ip, _oai_error(f'来源 IP {ip} 被安全策略拦截', 403, 'permission_error', 'ip_blocked')
 
     # 注意这一行**在密钥校验之前**：密钥层面的拒绝（停用 / 过期 / 配额用尽 /
     # 模型与版本不符 / IP 白名单）发生在这之后，若就这样返回，日志里会显示
     # 「已放行」而请求其实失败了 —— 用户对着「已放行」找问题，方向直接跑偏。
     # 因此校验失败时改写这一行为拦截（见下），放行时才落「已放行」。
-    reason = keysvc.validate(key, ip, model, is_model_list=is_model_list)
+    reason = keysvc.validate(key, ip, model, is_model_list=is_model_list,
+                             mapped_model=mapped)
     if reason:
         # 状态码由 keysvc 决定，不再一律 403：一批客户端（DeepSeek Harness 等）
         # 把 401/403 统一显示成「API 密钥无效」，一律 403 会把「密钥版本不匹配」
         # 这种配置问题说成密钥坏了，用户便反复重建密钥（issue #18）。
-        _record(key, ip, model or '', '', getattr(reason, 'status', 403), 0, 0, 0, ua, reason, False)
+        _record(key, ip, model or '', mapped or '',
+                getattr(reason, 'status', 403), 0, 0, 0, ua, reason, False)
         _log_ip(ip, path, True, ua, _key_reject_code(reason, is_model_list))
         return None, ip, _oai_error(
             reason,
@@ -351,7 +426,7 @@ def _authorize(request: Request, model: str | None,
     limited, count = _rate_limited(key)
     if limited:
         msg = f'请求过于频繁（{RATE_WINDOW}s 内超过 {RATE_MAX_PER_MIN} 次）'
-        _record(key, ip, model or '', '', 429, 0, 0, 0, ua, msg, False)
+        _record(key, ip, model or '', mapped or '', 429, 0, 0, 0, ua, msg, False)
         _log_ip(ip, path, True, ua, 'rate_limited')
         return None, ip, _oai_error(msg, 429, 'rate_limit_error', 'rate_limit_exceeded')
 
@@ -373,9 +448,17 @@ def _key_reject_code(reason: object, is_model_list: bool) -> str:
 
 
 def _map_model(model: str | None) -> str | None:
+    """「模型映射」查表：别名 → 真名；没有映射时原样返回。
+
+    设置坏掉（存成了非对象）时按「没有映射」处理，**不能让整个网关 5xx**：
+    映射是可选的便利功能，坏数据只该影响它自己那一项，不连坐（与
+    `db._json_list` 对非法 JSON 列的处理同一原则）。
+    """
     if not model:
         return model
     mapping = db.get_setting('model_map', {}) or {}
+    if not isinstance(mapping, dict):
+        return model
     return mapping.get(model, model)
 
 
@@ -570,11 +653,13 @@ async def _chat(request: Request, upstream_path: str):
     # 这里直接拒掉，也顺带让模型白名单的判定有确定的输入。
     if requested_model is not None and not isinstance(requested_model, str):
         return _oai_error('model 必须是字符串', 400, 'invalid_request_error', 'invalid_model')
-    key, ip, err = _authorize(request, requested_model)
+    # 映射**先于鉴权**：版本归属判的是实际要用的名字（issue #47），配了
+    # 「别名 → 带前缀的真名」的密钥此前会被 realm 检查当成错版本打回。
+    mapped = _map_model(requested_model)
+    key, ip, err = _authorize(request, requested_model, mapped=mapped)
     if err:
         return err
 
-    mapped = _map_model(requested_model)
     if mapped:
         body['model'] = mapped
 
@@ -605,7 +690,7 @@ async def _chat(request: Request, upstream_path: str):
             error = None if resp.status_code < 400 else (str(data)[:500] if data is not None else resp.text[:500])
             _record(
                 key, ip, requested_model or '', mapped or '', resp.status_code, pt, ct,
-                latency, ua, error, False, credit=_usage_credit(usage),
+                latency, ua, error, False, usage=usage,
             )
             if data is not None:
                 return JSONResponse(data, status_code=resp.status_code)
@@ -661,7 +746,7 @@ async def _chat(request: Request, upstream_path: str):
             ct = int(usage.get('completion_tokens') or 0)
             _record(
                 key, ip, requested_model or '', mapped or '', status_code, pt, ct,
-                latency, ua, error_text, True, credit=_usage_credit(usage),
+                latency, ua, error_text, True, usage=usage,
                 first_token=first_token_ms,
             )
 

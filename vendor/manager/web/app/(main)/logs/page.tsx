@@ -43,6 +43,44 @@ import {
 
 const PAGE_SIZE = 20;
 
+/**
+ * 本次请求的缓存命中率（issue #69）。
+ *
+ * 口径取 **hit / (hit + miss)** —— 与上游自己 `/v1/stats` 的 cache_hit_rate 一致
+ * （两者同源：腾讯在末帧 usage 里给的三个字段）。不拿 `prompt_tokens` 当分母：
+ * 它含工具定义等不一定参与缓存的部分，算出来的比例会比实际低，用户会以为缓存没生效。
+ *
+ * 分母为 0（只有 hit 没有 miss，或两者都 0）时返回 100% —— 命中数大于 0 才调这里。
+ */
+function cachePct(l: RequestLog): string {
+  const hit = l.cache_hit_tokens ?? 0;
+  const miss = l.cache_miss_tokens ?? 0;
+  if (hit + miss <= 0) return '100';
+  return String(Math.round((hit / (hit + miss)) * 100));
+}
+
+/**
+ * 账号列（issue #69）：上游日志里的形状是 `昵称(uid8)`。
+ *
+ * 拆开显示是为了两件事都好办：昵称给人看（「这几次都落在张叔叔那个号上」），
+ * uid 用于和账号页/上游日志对齐（重名的账号靠它区分）。
+ * 对不上这个形状时原样显示——上游改格式我们也不该丢信息。
+ */
+function AccountCell({account}: {account: string | null}) {
+  if (!account) {
+    return <span className="text-muted-foreground/50">—</span>;
+  }
+  const m = account.match(/^(.*?)\(([^()]*)\)$/);
+  return (
+    <>
+      <span>{m ? m[1] : account}</span>
+      {m && m[2] && (
+        <span className="ml-1 font-mono text-[10px] text-muted-foreground">{m[2]}</span>
+      )}
+    </>
+  );
+}
+
 export default function LogsPage() {
   const t = useT();
   const {isAdmin} = useAuth();
@@ -215,6 +253,7 @@ export default function LogsPage() {
               <TableHead className="pl-4 text-[11px] text-muted-foreground">{t('logs.colTime')}</TableHead>
               <TableHead className="text-[11px] text-muted-foreground">{t('nav.keys')}</TableHead>
               <TableHead className="text-[11px] text-muted-foreground">IP</TableHead>
+              <TableHead className="text-[11px] text-muted-foreground">{t('logs.colAccount')}</TableHead>
               <TableHead className="text-[11px] text-muted-foreground">{t('nav.models')}</TableHead>
               <TableHead className="text-[11px] text-muted-foreground">{t('accounts.colStatus')}</TableHead>
               <TableHead className="text-[11px] text-muted-foreground">{t('logs.colFirstToken')}</TableHead>
@@ -233,6 +272,12 @@ export default function LogsPage() {
                 <TableCell className="pl-4 text-xs text-muted-foreground">{fmtDateTimeMarked(l.ts)}</TableCell>
                 <TableCell className="text-xs">{l.key_name || '—'}</TableCell>
                 <TableCell className="font-mono text-xs text-muted-foreground">{l.ip}</TableCell>
+                {/* 本次用的上游账号（issue #69）。账号由上游选、不在响应里回传，
+                    这一列是采集它的容器日志后按时间对回来的——比请求晚几秒，
+                    所以刚打完的请求可能还是「—」，稍后刷新就有。 */}
+                <TableCell className="text-xs">
+                  <AccountCell account={l.account} />
+                </TableCell>
                 <TableCell className="text-xs">
                   {l.model || '—'}
                   {l.mapped_model && l.mapped_model !== l.model && (
@@ -276,6 +321,27 @@ export default function LogsPage() {
                     <span className="text-muted-foreground/70">—</span>
                   )}
                   {l.stream && <span className="ml-1 text-[10px] text-muted-foreground">{t('logs.streamShort')}</span>}
+                  {/* 提示词缓存（issue #69）：用户靠这条判断「缓存到底有没有起作用」。
+                      上游没返回这三个字段时整块不显示（而不是显示 0%）——
+                      与「确实没命中」不是一回事。 */}
+                  {typeof l.cache_hit_tokens === 'number' ? (
+                    <span
+                      className={
+                        'ml-1 text-[10px] ' +
+                        (l.cache_hit_tokens > 0
+                          ? 'text-emerald-600 dark:text-emerald-400'
+                          : 'text-amber-600 dark:text-amber-400')
+                      }
+                      title={t('logs.cacheTitle', {
+                        hit: fmtNumber(l.cache_hit_tokens),
+                        miss: fmtNumber(l.cache_miss_tokens ?? 0),
+                      })}
+                    >
+                      {l.cache_hit_tokens > 0
+                        ? t('logs.cacheShort', {pct: cachePct(l)})
+                        : t('logs.cacheMissShort')}
+                    </span>
+                  ) : null}
                 </TableCell>
                 <TableCell className="pr-4 text-xs tabular-nums">
                   {typeof l.credit === 'number' ? (
@@ -338,6 +404,7 @@ export default function LogsPage() {
               {([
                 ['ip', t('logs.rowIp'), detail.ip],
                 ['key', t('logs.rowKey'), detail.key_name || '—'],
+                ['account', t('logs.rowAccount'), detail.account || t('logs.notCollected')],
                 ['model', t('logs.rowModel'), detail.model || '—'],
                 ['mapped', t('logs.rowMappedModel'), detail.mapped_model || '—'],
                 ['status', t('logs.rowStatus'), String(detail.status)],
@@ -351,6 +418,29 @@ export default function LogsPage() {
                 ['latency', t('logs.rowLatency'), fmtLatency(detail.latency_ms)],
                 ['promptTokens', 'Prompt Token', fmtNumber(detail.prompt_tokens)],
                 ['completionTokens', 'Completion Token', fmtNumber(detail.completion_tokens)],
+                // 提示词缓存三段（issue #69）。null 显示「未采集」而不是 0：
+                // 老上游不返回这三个字段，显示 0 会让人以为缓存从未生效。
+                [
+                  'cacheHit',
+                  t('logs.rowCacheHit'),
+                  detail.cache_hit_tokens != null
+                    ? fmtNumber(detail.cache_hit_tokens)
+                    : t('logs.notCollected'),
+                ],
+                [
+                  'cacheMiss',
+                  t('logs.rowCacheMiss'),
+                  detail.cache_miss_tokens != null
+                    ? fmtNumber(detail.cache_miss_tokens)
+                    : t('logs.notCollected'),
+                ],
+                [
+                  'cacheWrite',
+                  t('logs.rowCacheWrite'),
+                  detail.cache_write_tokens != null
+                    ? fmtNumber(detail.cache_write_tokens)
+                    : t('logs.notCollected'),
+                ],
                 [
                   'credit',
                   t('logs.rowCredit'),

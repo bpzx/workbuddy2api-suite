@@ -223,6 +223,25 @@ class ChangelogIsUserFacingTest(unittest.TestCase):
         self.assertGreater(len(secs), 10, '没切出版本段落，守卫会空转')
         self.assertIn('1.0.49', [v for v, _ in secs])
 
+    def test_no_content_before_the_first_version_heading(self) -> None:
+        """第一个 `## [版本]` 之前不能有**条目**（审查发现的空档）。
+
+        为什么需要：切段是按 `## [x.y.z]` 分的，于是**标题之前**的内容不属于任何
+        段落 —— 上面几条检查全都看不到它，写了等于没写。实测就这么漏过一次：
+        加条目时替换字符串把 `## [未发布]` 那行一起吞了，两段条目挂在文件顶部没有
+        任何版本归属，而守卫全绿。
+
+        （文件头部的说明文字允许存在：它在第一个 `---` 之前，这里只看分隔线之后。）
+        """
+        head = self.text.split('\n---\n', 1)[0]
+        body = self.text[len(head):]
+        before = body.split('\n## [', 1)[0]
+        loose = [ln for ln in before.splitlines()
+                 if ln.startswith(('- ', '### ')) or re.match(r'^\d+\.\s', ln)]
+        self.assertEqual(loose, [],
+                         '第一个版本标题之前出现了条目/小节 —— 它们不属于任何版本段落：'
+                         + '; '.join(loose[:3]))
+
     def test_no_internal_identifiers(self) -> None:
         """不得出现函数名、模块路径、下划线开头的内部名。"""
         bad = re.compile(

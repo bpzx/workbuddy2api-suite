@@ -33,6 +33,19 @@ export interface Account {
    * 账号级冷却时间不足以表达，故逐条列出。
    * 字段名照上游 /status 的 JSON：model / until / reset_at / reason。
    */
+  /**
+   * 本端给这个账号写的备注（issue #67）。按 uid 存在本端库里，不在上游账号文件里，
+   * 所以临时停用（改文件名）不会丢。没有备注时是空串（不是缺字段）。
+   */
+  note?: string;
+  /**
+   * 今天成功签到的时刻（epoch 秒）；null / 缺省 = 今天还没签。
+   *
+   * 判定依据是本端签到记录（腾讯对「今天已签过」回 10001，我们照记成功），
+   * 所以它同时代表「本面板签过」与「今天已签到」。界面据此把签到按钮变成
+   * 已签到态，避免重复点击（详见 server/routers/accounts.py 的 `_today_start`）。
+   */
+  checkin_today?: number | null;
   rate_limited_models?: {
     model: string;
     /** 该模型的冷却截止（已被 soft_rate_max 截断） */
@@ -203,8 +216,13 @@ export interface CatalogModel {
   reasoning_summary?: string;
   /** 默认推理档位；空串 = 上游未声明（由上游自行回退到硬编码默认） */
   default_effort: string;
-  /** 是否支持图片输入（多模态） */
-  supports_images: boolean;
+  /** 平台声明的图片输入能力；null 表示未知或冲突，不代表模型原生多模态 */
+  supports_images: boolean | null;
+  native_modality?: 'text' | 'multimodal' | 'router' | 'unknown';
+  native_modality_source?: string;
+  native_modality_verified_at?: string;
+  image_input_conflict?: boolean;
+  image_input_sources?: Record<string, boolean | null>;
   /** 系列归属（按 id 前缀推导，仅用于分组浏览） */
   series: string;
 }
@@ -273,10 +291,45 @@ export interface ApiKey {
    */
   quota_credit: number;
   used_credit: number;
+  /**
+   * 来源红包的 id；null = 手工建的。
+   *
+   * 密钥列表按它分成两个 tab：红包一次生成一批、额度零碎，与手工建的混在
+   * 一起很难看（也从没人会去逐把编辑红包发出去的密钥）。
+   */
+  packet_id: number | null;
   created_at: number;
   last_used_at: number | null;
   /** 仅在创建时返回一次 */
   key?: string;
+}
+
+/**
+ * 管理面**作用域化 API Token**（见 docs/api-tokens.md）。
+ *
+ * 与上面那把网关密钥（`ApiKey`）是**两套东西**：`ApiKey` 只授权模型调用；
+ * 本类型授权的是管理接口 `/api/*`，供脚本 / CI 免登录调用。
+ */
+export interface ApiToken {
+  id: number;
+  name: string;
+  /** 明文前 12 字符，用于展示与识别（明文本身不会再回传） */
+  prefix: string;
+  /** 权限：只读 / 管理员（角色由它决定） */
+  scope: 'readonly' | 'admin';
+  enabled: boolean;
+  /** 到期时刻（epoch 秒）；null = 永不过期 */
+  expires_at: number | null;
+  created_at: number;
+  /** 创建者用户名（审计用） */
+  created_by: string;
+  last_used_at: number | null;
+  last_used_ip: string | null;
+}
+
+/** 创建令牌的返回：比 ApiToken 多一个**仅此一次**的明文字段。 */
+export interface CreatedApiToken extends ApiToken {
+  token: string;
 }
 
 export interface RequestLog {
@@ -298,11 +351,30 @@ export interface RequestLog {
    * 反映不出上游响应快慢；首字延迟才是「上游多久开始回话」。
    */
   first_token_ms: number | null;
+  /**
+   * 提示词缓存的三段 token（issue #69）：上游（腾讯）在流式末帧 usage 里给。
+   * **null = 上游没给这三个字段**（老上游），与「给了 0」不是一回事——
+   * 后者代表这次请求确实没命中缓存。界面据此显示「—」而不是 0%。
+   *
+   * 前缀缓存是**按账号**存的，所以「换了号」与「没命中」常常一起出现，
+   * 与下面那个 account 列对着看才有意义。
+   */
+  cache_hit_tokens: number | null;
+  cache_miss_tokens: number | null;
+  cache_write_tokens: number | null;
   ua: string | null;
   error: string | null;
   stream: boolean;
   /** 本次调用的真实扣费（上游 usage.credit）；null = 上游未返回，不是 0 */
   credit: number | null;
+  /**
+   * 本次实际用了哪个上游账号，形如 `昵称(uid8)`。
+   *
+   * 账号由上游决定、不在响应里回传，本端是**采集上游容器日志后按时间对回来的**，
+   * 所以比请求本身晚几秒——刚打完的请求这一列可能还是 null（界面显示「—」，
+   * 稍后刷新即有）。null 也可能是「日志已滚掉」或「上游没在跑容器」。
+   */
+  account: string | null;
 }
 
 export interface UsagePoint {
@@ -750,4 +822,142 @@ export interface AuditLog {
 export interface AuditLogPage {
   items: AuditLog[];
   total: number;
+}
+
+/**
+ * 上游自己那份统计（`/v1/stats`，issue #59）。
+ *
+ * 字段名照上游 JSON。**口径与面板的用量统计不同**：这份含直连上游的调用，
+ * 且自上游进程启动累计——界面必须标注清楚，别与按时段统计的数字混着看。
+ */
+export interface UpstreamStatRow {
+  model?: string;
+  requests?: number;
+  success?: number;
+  failed?: number;
+  total_tokens?: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  credit?: number;
+  cache_hit_rate?: number;
+}
+
+export interface UpstreamStats {
+  /** 取不到时为 false，此时只有 error */
+  available: boolean;
+  error?: string;
+  /** 上游可关闭统计采集；关闭时 enabled=false 且 message 说明原因 */
+  enabled?: boolean;
+  message?: string;
+  since?: string;
+  uptime_sec?: number;
+  total?: UpstreamStatRow;
+  models?: UpstreamStatRow[];
+}
+
+/* ── 红包：一次建一批带额度的密钥，管理员自己分发 ──────────
+ * 见 server/redpacket.py 的模块说明（为什么不做领取页/分享码）。 */
+
+/**
+ * 额度类别。两者**限制的对象不同**，不只是单位不同：
+ * credit 限制上游返回的真实扣费（口径准）；token 限制 token 总数（直观）。
+ */
+export type RedPacketKind = 'credit' | 'token';
+
+/** 分配方式：lucky = 拼手气（有人多有人少），even = 均分 */
+export type RedPacketMode = 'lucky' | 'even';
+
+export interface RedPacket {
+  id: number;
+  title: string;
+  quota_kind: RedPacketKind;
+  total_amount: number;
+  shares: number;
+  mode: RedPacketMode;
+  /**
+   * 限定的模型范围。**token 红包非空、积分红包恒为空**（两类规则相反，见
+   * server/redpacket.py 的 validate）：token 是「量」与模型强相关，
+   * 积分是「钱」任何模型都能用。
+   */
+  models: string[];
+  /**
+   * 抽奖码 —— 拼出分享链接用。**它是凭据**：拿到就能抽走一份，
+   * 所以只在管理端接口下发，不要贴到公开场合。
+   */
+  code: string;
+  created_by: string;
+  created_at: number;
+  expires_at: number;
+  /** 已被抽走的份数（抽奖式红包看的就是这个进度） */
+  claimed: number;
+  /** 整批都已停用 = 已收回（部分停用不算，那种情况去密钥页看单把） */
+  revoked: boolean;
+}
+
+/** 红包里的一份（= 一个密钥）。**不含明文** —— 库里只有哈希。 */
+export interface RedPacketItem {
+  key_id: number;
+  prefix: string;
+  amount: number;
+  enabled: boolean;
+  used_tokens: number;
+  used_credit: number;
+}
+
+export interface RedPacketDetail extends RedPacket {
+  items: RedPacketItem[];
+}
+
+/**
+ * 创建红包的结果：含**明文 key**，且**仅此一次**（与 keyApi.create 同理）。
+ *
+ * 界面上必须提示「离开后无法再看到」并提供复制/导出 —— 这是「直接发 key」
+ * 方案的固有代价，不是缺陷。
+ */
+/** 抽奖页的元信息。**不含密钥** —— 没点「开启」之前不该能拿到。 */
+export interface ClaimInfo {
+  title: string;
+  quota_kind: RedPacketKind;
+  shares: number;
+  /** 还剩几份 */
+  left: number;
+  models: string[];
+  expires_at: number;
+  expired: boolean;
+  /** 本机（IP）是不是已经抽过了 */
+  claimed: boolean;
+  /**
+   * 本机领到的那一份（没领过时为 null）。
+   *
+   * 第二次打开时会**直接展示**：关掉弹窗才想起没存密钥是很常见的，而明文
+   * 只显示那一次 —— 刷新就能找回来，比「请联系发红包的人」有用。
+   * 代价是同一 NAT 出口下的人能看到彼此的那份（红包的熟人场景下可接受）。
+   */
+  my_amount: number | null;
+  my_key: string | null;
+}
+
+/** 抽到的那一份。`key` 是**明文**，只在抽的这一刻返回。 */
+export interface DrawResult {
+  amount: number;
+  quota_kind: RedPacketKind;
+  models: string[];
+  key: string;
+  expires_at: number;
+}
+
+export interface CreatedRedPacket {
+  id: number;
+  title: string;
+  quota_kind: RedPacketKind;
+  total_amount: number;
+  shares: number;
+  mode: RedPacketMode;
+  /** 同上：token 红包非空、积分红包恒为空 */
+  models: string[];
+  /** 抽奖码 —— 拼分享链接用（仅此一次能拿到，之后详情接口还会给） */
+  code: string;
+  created_at: number;
+  expires_at: number;
+  keys: ApiKey[];
 }

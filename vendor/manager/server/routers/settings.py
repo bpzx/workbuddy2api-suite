@@ -21,7 +21,7 @@ def get_upstream(user: dict = Depends(security.current_user)) -> dict:
 
 @router.post('/settings/upstream')
 async def save_upstream(body: dict, request: Request,
-                        user: dict = Depends(security.require_admin)) -> dict:
+                        user: dict = Depends(security.require_session_admin)) -> dict:
     # 必须是 async：同步路由会被 FastAPI 放进线程池执行，那里没有事件循环，
     # 无法调度后台重载任务（request_restart 将拿不到 running loop）。
     try:
@@ -45,7 +45,7 @@ async def save_upstream(body: dict, request: Request,
         result['reload_scheduled'] = False
         result['reload_hint'] = (
             '配置已写入，但当前环境无法操作 docker，不会自动重启上游容器。'
-            '请在宿主机执行 docker compose restart wbapi（上游目录下）使其生效。'
+            '请在宿主机执行 docker compose restart wb2api（上游目录下）使其生效。'
         )
     return result
 
@@ -70,8 +70,13 @@ async def test_upstash(body: UpstashTestIn, user: dict = Depends(security.requir
 
 
 @router.post('/settings/upstash/reload')
-async def reload_upstream(user: dict = Depends(security.require_admin)) -> dict:
-    """立即重启上游容器（等待结果）。一般无需手动调用——保存配置会自动重载。"""
+async def reload_upstream(user: dict = Depends(security.require_session_admin)) -> dict:
+    """立即重启上游容器（等待结果）。一般无需手动调用——保存配置会自动重载。
+
+    与会话绑定：它和 `/api/restart` 是**同一个动作**（都走 `reload.restart_now()`），
+    后者在引入 API Token 时被划为「仅会话」。同一个动作不能因为走的是哪个路由就
+    权限不同——否则 token 泄露者能从这里把上游重启掉，那条边界就形同虚设。
+    """
     ok, message = await reload.restart_now()
     return {'ok': ok, 'message': message}
 
@@ -112,7 +117,7 @@ def list_users(user: dict = Depends(security.current_user)) -> list[dict]:
 
 @router.post('/users')
 def add_user(body: UserIn, request: Request,
-             user: dict = Depends(security.require_admin)) -> dict:
+             user: dict = Depends(security.require_session_admin)) -> dict:
     """新建管理用户。
 
     审计是必须的：上次入侵里攻击者正是「先建自己的账号、再正常登录」，
@@ -138,7 +143,7 @@ def add_user(body: UserIn, request: Request,
 
 @router.patch('/users/{username}')
 def update_user(username: str, body: UserPatch, request: Request,
-                user: dict = Depends(security.require_admin)) -> dict:
+                user: dict = Depends(security.require_session_admin)) -> dict:
     """改密码 / 改角色。
 
     两种改动都必须**吊销该用户既有会话**：
@@ -194,7 +199,7 @@ def update_user(username: str, body: UserPatch, request: Request,
 
 @router.delete('/users/{username}')
 def delete_user(username: str, request: Request,
-                user: dict = Depends(security.require_admin)) -> dict:
+                user: dict = Depends(security.require_session_admin)) -> dict:
     cfg = security.load_users()
     users = cfg.get('users', [])
     target = next((u for u in users if u.get('username') == username), None)

@@ -159,6 +159,17 @@ class PostParamLocationAuditTest(unittest.TestCase):
         '/api/auth/start': {'realm'},  # 同时接受 body，query 仅为兼容旧调用方
     }
 
+    # 覆盖的方法：**所有带 body 的写方法**，不只是 POST。
+    # 只查 POST 会漏掉 PUT/PATCH —— 它们同样会「前端发 body、后端按 query 解析」
+    # 而静默失效（本项审查时新增了 `PUT /api/accounts/{filename}/note`，正好落在这个
+    # 盲区里：闸门是绿的，但没检查过它）。
+    MUTATING_METHODS = ('post', 'put', 'patch')
+
+    def test_sweep_covers_put_and_patch(self) -> None:
+        """闸门自身的方法集合不能退化成只剩 post（否则又是空的守）。"""
+        for m in ('post', 'put', 'patch'):
+            self.assertIn(m, self.MUTATING_METHODS)
+
     def test_no_undeclared_query_params_on_posts(self) -> None:
         import os
         import tempfile
@@ -167,10 +178,12 @@ class PostParamLocationAuditTest(unittest.TestCase):
 
         schema = app.openapi()
         offenders = []
+        counted = 0
         for path, ops in schema['paths'].items():
             for method, op in ops.items():
-                if method != 'post':
+                if method not in self.MUTATING_METHODS:
                     continue
+                counted += 1
                 query = {p['name'] for p in op.get('parameters', [])
                          if p.get('in') == 'query'}
                 if not query:
@@ -178,9 +191,10 @@ class PostParamLocationAuditTest(unittest.TestCase):
                 allowed = self.ALLOWED_QUERY_POSTS.get(path)
                 if allowed is None or not query <= allowed:
                     offenders.append((path, sorted(query)))
+        self.assertGreater(counted, 10, '没扫到写接口 —— 闸门空转了')
         self.assertEqual(
             offenders, [],
-            '这些 POST 端点的 query 参数未登记：'
+            '这些写端点的 query 参数未登记：'
             f'{offenders}。若前端确实发 query，请加入 ALLOWED_QUERY_POSTS；'
             '若前端发 JSON body，则需要用 Body() 声明（否则参数会静默失效）。',
         )

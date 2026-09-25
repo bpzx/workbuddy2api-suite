@@ -1,4 +1,5 @@
 import axios, {AxiosError} from 'axios';
+import {BASE_PATH} from './base-path';
 import {tp} from './i18n';
 import type {Realm} from './realm-context';
 import type {
@@ -8,6 +9,15 @@ import type {
   CreditsMeta,
   AccountsResponse,
   ApiKey,
+  ClaimInfo,
+  CreatedRedPacket,
+  DrawResult,
+  RedPacket,
+  RedPacketDetail,
+  RedPacketKind,
+  RedPacketMode,
+  ApiToken,
+  CreatedApiToken,
   IpAccessLog,
   IpRule,
   Me,
@@ -24,6 +34,7 @@ import type {
   TaskLogResponse,
   TaskRunStatus,
   UpstreamConfig,
+  UpstreamStats,
   UpstreamStatus,
   UsageBreakdown,
   UpdateCheck,
@@ -34,7 +45,9 @@ import type {
 } from './types';
 
 export const http = axios.create({
-  baseURL: '',
+  // 子路径部署时接口也挂在前缀下（反向代理剥掉前缀再转发给本服务）。
+  // 这里必须用 basePath，否则所有请求都会打到域名根路径的 /api 上。
+  baseURL: BASE_PATH,
   withCredentials: true,
   timeout: 60000,
 });
@@ -59,8 +72,19 @@ http.interceptors.response.use(
     if (error.response?.status === 401 && typeof window !== 'undefined') {
       // 会话失效：清掉缓存的登录态，避免仍显示管理员入口
       window.sessionStorage.removeItem('wb-me');
-      if (!window.location.pathname.startsWith('/login')) {
-        window.location.href = '/login';
+      const path = window.location.pathname;
+      // **公开页不跳登录页**：红包抽奖页就是给没账号的人看的（同事朋友收到链接
+      // 直接打开），而它自己也会加载 /api/me（根 layout 的 AuthProvider 一挂载
+      // 就校验一次会话）—— 未登录必然 401，于是被这个拦截器立刻踢去登录页，
+      // 用户根本没机会点「开启」。那正是「不注册也能领」的反面。
+      // 这不改变服务端的鉴权（那些端点本来就是公开的），只是别在前端自己拦自己。
+      // 将来再加公开页，往这个清单里加一条即可。
+      // 路径必须带 basePath：basePath 只自动作用于 next/router 的跳转，裸的
+      // window.location.href 会跳到域名根（通常 404）—— 登录页与公开页都一样。
+      const loginPath = `${BASE_PATH}/login`;
+      const publicPaths = [loginPath, `${BASE_PATH}/claim`];
+      if (!publicPaths.some((p) => path.startsWith(p))) {
+        window.location.href = loginPath;
       }
     }
     return Promise.reject(error);
@@ -112,9 +136,13 @@ export const accountApi = {
           reload_triggered: boolean; message: string}>(
       `/api/accounts/${encodeURIComponent(file)}/disabled`, {disabled}),
   checkin: (file: string) =>
-    post<{code: number; message: string; credits?: number | null}>(
-      `/api/accounts/${encodeURIComponent(file)}/checkin`,
-    ),
+    post<{
+      code: number;
+      message: string;
+      /** 今天已经签过：后端没打上游请求，直接就地返回。提示语要与「刚签上」分开 */
+      already?: boolean;
+      credits?: number | null;
+    }>(`/api/accounts/${encodeURIComponent(file)}/checkin`),
   /** 单个账号的实时积分（直接向腾讯查询） */
   credits: (file: string) =>
     get<{
@@ -136,9 +164,23 @@ export const accountApi = {
       failed: string[];
     }>('/api/accounts/refresh-credits' + (force ? '?force=true' : '?force=false')),
   checkinAll: () =>
-    post<{total: number; succeeded: number; results: {nickname: string; ok: boolean; message: string}[]}>(
-      '/api/accounts/checkin-all',
-    ),
+    post<{
+      /**
+       * 只统计**本次真正发起签到**的账号：国际版（不适用）与今天已签到的都不进
+       * 分母，分别见 skipped / already。原先 total 里混着「今天已签过」的账号，
+       * 界面会把「无需重复」说成「刚签成功」。
+       */
+      total: number;
+      succeeded: number;
+      /** 今天已签到、本次被跳过的账号数（没打上游请求） */
+      already: number;
+      /** 不适用的账号数（国际版没有签到体系）。它既不算成功也不算失败 */
+      skipped: number;
+      results: {
+        nickname: string; ok: boolean; message: string;
+        code?: number; skipped?: boolean; already?: boolean;
+      }[];
+    }>('/api/accounts/checkin-all'),
   /** 签到记录（分页）。days 用于时间范围筛选 */
   checkinLogs: (limit = 20, offset = 0, uid?: string, days?: number, realm?: Realm) =>
     get<CheckinLogPage>('/api/checkin-logs', {limit, offset, uid, days, realm}),
@@ -154,6 +196,20 @@ export const accountApi = {
     post<{ok: boolean; message: string}>(`/api/accounts/${encodeURIComponent(file)}/test`),
   refresh: (file: string) =>
     post<{ok: boolean; message: string}>(`/api/accounts/${encodeURIComponent(file)}/refresh`),
+  /** 强制清除账号级冷却、熔断/降权与模型级限流（会重启一次上游）。 */
+  clearCooling: (file: string) =>
+    post<{ok: boolean; message: string; uid?: string; backup?: string}>(
+      `/api/accounts/${encodeURIComponent(file)}/clear-cooling`,
+    ),
+  /**
+   * 给账号写备注（issue #67）。传空串 = 清除备注。
+   * 存的是本端库、按 uid 关联——临时停用（改文件名）不会丢。
+   */
+  setNote: (file: string, note: string) =>
+    put<{ok: boolean; uid: string; note: string}>(
+      `/api/accounts/${encodeURIComponent(file)}/note`,
+      {note},
+    ),
   restart: () => post<{ok: boolean; message: string}>('/api/restart'),
 
   /* ── 成长任务一键执行（issue #19）─────────────────────
@@ -208,6 +264,51 @@ export const keyApi = {
       '/api/keys/check-models', {models, realm}),
 };
 
+/* ── 红包：批量发放带额度的密钥（见 server/redpacket.py）────
+ * create 返回**明文 key**，且仅此一次（库里只存哈希）。 */
+export const redPacketApi = {
+  list: () => get<RedPacket[]>('/api/red-packets'),
+  detail: (id: number) => get<RedPacketDetail>(`/api/red-packets/${id}`),
+  create: (body: {
+    title: string;
+    quota_kind: RedPacketKind;
+    total_amount: number;
+    shares: number;
+    mode: RedPacketMode;
+    /** 有效期（天）。null = 用后端默认值（7 天） */
+    ttl_days: number | null;
+    /** 模型白名单：**token 红包必填、积分红包必须为空**（见 server/redpacket.py） */
+    models: string[];
+  }) => post<CreatedRedPacket>('/api/red-packets', body),
+  /** 收回整批（停用这批密钥，可逆）。返回停用的数量。 */
+  revoke: (id: number) => post<{revoked: number}>(`/api/red-packets/${id}/revoke`),
+};
+
+/* ── 抽奖（**公开**，不需要登录）─────────────────────────
+ * 收到链接的是同事朋友，不该要求他们注册账号。防滥用靠「每 IP 一次」
+ * + 128 位抽奖码 + 有效期。 */
+export const claimApi = {
+  info: (code: string) => get<ClaimInfo>(`/api/claim/${encodeURIComponent(code)}`),
+  /** 抽一份。同一 IP 第二次会 409（提示「你已经抽过了」）。 */
+  draw: (code: string) => post<DrawResult>(`/api/claim/${encodeURIComponent(code)}`, {}),
+};
+
+/* ── 访问令牌（管理面作用域化 API Token）──────────────────
+ * 与 keyApi 是两套：那个是给下游调模型的网关密钥，这个授权管理接口。
+ * 明文只在创建时返回一次。 */
+export const tokenApi = {
+  list: () => get<ApiToken[]>('/api/tokens'),
+  create: (body: {name: string; scope: 'readonly' | 'admin'; expires_at: number | null}) =>
+    post<CreatedApiToken>('/api/tokens', body),
+  update: (id: number, body: {
+    name?: string;
+    scope?: 'readonly' | 'admin';
+    enabled?: boolean;
+    expires_at?: number | null;
+  }) => patch<ApiToken>(`/api/tokens/${id}`, body),
+  remove: (id: number) => del<{ok: boolean}>(`/api/tokens/${id}`),
+};
+
 /* ── 日志 ───────────────────────────────────────────── */
 export const logApi = {
   list: (params: Record<string, unknown>) => get<Page<RequestLog>>('/api/logs', params),
@@ -223,6 +324,11 @@ export const statsApi = {
     get<UsageBreakdown[]>('/api/stats/by-model', {days, realm}),
   byKey: (days = 30, realm?: Realm) =>
     get<UsageBreakdown[]>('/api/stats/by-key', {days, realm}),
+  /**
+   * 上游自己那份统计（issue #59）。口径与本页其它数字不同：含**直连上游**的调用，
+   * 且是自上游进程启动以来的累计（没有时段概念）。
+   */
+  upstream: () => get<UpstreamStats>('/api/stats/upstream'),
   /** 按请求日志回填用量缺口（幂等） */
   rebuildUsage: () =>
     post<{rows_before: number; rows_after: number; requests_delta: number; tokens_delta: number}>(

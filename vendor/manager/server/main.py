@@ -6,18 +6,19 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 import logging
 
-from . import config, db, security
+from . import config, db, redpacket, security
 from .iputil import client_ip
 from .routers import (
     accounts, anthropic, auth, gateway, keys, logs, models, playground,
-    responses, security as security_router, settings, stats, system,
+    redpackets, responses, security as security_router, settings, stats,
+    system, tokens,
 )
-from .services import renew, tasklog, taskrun
+from .services import accountlog, renew, tasklog, taskrun
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,11 @@ async def lifespan(app: FastAPI):
     db.connect()
     security.load_users()  # 首次启动会自动生成管理员并打印一次密码
     _warn_if_exposed()
+    # 给「抽奖码」这一列上线之前建的红包补码（幂等）：没有码就拼不出抽奖链接，
+    # 等于那些红包只能自己发 key、没法让大家抽。
+    filled = redpacket.backfill_codes()
+    if filled:
+        logger.info('为 %d 个旧红包补上了抽奖码', filled)
     # 后台采集上游自动任务日志（旅行/活跃/签到/保活），容器日志会被重建清掉，
     # 这里解析后落库长期保留，界面才能看到「这趟旅行领了多少积分」
     tasklog.start_collector()
@@ -37,12 +43,16 @@ async def lifespan(app: FastAPI):
     # token 自动续期（issue #40）：上游只在「保活时刻」与「有流量时」刷新，
     # 长期闲置的账号会一路走到过期。这里按剩余寿命巡检补齐那个空档。
     renew.start_scheduler()
+    # 请求日志的「账号」回填（issue #69）：账号是上游选的、不在响应里回传，
+    # 只能从它的容器日志里读出来再按时间对回去（见 accountlog 的说明）。
+    accountlog.start_collector()
     try:
         yield
     finally:
         tasklog.stop_collector()
         taskrun.stop_scheduler()
         renew.stop_scheduler()
+        accountlog.stop_collector()
 
 
 def _warn_if_exposed() -> None:
@@ -64,7 +74,7 @@ def _warn_if_exposed() -> None:
 
 app = FastAPI(
     title='WorkBuddy Manager',
-    version='1.0.60',
+    version='1.0.70',
     lifespan=lifespan,
     # 生产环境默认关闭交互式文档与 OpenAPI 描述：
     # 它们会把管理接口全貌（路径、参数、结构）暴露给任何未认证访问者，
@@ -125,9 +135,15 @@ async def limit_api_body(request: Request, call_next):
 app.include_router(auth.router)
 app.include_router(accounts.router)
 app.include_router(keys.router)
+# 红包：批量发放带额度的密钥（与密钥同属「分发」这件事，所以挨着放）
+app.include_router(redpackets.router)
+# 抽奖：**公开端点**（收到链接的人不需要账号），单独挂便于区分边界
+app.include_router(redpackets.claim_router)
 app.include_router(logs.router)
 app.include_router(stats.router)
 app.include_router(security_router.router)
+# 管理面作用域化 API Token（见 docs/api-tokens.md）；接口本身只接受会话鉴权
+app.include_router(tokens.router)
 app.include_router(settings.router)
 app.include_router(system.router)
 app.include_router(models.router)
@@ -261,6 +277,50 @@ def _safe_static_path(full_path: str) -> Path | None:
     return candidate if candidate.is_file() else None
 
 
+def _is_document_request(request: Request) -> bool:
+    """这次请求是不是「把结果当页面显示」的文档型导航。
+
+    浏览器的地址栏导航会带 `Accept: text/html,...`；而客户端路由抓 RSC 数据
+    用的是 `fetch`（`Accept: */*` 或 `text/x-component`）并带 `RSC: 1` 头。
+    两者必须分开：前者拿到的若是 flight 文本，用户看到的就是满屏原始数据。
+    """
+    if request.headers.get('rsc'):
+        return False
+    return 'text/html' in (request.headers.get('accept') or '').lower()
+
+
+def _rsc_page_for(full_path: str) -> str | None:
+    """文档型请求命中 Next 静态导出的 RSC 数据文件时，返回它对应的页面路径。
+
+    `output: 'export'` 会把每个页面的 RSC（flight）数据写成
+    `<页>/index.txt`（实测：`dashboard/index.txt`、`settings/index.txt`…）。
+    正常客户端拿它做客户端路由的数据源；但 router 的兜底分支
+    （`Failed to fetch RSC payload … Falling back to browser navigation`）
+    会把浏览器**整页导航**到这个地址，于是浏览器按 `text/plain` 渲染那份
+    flight 数据、地址栏也变成 `.txt`，刷新只会继续显示它（issue #48）。
+
+    **只有对应页面确实存在时才返回**：`.txt` 也可能是真实静态文件
+    （如 `robots.txt`），那种没有同名页面，不能一并重定向。
+
+    两种导出形态都要认：`<页>/index.html`（绝大多数页面，实测 dashboard 等）
+    与 `<页>.html`（根页面就是这种：`index.html` + `index.txt`）。少认一种，
+    对应形态的页面在真机上就会继续显示原始数据。
+    """
+    p = (full_path or '').strip('/')
+    if not p.endswith('.txt'):
+        return None
+    stem = p[:-4]
+    if stem.endswith('/index'):
+        stem = stem[: -len('/index')]
+    elif stem == 'index':
+        stem = ''
+    candidates = (f'{stem}/index.html' if stem else 'index.html',
+                  f'{stem}.html' if stem else 'index.html')
+    if not any(_safe_static_path(c) is not None for c in candidates):
+        return None          # 没有同名页面 → 是真实文件，按普通静态资源处理
+    return f'/{stem}' if stem else '/'
+
+
 if config.STATIC_DIR.is_dir():
     app.mount('/_next', StaticFiles(directory=str(config.STATIC_DIR / '_next')), name='next-assets')
     if (config.STATIC_DIR / 'favicon.ico').exists():
@@ -273,7 +333,7 @@ if config.STATIC_DIR.is_dir():
         return FileResponse(config.STATIC_DIR / 'index.html')
 
     @app.get('/{full_path:path}', include_in_schema=False)
-    def spa(full_path: str):
+    def spa(full_path: str, request: Request):
         # 优先命中导出的静态页面 / 资源，否则回退到 404 页面。
         # 所有路径都必须先通过 _safe_static_path（越界即 None → 404）。
         #
@@ -281,6 +341,16 @@ if config.STATIC_DIR.is_dir():
         # 之前不记录任何痕迹，出事后无从追溯。日志只写路径，不含内容。
         if _looks_like_traversal(full_path):
             logger.warning('拦截疑似路径穿越请求: %r', full_path[:300])
+        # ① 文档型请求命中 RSC 数据文件 → 送回对应页面（issue #48）。
+        # 见 `_rsc_page_for` 的说明：客户端路由的兜底分支会把浏览器整页导航到
+        # `<页>/index.txt`，那边返回的是 flight 文本，用户看到满屏原始数据、
+        # 地址栏也变成了 .txt，只能手动改回地址。
+        if _is_document_request(request):
+            page = _rsc_page_for(full_path)
+            if page is not None:
+                # 补上子路径前缀：反代剥掉前缀后才到这里，但 Location 是发回浏览器
+                # 的绝对地址，不带前缀就会跳到域名根（另一个站点）上。
+                return RedirectResponse(f'{config.BASE_PATH}{page}', status_code=302)
         target = _safe_static_path(full_path)
         if target is not None:
             return FileResponse(target)
@@ -291,3 +361,70 @@ if config.STATIC_DIR.is_dir():
         if not_found.is_file():
             return FileResponse(not_found, status_code=404)
         return JSONResponse({'error': 'not found'}, status_code=404)
+
+
+# ── 子路径部署（反向代理前缀）────────────────────────────────────────
+#
+# 反向代理把本站挂在 /workbuddy-manager 这类前缀下、且**不剥离**前缀时，后端
+# 收到的路径仍带着前缀 —— 路由、静态挂载与 SPA 兜底全都匹配不上，页面会 404。
+# 这里在最外层统一剥掉，让内部逻辑只看到「前缀之后的路径」。
+#
+# 反向代理若已经剥离了前缀（proxy_pass 带 URI 的常见写法），本中间件找不到
+# 前缀、原样放行 —— 两种反代配置都能工作，nginx 侧不必改。
+#
+# 响应侧同步处理：SPA 的 RSC 兜底等场景会 302 到站内绝对路径（`/xxx`），
+# 不补回前缀就会把用户带出子路径、落到站点根目录。
+#
+# 与 `config.BASE_PATH` 的分工：那个值被用来**主动构造**带前缀的绝对地址
+# （见上面 SPA 兜底的 RedirectResponse）；本中间件负责「进来的路径带前缀」与
+# 「出去的 Location 漏前缀」这两件事。两者都指同一个 WB_BASE_PATH。
+class StripBasePathMiddleware:
+    """纯 ASGI 中间件：剥离请求前缀，并把响应里的站内绝对位置补回前缀。"""
+
+    def __init__(self, app, prefix: str) -> None:
+        self.app = app
+        self.prefix = prefix
+        self._prefix_slash = prefix + '/'
+
+    async def __call__(self, scope, receive, send):
+        if scope.get('type') != 'http':
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get('path') or '/'
+        if path == self.prefix or path.startswith(self._prefix_slash):
+            stripped = path[len(self.prefix):] or '/'
+            scope = dict(scope)
+            scope['path'] = stripped
+            scope['raw_path'] = stripped.encode('utf-8')
+
+        async def send_with_prefix(message):
+            if message.get('type') == 'http.response.start' and message.get('headers'):
+                message = dict(message)
+                message['headers'] = [
+                    (k, self._rewrite_location(v) if k.lower() == b'location' else v)
+                    for k, v in message['headers']
+                ]
+            await send(message)
+
+        await self.app(scope, receive, send_with_prefix)
+
+    def _rewrite_location(self, value: bytes) -> bytes:
+        try:
+            text = value.decode('latin-1')
+        except Exception:  # noqa: BLE001
+            return value
+        # 只处理站内绝对路径（/ 开头，且不是 //host 这种协议相对写法）
+        if not text.startswith('/') or text.startswith('//'):
+            return value
+        # 已经带前缀的不重复叠加（SPA 兜底那处已自己补过）
+        if text == self.prefix or text.startswith(self._prefix_slash):
+            return value
+        return (self.prefix + text).encode('latin-1')
+
+
+if config.BASE_PATH:
+    # add_middleware 后注册的在外层，所以这行放在文件末尾：请求进来先过它，
+    # 后面的限流 / 缓存头 / 路由看到的都是剥离后的路径。
+    app.add_middleware(StripBasePathMiddleware, prefix=config.BASE_PATH)
+    logger.info('子路径部署：已启用前缀 %s（反代可保留或自行剥离，两者都可用）', config.BASE_PATH)

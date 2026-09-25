@@ -47,6 +47,9 @@ PAYLOAD = {'object': 'list', 'data': [
 ]}
 
 
+ALIAS = 'claude-fable-5'
+
+
 def _key(**kw) -> dict:
     """一把**能通过其它所有校验**的密钥，只让白名单/版本参与判定。"""
     base = {'enabled': True, 'expires_at': 0, 'quota': 0, 'quota_credit': 0,
@@ -68,8 +71,11 @@ class ListMatchesCallAdmissionTest(unittest.TestCase):
 
     def _assert_invariant(self, key: dict, model_map: dict | None = None) -> list[str]:
         listed = _listed(key, model_map)
+        mp = model_map or {}
         for mid in listed:
-            reason = keysvc.validate(key, '1.2.3.4', mid)
+            # 调用路径把**映射后**的名字交给鉴权判版本（issue #47），这里必须同口径
+            # 地传——否则等于用一条真实调用不使用的规则去判列表，测出来的差异是假的。
+            reason = keysvc.validate(key, '1.2.3.4', mid, mapped_model=mp.get(mid, mid))
             self.assertIsNone(
                 reason,
                 f'列表给出的 {mid!r} 实际调用被拒（{reason}）——'
@@ -133,6 +139,26 @@ class ListMatchesCallAdmissionTest(unittest.TestCase):
     def test_alias_without_mapping_ignored(self) -> None:
         """没配映射的「别名」就是拼错的名字，不该凭空出现。"""
         self.assertEqual(self._assert_invariant(_key(models=['nope']), model_map={}), [])
+
+    def test_cross_realm_alias_stays_consistent(self) -> None:
+        """别名**跨版本**时列表与调用仍要一致（issue #46 + #47 的交叉点）。
+
+        限定国际版的密钥 + 白名单只写别名，别名指向国际版模型：列表给出别名
+        （客户端要发的就是它），调用也必须放行——两个 issue 的修法在这里会师：
+        列表按**目标**判版本、鉴权按**映射后**的名字判版本，白名单两边都判请求名。
+        任一处判据挪错，这条就会红。
+        """
+        listed = self._assert_invariant(
+            _key(realm='global', models=[ALIAS]),
+            model_map={ALIAS: 'global:deepseek-v4.1-flash'})
+        self.assertEqual(listed, [ALIAS])
+
+    def test_cross_realm_alias_hidden_from_other_realm(self) -> None:
+        """指向国际版的别名，不该出现在限定国内版的密钥的列表里。"""
+        listed = self._assert_invariant(
+            _key(realm='cn', models=[ALIAS]),
+            model_map={ALIAS: 'global:deepseek-v4.1-flash'})
+        self.assertEqual(listed, [], '国内版密钥的列表里出现了国际版别名')
 
 
 class ShapeSafetyTest(unittest.TestCase):

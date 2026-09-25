@@ -1,6 +1,6 @@
 'use client';
 
-import {useCallback, useEffect, useMemo, useState} from 'react';
+import {useEffect, useMemo, useState} from 'react';
 import {Users, CircleCheck, TriangleAlert, Activity, Server, Coins} from 'lucide-react';
 import {
   Area,
@@ -12,6 +12,8 @@ import {
   YAxis,
 } from 'recharts';
 import {useHeartbeat} from '@/lib/use-heartbeat';
+import {useAsyncAll} from '@/lib/use-async-data';
+import {getExpiryDailyGroup, groupExpiriesByDay} from '@/lib/display-prefs';
 import {accountApi, statsApi, upstreamApi} from '@/lib/api';
 import {useRealm} from '@/lib/realm-context';
 import type {
@@ -43,54 +45,68 @@ import {PageHeader} from '@/components/common/layout/PageHeader';
 import {StatCard} from '@/components/common/layout/StatCard';
 import {CreditCountdown} from '@/components/common/accounts/CreditCountdown';
 import {EmptyState} from '@/components/common/layout/EmptyState';
+import {LoadError} from '@/components/common/states/LoadError';
 import {Badge} from '@/components/ui/badge';
+import {Skeleton} from '@/components/ui/skeleton';
+import {cn} from '@/lib/utils';
 import {useT} from '@/lib/i18n/provider';
-import {notify} from '@/lib/toast';
+
+/**
+ * 取数完成前的空值。
+ *
+ * 必须是模块级的同一份：写成 `values.accounts?.accounts ?? []` 的话，每次渲染
+ * 都会新建一个数组，而它们要进下游 useMemo 的依赖——依赖每帧都变，那几个
+ * memo 就等于没写。共享只读常量才稳定。
+ */
+const EMPTY_ACCOUNTS: Account[] = [];
+const EMPTY_POINTS: UsagePoint[] = [];
+const EMPTY_CREDITS: Record<string, CreditsMeta> = {};
+const EMPTY_LIVE_CREDITS: Record<string, number> = {};
 
 export default function DashboardPage() {
   const {realm, label: realmName} = useRealm();
   const t = useT();
-  const [accounts, setAccounts] = useState<Account[]>([]);
-  const [summary, setSummary] = useState<StatsSummary | null>(null);
-  const [daily, setDaily] = useState<UsagePoint[]>([]);
-  const [upstream, setUpstream] = useState<UpstreamStatus | null>(null);
+
+  /**
+   * 本页要的 5 份数据一次并发取回，成败逐项独立。
+   *
+   * 依赖是 realm：切换版本后**必须重取**——两个版本的账号池不同，credits 也
+   * 不能混。useAsyncAll 在依赖变化时会连同旧数据一起清掉，否则会出现
+   * 「标题已经写着国际版、卡片上还是国内版的数字」。
+   *
+   * 加载态 / 失败态 / 是否正在刷新也由它给出，本页不再自己维护这几个 useState。
+   */
+  const {values, errors, isInitialLoading, isInitialFailed, isRefreshing, reload} = useAsyncAll({
+    accounts: () => accountApi.list(),
+    summary: () => statsApi.summary(realm),
+    daily: () => statsApi.daily(14, realm),
+    upstream: () => upstreamApi.status(),
+    // force=false：命中服务端 60 秒缓存，30 秒轮询不会反复打腾讯
+    credits: () => accountApi.refreshCredits(false),
+  }, [realm]);
+
+  const accounts: Account[] = values.accounts?.accounts ?? EMPTY_ACCOUNTS;
+  const summary: StatsSummary | null = values.summary ?? null;
+  const daily: UsagePoint[] = values.daily ?? EMPTY_POINTS;
+  const upstream: UpstreamStatus | null = values.upstream ?? null;
   /** 实时积分（按 uid），叠加到 accounts 上；上游 /status 的 credits 可能滞后数小时 */
-  const [liveCredits, setLiveCredits] = useState<Record<string, number>>({});
+  const liveCredits = useMemo(() => {
+    const raw = values.credits?.credits;
+    if (!raw) return EMPTY_LIVE_CREDITS;
+    return Object.fromEntries(
+      Object.entries(raw).filter(([, v]) => typeof v === 'number') as [string, number][],
+    );
+  }, [values.credits]);
   /** 各账号的积分套餐到期时间（按 uid），与实时积分同一次查询返回 */
-  const [creditsMeta, setCreditsMeta] = useState<Record<string, CreditsMeta>>({});
+  const creditsMeta: Record<string, CreditsMeta> = values.credits?.meta ?? EMPTY_CREDITS;
 
-  // 切换版本后要重新取实时积分：两个版本的账号池不同，credits 也不能混
-  const load = useCallback(async () => {
-    const results = await Promise.allSettled([
-      accountApi.list(),
-      statsApi.summary(realm),
-      statsApi.daily(14, realm),
-      upstreamApi.status(),
-      // force=false：命中服务端 60 秒缓存，30 秒轮询不会反复打腾讯
-      accountApi.refreshCredits(false),
-    ]);
-    if (results[0].status === 'fulfilled') setAccounts(results[0].value.accounts);
-    if (results[1].status === 'fulfilled') setSummary(results[1].value);
-    if (results[2].status === 'fulfilled') setDaily(results[2].value);
-    if (results[3].status === 'fulfilled') setUpstream(results[3].value);
-    if (results[4].status === 'fulfilled') {
-      const r = results[4].value;
-      setLiveCredits(
-        Object.fromEntries(
-          Object.entries(r.credits).filter(([, v]) => typeof v === 'number') as [string, number][],
-        ),
-      );
-      setCreditsMeta(r.meta ?? {});
-    }
-    if (results.slice(0, 4).some((r) => r.status === 'rejected')) notify.err(t('dashboard.partialLoadFailed'));
-  }, [realm, t]);
+  // 账号健康度与用量会持续变化，用心跳刷新避免展示陈旧数据。
+  // 走 reload（刷新模式）：只把新数据换上去，**不**重走首屏流程——
+  // 否则骨架会每 30 秒闪一次，用户以为页面在抽风。
+  useHeartbeat(reload, 30000);
 
-  useEffect(() => {
-    load();
-  }, [load]);
-
-  // 账号健康度与用量会持续变化，用心跳刷新避免展示陈旧数据
-  useHeartbeat(load, 30000);
+  /** 有字段没刷新成功。此时至少还有一份数据在，用顶部提示如实说明，不清空内容 */
+  const partialFailed = Object.keys(errors).length > 0;
 
   /**
    * 合并上游池状态 + 按当前版本过滤。
@@ -172,6 +188,42 @@ export default function DashboardPage() {
   // 阈值是 7 天，而本页每 30 秒重渲染一次，几秒的偏差不影响分档。
   const expiryUrgent = !!nextExpiry && nextExpiry.at - Date.now() / 1000 < 7 * 86400;
 
+  /** 「到期积分按天模糊统计」开关（界面偏好，存在浏览器本地）。
+   *  首屏后读：直接读会让服务端渲染与客户端不一致（与 realm-context 同理）。 */
+  const [dailyGroup, setDailyGroup] = useState(false);
+  useEffect(() => {
+    setDailyGroup(getExpiryDailyGroup());
+  }, []);
+
+  /**
+   * 全体账号的到期明细（按时刻升序）。
+   *
+   * 与上面 nextExpiry 的区别：那个只看每个账号的**第一笔**，回答「最近一笔什么时候
+   * 没了」；这里收全量，供「按天归并」用——同一天到期的多笔要能相加，
+   * 只看第一笔永远算不出那一天的总和。
+   */
+  const allExpiries = useMemo(() => {
+    const out: CreditExpiry[] = [];
+    for (const m of Object.values(creditsMeta)) {
+      for (const e of m.expiries ?? []) out.push(e);
+    }
+    return out.sort((a, b) => a.at - b.at);
+  }, [creditsMeta]);
+
+  /**
+   * 卡片上实际要显示的到期条目。
+   *
+   * 关闭（默认）= 最近一笔；开启 = 按本地日历日归并后的第一条（最近那一天，
+   * 金额是那天到期的**总和**）。两者数量级不同（一笔 vs 一天），所以开关默认
+   * 关闭——升级后看到的还是原来那个数，想按天看的自己打开。
+   */
+  const expiryShown = useMemo(
+    () => (dailyGroup
+      ? groupExpiriesByDay(allExpiries)
+      : (nextExpiry ? [nextExpiry] : [])),
+    [dailyGroup, allExpiries, nextExpiry],
+  );
+
   /**
    * 「反代上游」面板的计数，取自上游 `/status` 的 `realm_totals`。
    *
@@ -224,14 +276,40 @@ export default function DashboardPage() {
   const weekFailed =
     (summary?.failures?.week_4xx ?? 0) + (summary?.failures?.week_5xx ?? 0);
 
+  /**
+   * 页头。两条渲染路径（首屏 / 已就绪）都要用，抽出来免得改一处漏一处。
+   * 本页 30 秒自动刷新，且没有任何会改变数据的操作，因此不放手动刷新按钮
+   * （移动端还省下一行）。
+   */
+  const header = (
+    <PageHeader
+      title={t('dashboard.title')}
+      description={t('dashboard.description', {realm: realmName})}
+    />
+  );
+
+  // 首屏：还没拿到任何数据。此时**不能**渲染下面的卡片——它们会把「还没取到」
+  // 显示成「暂无账号」「暂无调用数据」，那是在撒谎。一次都没取到（失败）同理：
+  // 页面上没有任何可信数字，直接给错误态与「重试」，而不是一直转圈。
+  if (isInitialFailed || isInitialLoading) {
+    return (
+      <div className="flex flex-col gap-4 md:gap-6">
+        {header}
+        {isInitialFailed ? <LoadError variant="page" onRetry={reload} /> : <DashboardSkeleton />}
+      </div>
+    );
+  }
+
   return (
-    <div className="flex flex-col gap-4 md:gap-6">
-      {/* 本页 30 秒自动刷新，且没有任何会改变数据的操作，
-          因此不再放手动刷新按钮（移动端还省下一行） */}
-      <PageHeader
-        title={t('dashboard.title')}
-        description={t('dashboard.description', {realm: realmName})}
-      />
+    <div className="flex flex-col gap-4 md:gap-6" aria-busy={isRefreshing}>
+      {header}
+
+      {/* 刷新时有请求失败：常驻提示，**不**顶掉已经显示出来的内容——那些数据
+          仍然是对的，只是可能不是最新的。原先这里只弹一个 toast，几秒后自己
+          消失，用户切回来看到的是一片「正常」的数字。 */}
+      {partialFailed && (
+        <LoadError message={t('dashboard.partialLoadFailed')} onRetry={reload} />
+      )}
 
       <section className="grid grid-cols-2 gap-3 lg:grid-cols-5 md:gap-4">
         <StatCard
@@ -279,7 +357,7 @@ export default function DashboardPage() {
           value={
             <span className="inline-flex items-baseline gap-1.5">
               <span>{creditsKnown.length ? fmtNumber(totalCredits) : '—'}</span>
-              <CreditCountdown expiries={nextExpiry ? [nextExpiry] : []} />
+              <CreditCountdown expiries={expiryShown} />
             </span>
           }
           hint={
@@ -290,10 +368,10 @@ export default function DashboardPage() {
               ? t('dashboard.waitingUpstream')
               : creditsLow > 0
                 ? t('dashboard.creditsLow', {count: creditsLow, n: creditsLow})
-                : nextExpiry
-                  ? t('dashboard.creditsExpiry', {
-                      time: fmtDateTime(nextExpiry.at),
-                      amount: fmtNumber(nextExpiry.amount),
+                : expiryShown.length
+                  ? t(dailyGroup ? 'dashboard.creditsExpiryDaily' : 'dashboard.creditsExpiry', {
+                      time: fmtDateTime(expiryShown[0].at),
+                      amount: fmtNumber(expiryShown[0].amount),
                     })
                   : t('dashboard.creditsCovered', {count: creditsKnown.length, n: creditsKnown.length})
           }
@@ -524,5 +602,90 @@ export default function DashboardPage() {
         )}
       </section>
     </div>
+  );
+}
+
+/**
+ * 骨架里的一根「条」。
+ *
+ * 为什么要显式指定底色：`Skeleton` 自带 `bg-accent`，而本页所有卡片用的是
+ * `bg-muted` —— 这两个颜色在 globals.css 里**明暗两套主题下都是同一个字面量**
+ * （浅色同为 oklch(0.967 0.001 286.375)，深色同为 oklch(0.274 0.006 286.033)），
+ * 直接放上去等于画了看不见的条。改用前景色的低透明度：浅色下压暗、深色下提亮，
+ * 两种主题都能看出形状。
+ */
+function Bar({className}: {className?: string}) {
+  return <Skeleton className={cn('bg-foreground/10', className)} />;
+}
+
+/** 统计卡片的骨架。外壳与 StatCard 逐项对齐（同高、同圆角、同底色），到位时不跳 */
+function StatCardSkeleton() {
+  return (
+    <div className="min-h-[88px] rounded-[20px] bg-muted px-3.5 py-3 sm:min-h-[96px] sm:px-4">
+      <div className="flex items-start justify-between gap-2">
+        <Bar className="h-2.5 w-16" />
+        <Bar className="h-6 w-6 rounded-full" />
+      </div>
+      <Bar className="mt-3 h-6 w-20" />
+      <Bar className="mt-2 h-2.5 w-24" />
+    </div>
+  );
+}
+
+/**
+ * 首屏骨架。
+ *
+ * 结构与真实内容**逐块对应**（五张卡片 / 趋势图 + 上游面板 / 健康快照），而不是
+ * 一坨居中的转圈：数据到位时版面不会整体跳一下，加载期间也不会看起来像空白页。
+ * 页面每 30 秒心跳刷新一次，但只有「一次都没取到」才会走到这里（见
+ * use-async-data 的 isInitialLoading），所以不会一闪一闪。
+ */
+function DashboardSkeleton() {
+  return (
+    <>
+      <section className="grid grid-cols-2 gap-3 lg:grid-cols-5 md:gap-4">
+        {Array.from({length: 5}, (_, i) => <StatCardSkeleton key={i} />)}
+      </section>
+
+      <section className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+        <div className="rounded-[20px] bg-muted p-4 lg:col-span-2">
+          <div className="mb-3 flex items-center justify-between">
+            <Bar className="h-3.5 w-28" />
+            <Bar className="h-3 w-20" />
+          </div>
+          <Bar className="h-[220px] w-full rounded-2xl" />
+        </div>
+        <div className="rounded-[20px] bg-muted p-4">
+          <Bar className="mb-3 h-3.5 w-20" />
+          <div className="space-y-3">
+            {Array.from({length: 6}, (_, i) => (
+              <div key={i} className="flex items-center justify-between">
+                <Bar className="h-2.5 w-16" />
+                <Bar className="h-2.5 w-8" />
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      <section className="rounded-[20px] bg-muted p-4">
+        <Bar className="mb-3 h-3.5 w-24" />
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
+          {Array.from({length: 6}, (_, i) => (
+            <div key={i} className="rounded-2xl bg-background/60 p-3">
+              <div className="flex items-center justify-between gap-2">
+                <Bar className="h-3.5 w-20" />
+                <Bar className="h-2.5 w-10" />
+              </div>
+              <Bar className="mt-2 h-1.5 w-full rounded-full" />
+              <div className="mt-1.5 flex items-center justify-between gap-2">
+                <Bar className="h-2.5 w-12" />
+                <Bar className="h-2.5 w-10" />
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+    </>
   );
 }

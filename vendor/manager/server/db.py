@@ -184,6 +184,18 @@ CREATE TABLE IF NOT EXISTS settings (
   value TEXT
 );
 
+-- 账号备注（issue #67）：给账号起个「人记得住」的名字。
+--
+-- 为什么本端存而不是写进账号文件：账号文件是**上游的**文件（它按自己 schema 读写，
+-- 也会原子回写），往里塞自定义字段既可能被上游覆盖，也超出它的 schema。备注是
+-- 「我们这边怎么看这些号」，按 uid 关联即可——uid 是账号的稳定标识，改文件名
+-- （临时停用）或重新启用都不变，所以备注不会因为用户点了停用就丢。
+CREATE TABLE IF NOT EXISTS account_notes (
+  uid        TEXT PRIMARY KEY,
+  note       TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
 -- 签到 / 保活结果记录。上游只在失败时打日志、成功静默，
 -- 因此本表用于留下我们自己触发的签到结果，便于事后追溯。
 CREATE TABLE IF NOT EXISTS checkin_logs (
@@ -214,6 +226,97 @@ CREATE TABLE IF NOT EXISTS task_logs (
   dedup_key TEXT NOT NULL UNIQUE
 );
 CREATE INDEX IF NOT EXISTS idx_task_logs_ts ON task_logs(ts);
+
+-- 管理面**作用域化 API Token**（见 docs/api-tokens.md）。
+--
+-- 与 api_keys（数据面网关密钥）是**两套东西**：api_keys 只授权模型调用，
+-- 与后台权限无关；本表授权的是管理面 /api/*，所以要求更严：
+--   · 明文形如 wbt_<base64url>，**库中只存 SHA-256 哈希**，明文仅在创建时返回一次；
+--   · prefix 用于定位（先按前缀取候选行，再常量时间比哈希），避免全表扫描；
+--   · scope 决定角色（readonly → viewer，admin → admin）；
+--   · 可吊销（enabled）与可过期（expires_at），鉴权时逐次校验、即时生效。
+--
+-- 历史教训：2026-09-14 的事故源于 users.json 里一个直接授予 admin 的
+-- X-API-Key 数组。本表的形态与它**刻意不同**：在数据库而非配置文件、
+-- 只存哈希、有 scope、可吊销、全程审计。
+CREATE TABLE IF NOT EXISTS api_tokens (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  name         TEXT    NOT NULL,
+  token_hash   TEXT    NOT NULL,
+  prefix       TEXT    NOT NULL,
+  scope        TEXT    NOT NULL,
+  enabled      INTEGER NOT NULL DEFAULT 1,
+  expires_at   INTEGER,
+  created_at   INTEGER NOT NULL,
+  created_by   TEXT    NOT NULL DEFAULT '',
+  last_used_at INTEGER,
+  last_used_ip TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_tokens_prefix ON api_tokens(prefix);
+
+-- 红包：一次创建 N 个密钥，额度按拼手气或均分分配（见 server/redpacket.py）。
+--
+-- 为什么只记「这批是怎么来的」，不重复存密钥信息：密钥本体（配额、用量、
+-- 启停、过期）都在 api_keys 里，这里只用 key_id 指向它。同一件事存两份，
+-- 迟早会出现「红包说额度 100、密钥实际是 80」的不一致。
+CREATE TABLE IF NOT EXISTS red_packets (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  title         TEXT    NOT NULL DEFAULT '',
+  -- 额度类别：credit（限制真实扣费）/ token（限制 token 数）。两者口径不同，
+  -- 见 redpacket.py 模块头。
+  quota_kind    TEXT    NOT NULL,
+  total_amount  REAL    NOT NULL,
+  shares        INTEGER NOT NULL,
+  -- 分配方式：lucky（拼手气）/ even（均分）
+  mode          TEXT    NOT NULL,
+  -- 抽奖码（分享链接用）。高熵随机串，**没有它就拿不到红包里的密钥**，
+  -- 所以它本身就是凭据 —— 界面上只展示给管理员，不写进日志。
+  code          TEXT,
+  -- 这批密钥限定的模型（JSON 数组）。
+  --
+  -- **token 红包必须非空，积分红包必须为空**（见 redpacket.validate）：
+  -- 积分是「钱」（按真实扣费算，任何模型都能用），token 是「量」（与模型强
+  -- 相关——同一段上下文在不同模型下的 token 数、输出长度、上下文窗口都不同，
+  -- 不限定的话「10 万 token」这个说法就是浮动的）。记下来是为了在详情页
+  -- 能回答「这个红包当初限的是哪几个模型」——密钥本身也有这份白名单，
+  -- 但红包视角下看更直接。
+  models        TEXT    NOT NULL DEFAULT '[]',
+  created_by    TEXT    NOT NULL DEFAULT '',
+  created_at    INTEGER NOT NULL,
+  -- 这批密钥的失效时刻。默认 7 天（发出去的东西收不回，给个期限让它们自动清理）。
+  expires_at    INTEGER NOT NULL
+);
+
+-- 每一份红包 = 一个密钥。amount 是这一份分到的额度，各份之和
+-- **精确等于** red_packets.total_amount（浮点余数由 split_amount 兜底到最后一份）。
+--
+-- 为什么存明文 token（而 api_keys 里只存哈希）
+-- -------------------------------------------
+-- 密钥通常在创建时返回一次明文、之后只留哈希——但红包要**过一段时间**才由
+-- 领取者抽走，抽的那一刻必须把明文给他。两个选择：
+--   a) 抽奖时现场生成密钥（那就不能同时支持「管理员直接把 key 发出去」）；
+--   b) 创建时把明文存下来，抽奖时取出来。
+-- 这里选了 b，因为一个红包要能**同时**支持两种分发（管理员自己发 / 分享链接）。
+--
+-- 代价说清楚：库被读走 = 这批红包的密钥泄露。缓解措施是它们的**寿命短**
+-- （默认 7 天）且**额度有限**（红包的本质就是小额分发）；而库里本来就有
+-- 同等敏感的东西。真要更严，得引入加密依赖——但项目刻意保持窄依赖
+-- （只有 fastapi/uvicorn/httpx/pydantic），自己写加密比明文更危险
+-- （会让人以为它是安全的）。
+CREATE TABLE IF NOT EXISTS red_packet_shares (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  packet_id INTEGER NOT NULL,
+  key_id    INTEGER NOT NULL,
+  amount    REAL    NOT NULL,
+  -- 密钥明文。抽奖时原样返回给领取者；管理员自己发时也不用再查别处。
+  token     TEXT    NOT NULL DEFAULT '',
+  -- 领取者 IP 与时刻。NULL = 还没人抽到这一份。
+  -- **每 IP 对同一个红包只能抽一次**，由 redpacket.draw 在事务里保证
+  -- （不去建 UNIQUE 约束：SQLite 加约束要重建表，而这里靠事务已足够）。
+  claimed_by_ip TEXT,
+  claimed_at    INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_packet_shares ON red_packet_shares(packet_id);
 """
 
 
@@ -338,6 +441,13 @@ _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     # 便宜模型与贵模型的实际扣费能差几十倍，按 token 限额估不出花了多少积分
     # （提需求的人遇到的正是这个问题）。上游从 2026-09-13 起在末帧 usage 里
     # 带回真实 credit，我们已按请求存进 request_logs.credit，所以这里算得准。
+    # 提示词缓存的三段 token（issue #69）：腾讯在流式末帧 usage 里给
+    # prompt_cache_hit_tokens / prompt_cache_miss_tokens / prompt_cache_write_tokens。
+    # **可空**：老上游不给这三个字段时是 NULL（「没数据」），与「给了但是 0」不是
+    # 一回事——后者代表这次请求真的没命中缓存，而前者代表我们不知道。
+    ('request_logs', 'cache_hit_tokens', 'INTEGER'),
+    ('request_logs', 'cache_miss_tokens', 'INTEGER'),
+    ('request_logs', 'cache_write_tokens', 'INTEGER'),
     ('api_keys', 'quota_credit', 'REAL NOT NULL DEFAULT 0'),
     ('api_keys', 'used_credit', 'REAL NOT NULL DEFAULT 0'),
     # 入站请求被拦的**原因**（issue #33）。
@@ -348,6 +458,35 @@ _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     # ——实测有用户发了 issue 也说不清是哪一种。
     # 存量记录为 NULL（那时没记原因），界面按「未记录」展示。
     ('ip_access_logs', 'reason', 'TEXT'),
+    # 本次请求**实际用了哪个上游账号**（issue #69）。
+    #
+    # 为什么需要单独记：账号是**上游**选的，本端转发时并不知道。此前日志里
+    # 只有「请求了什么」，没有「谁答的」，于是两件事都无法回答：
+    #   · 同一把密钥的连续请求是否被分散到了不同账号（上游的轮换是否在工作）；
+    #   · 某个账号是不是在拖后腿（错误率/延迟异常）。
+    # 客户端的 system prompt 命中缓存时，同一账号才会命中同一份前缀缓存——
+    # 所以这一列也是判断「为什么这次没走缓存」的线索。
+    #
+    # 值形如 `昵称(uid8)`，与上游日志里的写法一致；脱敏与截断在写入侧做。
+    # NULL = 未关联上（采集不可用、或该条在上游日志里已滚掉），界面显示「—」。
+    ('request_logs', 'account', 'TEXT'),
+    # 输入侧命中缓存的 token 数（上游 usage.prompt_cache_hit_tokens）。
+    #
+    # 为什么值得单独记：prompt_tokens 是**含**缓存的，光看它看不出这次省了
+    # 多少——同一段 8k 前缀，命中与不命中的扣费能差约 17 倍（上游实测）。
+    # 缓存是否生效与「账号是否稳定」强相关，和上面那列一起看才有意义。
+    # NULL = 上游未返回该字段（旧版上游/非对话类请求），与「命中 0」是两回事。
+    ('request_logs', 'cache_hit_tokens', 'INTEGER'),
+    # 红包的抽奖支持：抽奖码 + 明文密钥 + 领取记录。
+    #
+    # 必须走迁移而不只是改建表语句：`CREATE TABLE IF NOT EXISTS` 对**已存在**
+    # 的表什么都不做（红包那两张表在本功能的前半部分就建好了），不补列的话
+    # 升级上来的部署一抽奖就报「no such column」。新装不受影响，两条路径
+    # 都要能走通，所以建表语句与迁移两处都得有。
+    ('red_packets', 'code', 'TEXT'),
+    ('red_packet_shares', 'token', "TEXT NOT NULL DEFAULT ''"),
+    ('red_packet_shares', 'claimed_by_ip', 'TEXT'),
+    ('red_packet_shares', 'claimed_at', 'INTEGER'),
 )
 
 
@@ -496,6 +635,27 @@ def get_setting(key: str, default: Any = None) -> Any:
         return default
 
 
+# ── 账号备注（issue #67）────────────────────────────────
+#
+# 备注按 **uid** 关联，不按文件名：临时停用会把文件改成 `.disabled`，按文件名存
+# 会让备注在停用/启用之间丢掉。调用方负责先解析出 uid（见 accounts 路由）。
+def set_account_note(uid: str, note: str) -> None:
+    execute(
+        'INSERT INTO account_notes(uid, note, updated_at) VALUES(?, ?, ?) '
+        'ON CONFLICT(uid) DO UPDATE SET note = excluded.note, updated_at = excluded.updated_at',
+        (str(uid), str(note), int(time.time())),
+    )
+
+
+def delete_account_note(uid: str) -> None:
+    execute('DELETE FROM account_notes WHERE uid = ?', (str(uid),))
+
+
+def account_notes() -> dict[str, str]:
+    """全部备注 {uid: note}。账号列表一次取回，避免按账号逐条查。"""
+    return {str(r['uid']): str(r['note']) for r in query('SELECT uid, note FROM account_notes')}
+
+
 def set_setting(key: str, value: Any) -> None:
     execute(
         'INSERT INTO settings(key, value) VALUES(?, ?) '
@@ -562,6 +722,27 @@ def add_checkin_log(
         'VALUES(?, ?, ?, ?, ?, ?, ?, ?)',
         (int(time.time()), uid or '', nickname or '', source, kind, 1 if success else 0, code, message),
     )
+
+
+def checkin_done_since(ts_from: int) -> dict[str, int]:
+    """每个账号在 `ts_from` 之后**最近一次成功**签到的时刻（uid → ts）。
+
+    没有记录的账号不出现在结果里，调用方用 `.get(uid)` 判空即可。
+
+    为什么成功判定直接用 `success = 1` 而不看 code：签到侧把两种都记成成功——
+    `0`（本次签到成功）与 `10001`（今天已签过）——而这两者对「今天签没签」是
+    同一个答案。`-2`（国际版无签到体系）与各种失败都是 `success = 0`，不会污染。
+    换句话说：这里问的是「今天签到这件事有没有办成过」，不是「是谁办的」。
+
+    仅取时间不取 code / source：界面要的是「签没签、什么时候签的」，多取列反而
+    得为「同一 ts 多条」写去重。
+    """
+    rows = query(
+        'SELECT uid, MAX(ts) AS ts FROM checkin_logs '
+        "WHERE success = 1 AND ts >= ? AND uid != '' GROUP BY uid",
+        (int(ts_from),),
+    )
+    return {str(r['uid']): int(r['ts']) for r in rows if r['ts'] is not None}
 
 
 # days 参数的统一上限。**必须有上限**：超大整数在 SQLite 绑定时会溢出抛错
@@ -760,19 +941,78 @@ def add_request_log(**fields: object) -> None:
     execute(
         'INSERT INTO request_logs(ts, key_id, ip, model, mapped_model, status, '
         'prompt_tokens, completion_tokens, latency_ms, first_token_ms, ua, error, '
-        'stream, credit, realm) '
-        'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'stream, credit, realm, account, cache_hit_tokens, cache_miss_tokens, '
+        'cache_write_tokens) '
+        'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         (fields.get('ts'), fields.get('key_id'), fields.get('ip'),
          fields.get('model'), fields.get('mapped_model'), fields.get('status'),
          fields.get('prompt_tokens'), fields.get('completion_tokens'),
          fields.get('latency_ms'), fields.get('first_token_ms'), fields.get('ua'),
          fields.get('error'), fields.get('stream'), fields.get('credit'),
-         fields.get('realm')),
+         fields.get('realm'), fields.get('account'), fields.get('cache_hit_tokens'),
+         fields.get('cache_miss_tokens'), fields.get('cache_write_tokens')),
     )
     _request_log_writes += 1
     if _request_log_writes >= _REQUEST_LOG_CHECK_EVERY:
         _request_log_writes = 0
         _prune_request_logs()
+
+
+# 账号回填的匹配窗口（秒）。
+#
+# 上游日志的时间戳是「请求结束」时刻，与本端 `request_logs.ts` 同义（也在
+# 请求结束时取的 `int(time.time())`），所以能直接比。实测两者相差 < 1 秒
+# （RTT + 双方时钟），窗口给 3 秒覆盖慢链路与时钟漂移。
+_ACCOUNT_MATCH_WINDOW = 3
+
+
+def attach_request_accounts(entries: Iterable[dict]) -> int:
+    """把从上游日志采集到的账号回填到对应的请求日志行（issue #69）。返回回填条数。
+
+    entries 形如 `[{'ts': 结束时刻(epoch 秒), 'model': 上游侧模型名,
+    'account': '昵称(uid8)'}]`。
+
+    匹配规则：**同模型 + 时间最接近 + 尚未回填**。
+
+    为什么用「最接近」而不是相等：本端记的是 `int(time.time())`（秒级截断），
+    上游给的是纳秒 —— 两者不可能相等，只能就近匹配。实测「最近的一行」总是
+    正确的那条；但**同一秒内有多个同模型请求**时无法区分，所以只挑
+    `account IS NULL` 的行，避免把已经填对的行改错（宁可漏填，不可填错）。
+
+    模型名两边都取**映射后**的名字（`mapped_model`），另兼看 `model` ——
+    映射表变更时两边可能只对得上一个。
+    """
+    filled = 0
+    for e in entries:
+        ts = e.get('ts')
+        acct = _clean(e.get('account'), 64)
+        # bool 是 int 的子类：`ts=True` 会当成「1970-01-01 00:00:01」，虽然只会
+        # 匹配到空窗（几乎没有这种行），但没有时间戳就不该参与匹配。
+        if not isinstance(ts, int) or isinstance(ts, bool) or not acct:
+            continue
+        model = _clean(e.get('model'), 128)
+        # 模型名为空时**不能**匹配：`model = ''` 会命中「模型列也是空」的那些行
+        # （历史记录里存在），等于把账号填到一条毫不相干的日志上。宁可漏填。
+        if not model:
+            continue
+        try:
+            row = query_one(
+                'SELECT id FROM request_logs '
+                'WHERE account IS NULL AND ts BETWEEN ? AND ? '
+                '  AND (mapped_model = ? OR model = ?) '
+                'ORDER BY ABS(ts - ?) LIMIT 1',
+                (ts - _ACCOUNT_MATCH_WINDOW, ts + _ACCOUNT_MATCH_WINDOW,
+                 model, model, ts),
+            )
+            if row is None:
+                continue
+            execute('UPDATE request_logs SET account = ? WHERE id = ?',
+                    (acct, row['id']))
+            filled += 1
+        except Exception:  # noqa: BLE001
+            # 回填是旁路：任何异常都不能影响采集循环的其余部分
+            continue
+    return filled
 
 
 def add_ip_access_log(ip: object, path: object, blocked: bool, ua: object,

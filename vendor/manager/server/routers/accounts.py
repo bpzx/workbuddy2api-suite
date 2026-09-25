@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import time
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
@@ -15,6 +16,22 @@ from ..services.realm import realm_of, supports_checkin
 router = APIRouter(prefix='/api', tags=['accounts'])
 
 
+def _today_start() -> int:
+    """本地时区「今天 0 点」的 epoch 秒 —— 签到状态按**自然日**判定。
+
+    两件事都要求自然日口径：
+
+      · 腾讯侧签到就是按自然日算的（重复签到时它回 10001「今日已签到」）；
+      · 界面要回答的是「今天签没签」，不是「最近 24 小时签没签」。
+
+    为什么用本地时间而不是 UTC：容器 TZ=Asia/Shanghai（见 docker-compose.yml），
+    这里若按 UTC 取当天 0 点，中国时间每天 08:00 之前会被算成「昨天」——
+    表现为早上刚签完，界面又说没签。
+    """
+    now = datetime.datetime.now()
+    return int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+
+
 @router.get('/accounts')
 async def list_accounts(user: dict = Depends(security.current_user)) -> dict:
     """账号列表：本地授权信息 + 上游运行时状态（含积分余额）。
@@ -25,6 +42,19 @@ async def list_accounts(user: dict = Depends(security.current_user)) -> dict:
     accounts = wb2api.list_auth_accounts()
     status = await wb2api.get_status()
     wb2api.merge_pool_status(accounts, status)
+    # 备注随列表一次带回（issue #67）：按 uid 取，没有备注的账号给空串而不是缺字段
+    # —— 前端两处视图（手机卡片 / 桌面表格）都直接读它，缺字段会多一处判空。
+    notes = db.account_notes()
+    # 今日签到状态随列表一次带回（和备注同一个理由：两处视图都直接读它）。
+    # 数据源是本端签到记录 —— 腾讯对「今天已签过」回 10001 且我们照记，
+    # 所以「本端签过」与「今天已签到」在这里是同一件事。上游自动签到不产
+    # 逐账号记录（它只打一行汇总），所以首次进入面板时可能显示未签到，
+    # 手动点一次拿到 10001 后就归位了 —— 这一点在界面上如实说明。
+    done_today = db.checkin_done_since(_today_start())
+    for a in accounts:
+        uid = str(a.get('uid') or '')
+        a['note'] = notes.get(uid, '')
+        a['checkin_today'] = done_today.get(uid)
     synced = sum(1 for a in accounts if a.get('credits') is not None)
     return {
         'total': len(accounts),
@@ -300,6 +330,21 @@ async def account_checkin(filename: str, user: dict = Depends(security.require_a
         db.add_checkin_log(uid, nickname, 'manual', False, None, '该账号无有效 accessToken')
         return {'code': -1, 'message': '该账号无有效 accessToken'}
 
+    # 今天已经签过就不再打上游：腾讯对重复签到回 10001（幂等成功，不是错误），
+    # 但每点一次都是一次真实 RPC，而且会在签到记录里堆出一串「今日已签到」，
+    # 把真正的失败记录挤出视线（线上实测：同一个账号一天被记了 11 条）。
+    # 这里就地返回、不写日志，让「签到记录」保持「每次实际动作一条」。
+    done_at = db.checkin_done_since(_today_start()).get(uid)
+    if done_at is not None:
+        return {
+            'code': 10001,
+            'already': True,
+            'message': '今日已签到，无需重复',
+            'checkin_today': done_at,
+            'credits': None,
+            'expiries': [],
+        }
+
     # 传完整 auth dict：billing 域要带 X-User-Id 等身份头（对齐上游 BillingHeaders）
     code, message = await tencent.checkin({
         'access_token': token,
@@ -328,6 +373,9 @@ async def account_checkin(filename: str, user: dict = Depends(security.require_a
     return {
         'code': code,
         'message': message,
+        # 10001 = 腾讯说「今天已签过」：这也是成功，但和「本次刚签上」在提示语上
+        # 要分开说 —— 否则用户会以为自己的点击真的又签了一次。
+        'already': code == 10001,
         'credits': credits,
         'expiries': expiries,
     }
@@ -362,7 +410,7 @@ async def account_credits(
 @router.post('/accounts/refresh-credits')
 async def refresh_all_credits(
     force: bool = True,
-    user: dict = Depends(security.require_admin),
+    user: dict = Depends(security.current_user),
 ) -> dict:
     """并发查询所有账号的积分，返回 {uid: credits} 与每条是否来自缓存。
 
@@ -370,7 +418,22 @@ async def refresh_all_credits(
     本接口直接向腾讯查询。force=true（默认）用于「刷新积分」按钮，
     强制绕过 60 秒缓存；force=false 用于页面加载，命中缓存时不重复请求腾讯。
     无论哪种，都回传 cached / cache_age，前端据此标注「实时 / 缓存」。
+
+    ## 权限（issue #56）
+
+    `force=false`（页面加载那条路）**任何已登录用户都能调**：它读取的是
+    账号余额，属于只读信息，只读账号同样应当看到**同一份**数字。
+    此前整个接口都是 admin-only，于是只读账号的页面加载静默 403，界面
+    回退到上游 `/status` 的快照值——那是「上游上次调度这个账号时记下的」，
+    可能滞后数小时、也可能还是 0，用户看到的就是「积分不对 / 有两个显示 0」。
+
+    `force=true`（显式点「刷新积分」）仍然只有管理员能调：它会**强制**绕过
+    缓存、对所有账号发起一次真实查询，属于「主动触发外部调用」的动作，
+    不该由只读账号驱动。
     """
+    if force and str(user.get('role') or '') != 'admin':
+        raise HTTPException(status_code=403, detail='刷新积分需要管理员权限')
+
     accounts = wb2api.list_auth_accounts()
 
     async def one(
@@ -427,6 +490,7 @@ async def checkin_all(user: dict = Depends(security.require_admin)) -> dict:
     后端却还在跑，用户容易重复点击。并发后总耗时约等于最慢的单个账号。
     """
     accounts = wb2api.list_auth_accounts()
+    done_today = db.checkin_done_since(_today_start())
     sem = _checkin_semaphore()
 
     async def one(acc: dict) -> dict:
@@ -451,7 +515,15 @@ async def checkin_all(user: dict = Depends(security.require_admin)) -> dict:
         if not supports_checkin(realm_of(auth)):
             msg = '国际版无签到体系，已跳过'
             db.add_checkin_log(uid, nickname, 'manual-batch', False, -2, msg)
-            return {'nickname': nickname, 'ok': False, 'code': -2, 'message': msg}
+            return {'nickname': nickname, 'ok': False, 'skipped': True,
+                    'code': -2, 'message': msg}
+
+        # 今日已签到：跳过（理由同单账号签到 —— 重复点是白打的 RPC，
+        # 还会在签到记录里堆出一串「今日已签到」把失败记录挤下去）。
+        # 结果里照报，界面才能显示「N 个今日已签到」而不是让它们凭空消失。
+        if uid and uid in done_today:
+            return {'nickname': nickname, 'ok': True, 'already': True,
+                    'code': 10001, 'message': '今日已签到，已跳过'}
 
         async with sem:
             # 传完整 auth dict：billing 域要带 X-User-Id 等身份头
@@ -468,8 +540,24 @@ async def checkin_all(user: dict = Depends(security.require_admin)) -> dict:
         return {'nickname': nickname, 'ok': ok, 'code': code, 'message': message}
 
     results = await asyncio.gather(*(one(a) for a in accounts)) if accounts else []
-    succeeded = sum(1 for r in results if r['ok'])
-    return {'total': len(results), 'succeeded': succeeded, 'results': list(results)}
+    # 两类账号都不进 `total` 分母，各自单独报数：
+    #   · skipped：国际版没有签到体系，既不会成功也不是失败。算进 total 会显示成
+    #     「5/6 成功」，用户以为漏签了一个号、反复去点——而它永远是「已跳过」。
+    #   · already：今日已签到，本次压根没打上游。算进 total 会把「无需重复」说成
+    #     「刚签成功」，用户会以为这次点击真的又签了一次。
+    # 于是 total 的含义收敛成「本次真正发起并需要结果的账号数」，
+    # succeeded 自然就是「这次真签上了几个」。
+    applicable = [r for r in results if not r.get('skipped')]
+    already = [r for r in applicable if r.get('already')]
+    attempted = [r for r in applicable if not r.get('already')]
+    succeeded = sum(1 for r in attempted if r['ok'])
+    return {
+        'total': len(attempted),
+        'succeeded': succeeded,
+        'already': len(already),
+        'skipped': len(results) - len(applicable),
+        'results': list(results),
+    }
 
 
 @router.get('/checkin-logs')
@@ -504,6 +592,14 @@ def checkin_logs(
     # 各表都取到 start+size，保证合并后第 start..start+size 条一定在候选里
     want = start + size
 
+    # 版本筛选是**按行**做的（日志表没有 realm 列），被筛掉的往往是窗口里的大多数
+    # 行——另一个版本的记录。候选量因此要放大到单表上限，与 /task-logs 重算 stats
+    # 时同一做法。不放大会有两个后果：本版的记录被另一版挤出窗口（页面上「本版
+    # 一条都没有」），以及下面按窗口统计的 total 偏小（issue #51 的次要问题）。
+    realm_map = _realm_uid_filter(realm)
+    if realm_map is not None:
+        want = max(want, 2000)
+
     local = db.list_checkin_logs(limit=want, uid=uid, offset=0, days=days)
     local_total = db.count_checkin_logs(uid=uid, days=days)
     local_items = [{**r, 'auto': False} for r in local]
@@ -532,9 +628,14 @@ def checkin_logs(
     merged = sorted(local_items + auto_items, key=lambda x: x['ts'], reverse=True)
 
     # 按版本过滤（realm 为空则不过滤，保持既有调用行为）
-    realm_map = _realm_uid_filter(realm)
     if realm_map is not None:
         merged = [it for it in merged if _uid_matches_realm(str(it.get('uid') or ''), realm_map, realm)]
+
+    # total 必须与**列表同一口径**（issue #51 次要问题）：此前它统计在版本过滤之前，
+    # 界面上「共 6 条 · 仅显示最近 2 条」而列表只有 2 条，用户以为记录丢了。
+    # 过滤生效时用过滤后的条数（窗口已放大到单表上限，见上），未过滤时保持原值。
+    total = len(merged) if realm_map is not None else local_total + auto_total
+    unfiltered_total = local_total + auto_total
 
     # 自动侧的行也要解析昵称（上游只带 uid 前 8 位）；本端的已有昵称
     resolve_nick = _nickname_resolver()
@@ -546,15 +647,21 @@ def checkin_logs(
     end = start + min(500, max(1, int(limit)))
     return {
         'items': merged[start:end],
-        'total': local_total + auto_total,
-        # 分别给出，便于界面说明「本端 N 条 / 自动 M 条」
+        'total': total,
+        # 分别给出，便于界面说明「本端 N 条 / 自动 M 条」。
+        #
+        # **这两个数故意不按版本过滤**（与上面的 `total` 不同）：界面用它说明
+        # 「清空会删掉多少条」，而清空是整表操作、不分版本——按版本过滤会让提示
+        # 少说数量。两个口径各有用途，别把它们「统一」掉。
         'local_total': local_total,
         'auto_total': auto_total,
+        # 两个版本合计的条数（版本筛选生效时，`total` 只数当前版本）
+        'unfiltered_total': unfiltered_total,
     }
 
 
 @router.post('/checkin-logs/clear')
-def clear_checkin_logs(user: dict = Depends(security.require_admin)) -> dict:
+def clear_checkin_logs(user: dict = Depends(security.require_session_admin)) -> dict:
     db.clear_checkin_logs()
     return {'ok': True}
 
@@ -620,12 +727,21 @@ def _realm_uid_filter(realm: str | None) -> dict[str, str] | None:
 
 
 def _uid_matches_realm(uid: str, realm_map: dict[str, str] | None, realm: str) -> bool:
-    """该日志行的 uid 是否属于指定版本（realm_map 为 None 时恒 True）。"""
+    """该日志行的 uid 是否属于指定版本（realm_map 为 None 时恒 True）。
+
+    **uid 为空的行属于所有版本**（issue #51）：轮次汇总行（`checkin done:
+    total=.. ok=..`）与脚本行不属于任何账号，是「这一轮跑没跑」的唯一凭据。
+    按「空 uid 不属于任何版本」处理会让它们在**每个**版本视图下都被筛掉——
+    用户看到的现象是「自动签到没跑」，而实际是记录被藏了。
+
+    与下面那段「删号的历史日志宁可不显示」不冲突：那种行的 uid **非空**
+    （属于某个真实账号，只是账号已不在表里），仍按前缀匹配的老规矩处理。
+    """
     if realm_map is None:
         return True
     u = str(uid or '')
     if not u:
-        return False
+        return True
     want = 'global' if str(realm).strip().lower() == 'global' else 'cn'
     full = realm_map.get(u)
     if full is not None:
@@ -718,7 +834,7 @@ async def collect_task_logs(user: dict = Depends(security.require_admin)) -> dic
 
 
 @router.post('/task-logs/clear')
-def clear_task_logs(user: dict = Depends(security.require_admin)) -> dict:
+def clear_task_logs(user: dict = Depends(security.require_session_admin)) -> dict:
     db.clear_task_logs()
     return {'ok': True}
 
@@ -879,17 +995,82 @@ async def account_refresh(filename: str, user: dict = Depends(security.require_a
         return {'ok': False,
                 'message': f'{message}，但写入账号文件失败：{exc}（有效期未保存）'}
 
-    reloaded = await reload.restart_now()
+    # restart_now() 返回 (ok, message) 二元组，必须解包：直接当布尔用会因为
+    # 非空元组恒为真，从而在重载失败时仍报「已重载生效」（且 reload_triggered
+    # 会变成数组、与前端声明的 boolean 不符）。
+    reloaded, reload_error = await reload.restart_now()
     return {
         'ok': True,
-        'message': message + ('，上游已重载生效' if reloaded else '；请手动重启上游以生效'),
+        'message': message + ('，上游已重载生效' if reloaded
+                              else f'；上游重载失败：{reload_error}，请在宿主机重启上游容器'),
         'reload_triggered': reloaded,
         'expires_at': fields.get('expires_at'),
     }
 
 
+@router.post('/accounts/{filename}/clear-cooling')
+async def account_clear_cooling(
+    filename: str,
+    user: dict = Depends(security.require_admin),
+) -> dict:
+    """强制退出账号级冷却、熔断/降权和模型级限流状态。
+
+    上游没有提供清除运行态冷却的管理接口，而 state.json 每 5 秒会被内存
+    Flush 覆盖。因此这个动作必须：停上游 → 原子修改目标账号 → 启上游 →
+    验证实时状态。只改目标 uid，不碰凭证、积分、禁用位或其它账号。
+    """
+    try:
+        raw = wb2api.read_account_file_any(filename)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail='账号文件不存在') from exc
+    uid = str((raw.get('account') or {}).get('uid') or '').strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail='该账号文件缺少 uid，无法定位上游状态')
+
+    ok, message, detail = await wb2api.force_clear_account_cooling(uid)
+    return {'ok': ok, 'message': message, **(detail or {})}
+
+
+@router.put('/accounts/{filename}/note')
+async def account_set_note(
+    filename: str,
+    body: dict = Body(...),
+    user: dict = Depends(security.require_admin),
+) -> dict:
+    """给账号写一句备注（issue #67）——比如「张叔叔」「备用号」「给小李用的」。
+
+    为什么需要：用手机号邀请注册的账号，昵称往往认不出是谁，删号时不知道该删哪个。
+
+    存法见 `db.account_notes` 的注释：**按 uid** 存在本端库里（不写进上游的账号
+    文件——那是上游按自己 schema 读写的文件，塞自定义字段会被它覆盖或超出 schema）。
+    uid 是账号的稳定标识，所以临时停用（改文件名）不会让备注丢。
+
+    空串 = 删除备注（不留空行）。
+    """
+    try:
+        raw = wb2api.read_account_file_any(filename)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail='账号文件不存在') from exc
+    uid = str((raw.get('account') or {}).get('uid') or '').strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail='该账号文件缺少 uid，无法保存备注')
+
+    # 先把**所有空白收起成单个空格**（审查补）：备注在列表里是单行展示 + 悬停看
+    # 全文，粘进来的多行文本（或中间一串空格）会让它看起来像坏数据；顺带把
+    # 「只有换行/空格」的输入归成空串 = 清除。
+    #
+    # 截断而不是拒绝：备注是给人看的短文本，粘多了不该报错丢掉整句。
+    # 上限取 100 字符（界面上也是这个 maxLength），够写清是谁/做什么用。
+    note = ' '.join(str(body.get('note') or '').split())[:100]
+    if note:
+        db.set_account_note(uid, note)
+    else:
+        db.delete_account_note(uid)
+    return {'ok': True, 'uid': uid, 'note': note}
+
+
 @router.delete('/accounts/{filename}')
-async def account_delete(filename: str, user: dict = Depends(security.require_admin)) -> dict:
+async def account_delete(filename: str, user: dict = Depends(security.require_session_admin)) -> dict:
     try:
         removed = wb2api.delete_auth_account(filename)
     except ValueError as exc:
@@ -901,9 +1082,44 @@ async def account_delete(filename: str, user: dict = Depends(security.require_ad
 
 
 @router.post('/restart')
-async def restart(user: dict = Depends(security.require_admin)) -> dict:
+async def restart(user: dict = Depends(security.require_session_admin)) -> dict:
     ok, message = await reload.restart_now()
     return {'ok': ok, 'message': message}
+
+
+def _fallback_why(bit_code: str, disabled: bool) -> str:
+    """回退到改名方式时，把「为什么没走状态位」说到可操作（issue #45 追问）。
+
+    `no_route` 有两种成因，界面上必须分得开：
+
+      · 配置里**没开** → 给出开关位置；
+      · 配置里**已开** → 说明运行中的上游没加载到它：上游只在启动时读这个开关，
+        改完必须**重启容器**；若已重启仍如此，就是镜像太旧（早于 2026-09-19）。
+        这条文案里带上**面板实际读的配置路径**——用户手改的常常是另一个文件
+        （实测反馈：「明明上游已经打开了 admin.enabled 还是不行」）。
+
+    `disabled` 决定文案的落点：**停用**要说清代价并给出「重新停用」的下一步；
+    **启用**时账号已经恢复，再说「再重新停用」是说不通的（用户点的是启用），
+    只提示「以后想让它保留签到与保活，去哪儿开开关」。
+    """
+    if bit_code != 'no_route':
+        return ''
+    if disabled:
+        tail = '已改用改名方式：账号将完全退出账号池，签到与保活也会一并停止。'
+        next_step = ('若要保留签到与保活，请到「设置 → 账号管理接口」开启后'
+                     '重启上游容器，再重新停用')
+    else:
+        tail = '已改用改名方式启用（该方式下账号退出账号池，任务也不执行）。'
+        next_step = ('若希望以后停用时保留签到与保活，请到「设置 → 账号管理接口」'
+                     '开启后重启上游容器')
+    enabled, where = wb2api.admin_enabled_in_config()
+    if enabled:
+        return (f'（上游配置里已开启管理接口（{where}），但运行中的上游没有提供它：'
+                '上游只在启动时读这个开关，改完配置需要重启上游容器才生效；'
+                '若已重启仍如此，说明上游镜像早于 2026-09-19。' + tail + '）')
+    if enabled is None:
+        return f'（{where}。' + tail + next_step + '）'
+    return '（该上游未启用管理接口，' + tail + next_step + '）'
 
 
 @router.post('/accounts/{filename}/disabled')
@@ -1012,10 +1228,7 @@ async def account_set_disabled(
             # 回退路径要如实说清代价，并给出**可操作的下一步**：「该上游未启用管理
             # 接口」只说了现状，用户不知道去哪儿开（实测反馈正是这个——看到提示后
             # 只能来问）。所以带上开关位置与生效条件。
-            + ('（该上游未启用管理接口，已改用改名方式：账号将完全退出账号池，'
-               '签到与保活也会一并停止。若要保留签到与保活，请到「设置 → 账号管理'
-               '接口」开启后重启上游容器，再重新停用）'
-               if bit_code == 'no_route' else '')
+            + _fallback_why(bit_code, disabled)
             + ('，正在重载上游使其生效' if reloaded
                else ('；请手动重启上游以生效' if result.get('changed') else ''))
         ),

@@ -13,8 +13,12 @@ import {
   Users,
   Power,
   CalendarCheck,
+  Check,
   Coins,
   ChevronRight,
+  RotateCcw,
+  Sparkles,
+  StickyNote,
 } from 'lucide-react';
 import {useHeartbeat} from '@/lib/use-heartbeat';
 import {notify} from '@/lib/toast';
@@ -33,6 +37,8 @@ import {EmptyState} from '@/components/common/layout/EmptyState';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
 import {AddAccountDialog} from '@/components/common/accounts/AddAccountDialog';
 import {CreditCountdown} from '@/components/common/accounts/CreditCountdown';
+import {AccountNoteDialog} from '@/components/common/accounts/AccountNoteDialog';
+import {AccountTaskDialog} from '@/components/common/accounts/AccountTaskDialog';
 import {useAuth} from '@/lib/auth-context';
 import {realmLabel, useRealm} from '@/lib/realm-context';
 import {useT} from '@/lib/i18n/provider';
@@ -55,6 +61,11 @@ export default function AccountsPage() {
   const [upstream, setUpstream] = useState<UpstreamStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [addOpen, setAddOpen] = useState(false);
+  // 备注编辑（issue #67）：记的是**哪个账号**而不是布尔——弹窗要以该账号当前的
+  // 备注为初值，否则会拿上一个账号的内容去保存。
+  const [noteTarget, setNoteTarget] = useState<Account | null>(null);
+  // 活动任务（单账号执行成长任务）的目标账号；null = 对话框关闭
+  const [taskTarget, setTaskTarget] = useState<Account | null>(null);
   const [busyFile, setBusyFile] = useState<string | null>(null);
   const [checkinAllBusy, setCheckinAllBusy] = useState(false);
   /** 每个账号积分是实时查询还是命中缓存（含缓存已存在秒数） */
@@ -141,14 +152,35 @@ export default function AccountsPage() {
     try {
       const r = await accountApi.checkinAll();
       const failed = r.total - r.succeeded;
+      // 两类账号都不计入分母，各自补一句说明，否则用户会以为漏签了：
+      //   skipped — 国际版没有签到体系，点多少次都是「已跳过」
+      //   already — 今天已经签过，本次没再打上游（这正是「不重复签到」的效果）
+      const notes = [
+        r.skipped > 0 ? t('accounts.checkinSkippedNote', {skipped: r.skipped}) : '',
+        r.already > 0 ? t('accounts.checkinAlreadyNote', {n: r.already}) : '',
+      ].filter(Boolean).join(' ');
+      const note = notes ? ' ' + notes : '';
       if (r.total === 0) {
-        notify.info(t('accounts.noCheckinTargets'));
+        // 「今天都已签到」和「没有可签到的账号」是两回事：前者是正常且理想的状态
+        // （说明当天不用再操作），后者说明池子里没有国内版账号。混成一句「没有
+        // 可签到的账号」会让前者看起来像出了问题。
+        if (r.already > 0) {
+          notify.ok(
+            t('accounts.checkinNothingPending'),
+            t('accounts.checkinNothingPendingDetail', {n: r.already}) + note,
+          );
+        } else {
+          notify.info(t('accounts.noCheckinTargets'), notes.trim() || undefined);
+        }
       } else if (failed === 0) {
-        notify.ok(t('accounts.checkinAllDone'), t('accounts.checkinAllDoneDetail', {ok: r.succeeded, total: r.total}));
+        notify.ok(
+          t('accounts.checkinAllDone'),
+          t('accounts.checkinAllDoneDetail', {ok: r.succeeded, total: r.total}) + note,
+        );
       } else {
         notify.warn(
           t('accounts.checkinPartial', {failed}),
-          t('accounts.checkinPartialDetail', {ok: r.succeeded, total: r.total}),
+          t('accounts.checkinPartialDetail', {ok: r.succeeded, total: r.total}) + note,
         );
       }
       await load();
@@ -180,8 +212,31 @@ export default function AccountsPage() {
     [merged, realm],
   );
 
+  /**
+   * 今天还没签到的账号数 —— 「全部签到」按钮据此显示与禁用。
+   *
+   * 判据与签到按钮的**可见条件**保持一致（国内版、且未被面板停用）：面板停用的
+   * 账号已完全退出账号池、签到也跟着停了，把它算进「待签到」会让按钮牌子上
+   * 永远留着一个点不掉、也签不了的数字。
+   */
+  const pendingCheckin = useMemo(
+    () =>
+      visible.filter(
+        (a) =>
+          (a.realm ?? 'cn') === 'cn' &&
+          a.disabled_by_panel !== true &&
+          a.checkin_today == null,
+      ).length,
+    [visible],
+  );
+
   /** 执行单账号操作（签到 / 测活 / 刷新 / 删除），成功后同步底栏计数 */
-  async function run(file: string, fn: () => Promise<unknown>, okMsg: string) {
+  async function run(
+    file: string,
+    fn: () => Promise<unknown>,
+    okMsg: string,
+    preferOkMsg = false,
+  ) {
     setBusyFile(file);
     try {
       const res = (await fn()) as {
@@ -202,7 +257,7 @@ export default function AccountsPage() {
           }));
         }
       }
-      (ok ? notify.ok : notify.err)(res.message || okMsg);
+      (ok ? notify.ok : notify.err)(ok && preferOkMsg ? okMsg : (res.message || okMsg));
       await load();
       window.dispatchEvent(new Event('workbuddy-manager:accounts-changed'));
     } catch (e) {
@@ -390,7 +445,8 @@ export default function AccountsPage() {
    *  —— 有人只能进容器翻 state.json 才知道。
    *
    *  所以它与状态徽章**并列**展示（不是替代）：账号确实可用，只是有模型受限。
-   *  悬停给出每个受限模型与预计恢复时间——上游台账里带权威的重置时刻。 */
+   *  徽章里列具体有哪些模型受限，悬停再给出每个模型的恢复时间——上游台账里
+   *  带权威的重置时刻。 */
   function renderModelLimit(a: Account) {
     const limited = rateLimitedModels(a);
     if (!limited.length) return null;
@@ -407,10 +463,15 @@ export default function AccountsPage() {
           : t('accounts.modelLimited');
       return `${m.model} · ${why}`;
     });
-    const first = limited[0];
-    const shown = limited.length === 1
-      ? first.model
-      : t('accounts.modelsCount', {count: limited.length, n: limited.length});
+    // 徽章里**直接给出模型名**（用户反馈：只知道「有 2 个模型受限」不够用，得知道
+    // 是哪些，才能换模型或者告诉调用方避开它们）。名字可能很长（`global:` 前缀的
+    // 型号尤甚），所以最多列两个，其余用「+N」带过；完整清单与各自恢复时间仍在
+    // 悬停里——那里才是逐条说明的地方。
+    const MAX_INLINE = 2;
+    const names = limited.slice(0, MAX_INLINE).map((m) => m.model).join(sep);
+    const shown = limited.length > MAX_INLINE
+      ? `${names} +${limited.length - MAX_INLINE}`
+      : names;
     return (
       <Badge
         variant="secondary"
@@ -423,10 +484,22 @@ export default function AccountsPage() {
   }
 
   /** 积分余额 + 数据来源标注。
-   *  明确区分「实时」与「缓存 x 秒前」，避免把滞后的数字当成刚查到的。 */
+   *  明确区分「实时」「缓存 x 秒前」与「上游快照」三种来源，避免把滞后的数字
+   *  当成刚查到的。
+   *
+   *  为什么要单独标出「上游快照」（issue #56）：实时值取不到时（查询失败，或
+   *  只读账号早先根本调不到该接口），界面会回退到上游 `/status` 的快照值 ——
+   *  那是**上游上次调度这个账号时记下的**，可能滞后数小时，也可能仍是 0。
+   *  实测只读账号看到两个账号显示 0（管理员视角是 6420 / 9353），而 0 会被当成
+   *  「余额耗尽」用红色渲染，看起来像账号出了故障。
+   *
+   *  所以快照值：① 打「上游快照」标签；② **不用红色** ——「快照说 0」不等于
+   *  「确实没积分」，不该报警。
+   */
   function renderCredits(a: Account) {
-    // 优先用刚查到的实时值，其次上游 /status 的缓存值
-    const value = liveCredits[a.uid] ?? a.credits;
+    // 优先用刚查到的实时值，其次上游 /status 的快照值
+    const live = liveCredits[a.uid];
+    const value = live ?? a.credits;
     if (value === null || value === undefined) {
       return (
         <span
@@ -438,8 +511,10 @@ export default function AccountsPage() {
       );
     }
     const meta = creditsMeta[a.uid];
-    const tone =
-      value <= 0
+    const fromSnapshot = live === undefined;
+    const tone = fromSnapshot
+      ? 'text-muted-foreground'
+      : value <= 0
         ? 'text-red-600 dark:text-red-400'
         : value < 200
           ? 'text-amber-600 dark:text-amber-400'
@@ -449,7 +524,15 @@ export default function AccountsPage() {
         <span className={`text-xs font-medium tabular-nums ${tone}`} title={t('accounts.creditsTitle')}>
           {fmtNumber(value)}
         </span>
-        {meta &&
+        {fromSnapshot ? (
+          <span
+            className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] leading-3 text-muted-foreground"
+            title={t('accounts.snapshotTitle')}
+          >
+            {t('accounts.snapshot')}
+          </span>
+        ) : (
+          meta &&
           (meta.cached ? (
             <span
               className="rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] leading-3 text-amber-600 dark:text-amber-400"
@@ -464,8 +547,9 @@ export default function AccountsPage() {
             >
               {t('accounts.live')}
             </span>
-          ))}
-        <CreditCountdown expiries={meta?.expiries} />
+          ))
+        )}
+        <CreditCountdown expiries={fromSnapshot ? undefined : meta?.expiries} />
       </span>
     );
   }
@@ -504,6 +588,12 @@ export default function AccountsPage() {
     // 国际版没有签到体系（上游对 global 账号直接过滤，不发请求）。
     // 这一行的「签到」按钮对国际版账号只会返回「已跳过」，属误导，故不显示。
     const canCheckin = (a.realm ?? 'cn') === 'cn';
+    // 今天已经签过：按钮转为「已签到」并禁用。
+    // 为什么要在界面上拦：腾讯对重复签到回 10001（幂等成功），所以点下去「看着
+    // 也能成功」——但每次都真打一次 RPC，还会在签到记录里堆一串「今日已签到」，
+    // 把真正的失败记录挤下去。后端另有一道拦截（不发请求），这里是让用户
+    // 一眼看出「不用再点了」，而不是点了之后才知道。
+    const checkinDone = a.checkin_today != null;
     // 本面板改名停用（issue #21）：账号已完全退出账号池，签到等任务也随之停掉，
     // 所以隐藏其它操作（它们对这个号已无意义）。
     const paused = a.disabled_by_panel === true;
@@ -512,15 +602,60 @@ export default function AccountsPage() {
     // 「停用把签到也停了」，正好把这条路与改名那条的区别抹掉了。
     const viaBit = a.manual_disabled === true;
     const off = paused || viaBit;
+    const hasClearableState = a.cooling === true || rateLimitedModels(a).length > 0;
     return (
       <div className="flex justify-end gap-1">
+        {/* 备注（issue #67）：只动本端库里的一行文本，不碰上游、不重启容器，
+            所以放在最前——它是最轻的动作。任何状态下的账号都能写备注：
+            停用的号恰恰更容易忘了它是谁。 */}
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-7 w-7 rounded-md"
+          title={a.note ? t('accounts.noteEditTitle') : t('accounts.noteAdd')}
+          disabled={busy}
+          onClick={() => setNoteTarget(a)}
+        >
+          <StickyNote className={'h-3.5 w-3.5 ' + (a.note ? 'text-amber-600 dark:text-amber-400' : '')} />
+        </Button>
         {/* 临时停用 / 启用（issue #21、#45）。放在最前：它是最轻的「止血」动作——
             某个号在拖后腿（一直失败、触发风控）时，先停用它比删掉更合适
             （删除会丢凭证、只能重新扫码；停用是可逆的）。 */}
         {(!off || viaBit) && canCheckin && (
-          <Button variant="ghost" size="icon" className="h-7 w-7 rounded-md" title={t('accounts.checkin')} disabled={busy}
-            onClick={() => run(a.file, () => accountApi.checkin(a.file), t('accounts.opDone'))}>
-            <Gift className="h-3.5 w-3.5" />
+          <Button
+            variant="ghost"
+            size="icon"
+            className={
+              'h-7 w-7 rounded-md ' +
+              (checkinDone
+                ? 'text-emerald-600 hover:text-emerald-600 disabled:opacity-100 dark:text-emerald-400'
+                : '')
+            }
+            title={
+              checkinDone
+                ? t('accounts.checkinDoneTitle', {at: fmtDateTime(a.checkin_today as number)})
+                : t('accounts.checkin')
+            }
+            disabled={busy || checkinDone}
+            onClick={() => run(a.file, () => accountApi.checkin(a.file), t('accounts.opDone'))}
+          >
+            {checkinDone ? <Check className="h-3.5 w-3.5" /> : <Gift className="h-3.5 w-3.5" />}
+          </Button>
+        )}
+        {/* 活动任务（单账号）：与「任务」页的一键执行是同一套（调用上游
+            task_runner.py），区别是只对这一个账号跑 —— 池子里某个号想单独
+            补一轮任务时，不必把全部账号再跑一遍。国际版不适用 CN 任务中心
+            （脚本自己会 skip），所以与签到按钮同一个可见条件。 */}
+        {(!off || viaBit) && canCheckin && (
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-7 w-7 rounded-md"
+            title={t('accounts.taskRun')}
+            disabled={busy}
+            onClick={() => setTaskTarget(a)}
+          >
+            <Sparkles className="h-3.5 w-3.5" />
           </Button>
         )}
         {(!off || viaBit) && (
@@ -534,6 +669,31 @@ export default function AccountsPage() {
               <KeyRound className="h-3.5 w-3.5" />
             </Button>
           </>
+        )}
+        {!paused && hasClearableState && (
+          <ConfirmDialog
+            title={t('accounts.forceClearCoolingTitle')}
+            description={t('accounts.forceClearCoolingDesc')}
+            confirmText={t('accounts.forceClearCoolingConfirm')}
+            destructive
+            onConfirm={() => run(
+              a.file,
+              () => accountApi.clearCooling(a.file),
+              t('accounts.forceClearCoolingDone'),
+              true,
+            )}
+            trigger={
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-7 w-7 rounded-md text-rose-600 hover:text-rose-700 dark:text-rose-400"
+                title={t('accounts.forceClearCooling')}
+                disabled={busy}
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+              </Button>
+            }
+          />
         )}
         <Button
           variant="ghost"
@@ -610,6 +770,11 @@ export default function AccountsPage() {
                 }
               />
             )}
+            {/* 「刷新积分」= 强制查询（绕过 60 秒缓存），只有管理员能调。
+                只读账号页面加载时本来就会走缓存路径拿到实时值，所以这个按钮
+                对它们没有意义 —— 显示出来只会点了报 403（issue #56 之后权限
+                是明确的：force 仍限管理员）。与上面几个管理员操作同一个口径。 */}
+            {isAdmin && (
             <Button
               size="sm"
               variant="outline"
@@ -622,19 +787,34 @@ export default function AccountsPage() {
               <span className="hidden sm:inline">{t('accounts.refreshCredits')}</span>
               <span className="sm:hidden">{t('accounts.creditsShort')}</span>
             </Button>
+            )}
             {/* 「全部签到」仅国内版显示：国际版**没有签到体系**（上游调度器对
                 global 账号直接过滤，不发请求）。显示一个按下去只会得到「已跳过」
                 的按钮是误导，直接不给。 */}
+            {/* 「全部签到」反映当天状态：
+                · 还有待签的 → 文案回到「全部签到」，并带上待签数（不用点进去数）
+                · 今天都签过了 → 文案变「今日已签」并禁用。禁用比「点了提示已签到」
+                  更好：重复点击本来就不该发生，让按钮自己说出原因，比点完再报错省一次往返。
+                判据 pendingCheckin 与每行签到按钮的可见条件一致，不会出现
+                「按钮说还有 1 个、列表里却找不到那个号」的矛盾。 */}
             {isAdmin && realm === 'cn' && (
               <Button
                 size="sm"
                 variant="outline"
                 className="rounded-full"
                 onClick={checkinAll}
-                disabled={checkinAllBusy || !visible.length}
+                disabled={checkinAllBusy || pendingCheckin === 0}
+                title={
+                  pendingCheckin === 0
+                    ? t('accounts.checkinAllNoneTitle')
+                    : t('accounts.checkinAllTitle', {n: pendingCheckin})
+                }
               >
                 <CalendarCheck className={checkinAllBusy ? 'animate-pulse' : ''} />
-                {t('accounts.checkinAll')}
+                {pendingCheckin === 0 ? t('accounts.checkinAllNone') : t('accounts.checkinAll')}
+                {pendingCheckin > 0 && (
+                  <span className="tabular-nums opacity-70">{pendingCheckin}</span>
+                )}
               </Button>
             )}
             {isAdmin && (
@@ -665,6 +845,11 @@ export default function AccountsPage() {
                       {a.nickname || t('accounts.unnamed')}
                     </div>
                     <div className="truncate font-mono text-[10px] text-muted-foreground">{a.uid}</div>
+                    {a.note ? (
+                      <div className="truncate text-[10px] text-muted-foreground" title={a.note}>
+                        {t('accounts.noteLabel')}{a.note}
+                      </div>
+                    ) : null}
                   </div>
                 </div>
                 <div className="flex flex-wrap items-center justify-end gap-1.5">
@@ -711,9 +896,16 @@ export default function AccountsPage() {
                 <TableCell className="pl-4">
                   <div className="flex items-center gap-2.5">
                     {renderAvatar(a)}
-                    <span className={'truncate text-sm font-medium ' + (a.is_expired ? 'text-muted-foreground' : '')}>
-                      {a.nickname || t('accounts.unnamed')}
-                    </span>
+                    <div className="min-w-0">
+                      <div className={'truncate text-sm font-medium ' + (a.is_expired ? 'text-muted-foreground' : '')}>
+                        {a.nickname || t('accounts.unnamed')}
+                      </div>
+                      {a.note ? (
+                        <div className="truncate text-[10px] text-muted-foreground" title={a.note}>
+                          {t('accounts.noteLabel')}{a.note}
+                        </div>
+                      ) : null}
+                    </div>
                     <Badge
                       variant="secondary"
                       className={
@@ -773,6 +965,18 @@ export default function AccountsPage() {
       </div>
 
       <AddAccountDialog open={addOpen} onOpenChange={setAddOpen} onSuccess={load} />
+      <AccountNoteDialog
+        account={noteTarget}
+        open={noteTarget !== null}
+        onOpenChange={(open) => { if (!open) setNoteTarget(null); }}
+        onSaved={load}
+      />
+      <AccountTaskDialog
+        account={taskTarget}
+        open={taskTarget !== null}
+        onOpenChange={(open) => { if (!open) setTaskTarget(null); }}
+        onFinished={load}
+      />
     </div>
   );
 }

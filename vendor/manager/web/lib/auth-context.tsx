@@ -2,6 +2,7 @@
 
 import {createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode} from 'react';
 import {authApi} from '@/lib/api';
+import {BASE_PATH} from '@/lib/base-path';
 import type {Me, Role} from '@/lib/types';
 
 const ME_CACHE_KEY = 'wb-me';
@@ -74,7 +75,8 @@ export function AuthProvider({children}: {children: ReactNode}) {
     }
     setMe(null);
     writeCachedMe(null);
-    if (typeof window !== 'undefined') window.location.href = '/login';
+    // 裸跳转不走 next/router，basePath 不会自动生效，必须显式拼上
+    if (typeof window !== 'undefined') window.location.href = `${BASE_PATH}/login`;
   }, []);
 
   useEffect(() => {

@@ -5,6 +5,7 @@ import {KeyRound, Plus, Trash2, Ban, CircleCheck, Pencil, RotateCcw} from 'lucid
 import {useHeartbeat} from '@/lib/use-heartbeat';
 import {notify} from '@/lib/toast';
 import {keyApi, errText} from '@/lib/api';
+import {BASE_PATH} from '@/lib/base-path';
 import type {ApiKey} from '@/lib/types';
 import {fmtDateTime, fmtNumber} from '@/lib/format';
 import {PageHeader} from '@/components/common/layout/PageHeader';
@@ -27,6 +28,7 @@ import {
 } from '@/components/ui/select';
 import {Label} from '@/components/ui/label';
 import {Textarea} from '@/components/ui/textarea';
+import {Tabs, TabsList, TabsTrigger} from '@/components/ui/tabs';
 import {
   Dialog,
   DialogBody,
@@ -85,6 +87,13 @@ export default function KeysPage() {
   const {isAdmin} = useAuth();
   const {realm, label: realmName} = useRealm();
   const [keys, setKeys] = useState<ApiKey[]>([]);
+  /**
+   * 列表分组。红包一次生成一批、额度零碎，与手工建的混在一起很难看。
+   *
+   * 默认停在「普通密钥」而不是「全部」：日常看的是自己发出去的那几把，
+   * 红包那批是「发完就不太管」的；把它们混在首屏反而把常用的挤下去了。
+   */
+  const [tab, setTab] = useState<'normal' | 'packet'>('normal');
   const [loading, setLoading] = useState(true);
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<ApiKey | null>(null);
@@ -263,11 +272,33 @@ export default function KeysPage() {
     }
   }
 
-  // 下游接入地址：客户端才能拿到当前 origin，静态导出阶段为空
-  const baseUrl = typeof window !== 'undefined' ? window.location.origin : '';
+  // 下游接入地址：客户端才能拿到当前 origin，静态导出阶段为空。
+  // 子路径部署时网关也挂在前缀下（反代剥掉前缀再转发），所以要带上 basePath，
+  // 否则会把用户引到一个 404 的地址。
+  const baseUrl =
+    typeof window !== 'undefined' ? `${window.location.origin}${BASE_PATH}` : '';
+
+  // 分组过滤。keys 的量级是「几十到几百」，一次渲染算两遍不值得上 useMemo
+  // （那要多写一层依赖数组，还更容易漏依赖）。
+  const normalKeys = keys.filter((k) => !k.packet_id);
+  const packetKeys = keys.filter((k) => k.packet_id);
+  const shownKeys = tab === 'packet' ? packetKeys : normalKeys;
 
   return (
     <div className="flex flex-col gap-4 md:gap-6">
+      {/* 分组：红包一次生成一批、额度零碎，与手工建的混在一起很难看。
+          数字直接标在 tab 上，不用切过去才知道另一边有多少个。 */}
+      <Tabs value={tab} onValueChange={(v) => setTab(v as 'normal' | 'packet')}>
+        <TabsList className="rounded-full">
+          <TabsTrigger value="normal" className="rounded-full">
+            {t('keys.tabNormal')} · {normalKeys.length}
+          </TabsTrigger>
+          <TabsTrigger value="packet" className="rounded-full">
+            {t('keys.tabPacket')} · {packetKeys.length}
+          </TabsTrigger>
+        </TabsList>
+      </Tabs>
+
       <PageHeader
         title={t('keys.title')}
         description={t('keys.description')}
@@ -300,7 +331,7 @@ export default function KeysPage() {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {keys.map((k) => {
+            {shownKeys.map((k) => {
               const expired = !!k.expires_at && k.expires_at * 1000 < Date.now();
               // 两种额度任一超限都算「超额」——界面上必须与网关的拒绝口径**一致**，
               // 否则会出现「列表显示正常、调用却被 429」，用户会以为是网关坏了。
@@ -322,9 +353,9 @@ export default function KeysPage() {
                       <Badge variant="secondary" className="rounded-full text-emerald-600 dark:text-emerald-400">{t('keys.badgeOk')}</Badge>
                     )}
                   </TableCell>
-                  <TableCell className="text-xs text-muted-foreground">
-                    {k.expires_at ? fmtDateTime(k.expires_at) : t('keys.neverExpires')}
-                  </TableCell>
+                  {/* 版本必须排在有效期**前面**，与表头一致（issue #68：这两列的
+                      单元格与表头顺序反了，界面上「版本」列显示的是有效期、「有效期」
+                      列显示的是版本 —— 用户看到的就是这个错位）。 */}
                   <TableCell>
                     {k.realm === 'global' ? (
                       <Badge variant="secondary" className="rounded-full text-[10px]">{t('realm.global')}</Badge>
@@ -340,6 +371,9 @@ export default function KeysPage() {
                         {t('keys.realmUnset')}
                       </span>
                     )}
+                  </TableCell>
+                  <TableCell className="text-xs text-muted-foreground">
+                    {k.expires_at ? fmtDateTime(k.expires_at) : t('keys.neverExpires')}
                   </TableCell>
                   <TableCell className="text-xs text-muted-foreground">
                     {k.max_ips ? t('keys.ipLimit', {n: k.max_ips}) : t('keys.ipUnlimited')} /{' '}

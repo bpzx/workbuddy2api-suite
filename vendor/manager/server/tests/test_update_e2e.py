@@ -23,6 +23,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -117,7 +118,7 @@ class UpdateEndToEndTest(unittest.TestCase):
         (stage / 'server' / 'big.bin').write_bytes(os.urandom(200_000))
         if deploy_diff:
             (stage / 'deploy').mkdir()
-            (stage / 'deploy' / 'update.py').write_text('# 包内的（不应被自动采用）\n', encoding='utf-8')
+            (stage / 'deploy' / 'update.py').write_text('# 包内的（随包更新）\n', encoding='utf-8')
 
         pkg = Path(tempfile.mkdtemp(dir=self.dir)) / f'workbuddy-manager-v{version}.tar.gz'
         subprocess.run(['tar', 'czf', str(pkg), '-C', str(stage.parent), stage.name],
@@ -202,14 +203,39 @@ class UpdateEndToEndTest(unittest.TestCase):
         # 验签结果落到状态（界面据此显示「已验签」）
         self.assertEqual(rep.signature['status'], 'verified')
 
-        # deploy/ 绝不能被包内内容覆盖 —— 它是信任锚
+        # deploy/ 现在**随包更新**（维护者决定，见 issue #55）：更新器本身就在
+        # 这个目录里，不更新它意味着以后每次都用旧逻辑，它修过的毛病到不了用户手上
+        # （#28 修过的 compose 探测就是这么丢的）。
+        #
+        # 安全性依据：这一步在**验签之后**才执行（`verify_release_signature` 在
+        # 解压前就把整个包验过了），所以覆盖 deploy/ 与覆盖 server/ 是同一性质 ——
+        # 都是「维护者签过名的内容」。真正的不变量由下面那条攻击路径用例守着：
+        # 验签不过 → 整个更新中止、什么都不落盘。
         installed_deploy = (inst / 'deploy' / 'update.py').read_text(encoding='utf-8')
-        self.assertNotIn('包内的（不应被自动采用）', installed_deploy,
-                         'deploy/update.py 被包内容覆盖了 —— 信任锚已失守')
+        self.assertIn('包内的（随包更新）', installed_deploy,
+                      'deploy/ 没随包更新 —— 更新器会永远停在旧版本')
+        # 覆盖前必须备份（出问题能回退）
+        self.assertTrue(list((inst).glob('backup-*/deploy/update.py')),
+                        '覆盖 deploy/ 前没有备份')
+        self.assertIn('已同步到包内版本', rep.text())
+
+    def test_deploy_sync_can_be_disabled(self) -> None:
+        """`WB_SYNC_DEPLOY=0` 时保持本地 deploy/ 不动（手工维护者的退路）。
+
+        关掉时必须**告警**并说清代价（更新器会一直是旧的），不能静默跳过。
+        """
+        inst = self._make_install('ok')
+        pkg, sig = self._make_release('ok')
+        mod = self._load(inst)
+        with mock.patch.dict(os.environ, {'WB_SYNC_DEPLOY': '0'}):
+            ok, rep = self._run_update(mod, pkg, sig)
+        self.assertTrue(ok, rep.text())
+        installed_deploy = (inst / 'deploy' / 'update.py').read_text(encoding='utf-8')
+        self.assertNotIn('包内的（随包更新）', installed_deploy,
+                         '关了同步却还是被覆盖')
         self.assertIn('check_signature', installed_deploy)
-        # 且必须在日志里告警，而不是静默跳过
-        self.assertTrue(rep.warned(), 'deploy/ 有差异却没告警')
-        self.assertIn('已跳过同步', rep.text())
+        self.assertTrue(rep.warned(), '跳过同步却没告警')
+        self.assertIn('WB_SYNC_DEPLOY=0', rep.text())
 
     # ── 攻击路径：包被换过，必须中止且不落盘 ──
 
