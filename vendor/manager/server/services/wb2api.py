@@ -19,8 +19,11 @@ from . import realm as _realm
 from .realm import realm_of, supports_checkin
 
 
-def _safe_file(filename: str) -> Path:
+def _safe_file(filename: str, auth_dir: Path | None = None) -> Path:
     """把请求里的文件名解析为 auths 目录下的真实路径，非法即抛错。
+
+    auth_dir 非空时按该**分组**的账号目录解析（多分组 / 账号池，见 upstreamsvc），
+    缺省仍是本部署的 config.AUTH_DIR —— 存量调用方的行为逐字不变。
 
     穿越防线（`/`、反斜杠、`..`、NUL）是根本；此外只接受 `workbuddy*.json`
     这一种形态，避免越权读到目录里的其他文件（例如隐藏文件或临时文件）。
@@ -42,15 +45,16 @@ def _safe_file(filename: str) -> Path:
     # 不再匹配上游的 `workbuddy*.json` glob，于是上游不会加载它）。
     if not re.fullmatch(r'workbuddy[0-9A-Za-z_-]{0,80}\.json(\.disabled)?', filename):
         raise ValueError('非法的文件名')
-    target = config.AUTH_DIR / filename
+    base = auth_dir or config.AUTH_DIR
+    target = base / filename
     # 结尾必须是 .json 或 .json.disabled（上面正则已保证，这里再兜一层）
     if not (target.name.endswith('.json') or target.name.endswith('.json.disabled')):
         raise ValueError('非法的文件名')
     return target
 
 
-def read_account_file(filename: str) -> dict:
-    return json.loads(_safe_file(filename).read_text(encoding='utf-8'))
+def read_account_file(filename: str, auth_dir: Path | None = None) -> dict:
+    return json.loads(_safe_file(filename, auth_dir).read_text(encoding='utf-8'))
 
 
 def _jwt_times(access_token: str) -> tuple[int, int] | None:
@@ -104,8 +108,11 @@ def token_issued_at(access_token: str) -> int | None:
     return times[0] if times else None
 
 
-def list_auth_accounts() -> list[dict]:
+def list_auth_accounts(auth_dir: Path | None = None) -> list[dict]:
     """读取 auths/ 目录下的本地账号（与 /status 的运行时状态互补）。
+
+    auth_dir 非空时读该**分组**的账号目录（多分组 / 账号池，见 upstreamsvc）；
+    缺省读 config.AUTH_DIR —— 存量行为不变。
 
     同时收上游**加载不到**的两类文件，否则它们会在面板上「凭空消失」：
       · `workbuddy*.json.disabled` —— 本面板「临时禁用」改名的产物（见
@@ -113,12 +120,13 @@ def list_auth_accounts() -> list[dict]:
         否则「禁用」在使用体验上等同于「删除」。
     """
     out: list[dict] = []
-    if not config.AUTH_DIR.is_dir():
+    base = auth_dir or config.AUTH_DIR
+    if not base.is_dir():
         return out
     now = time.time()
     # 上游只加载 workbuddy*.json；我们额外收 .disabled，以便展示与恢复
-    files = sorted(config.AUTH_DIR.glob('workbuddy*.json'))
-    files += sorted(config.AUTH_DIR.glob('workbuddy*.json.disabled'))
+    files = sorted(base.glob('workbuddy*.json'))
+    files += sorted(base.glob('workbuddy*.json.disabled'))
     for path in files:
         try:
             raw = json.loads(path.read_text(encoding='utf-8'))
@@ -287,8 +295,8 @@ def merge_pool_status(accounts: list[dict], status: dict) -> list[dict]:
     return accounts
 
 
-def delete_auth_account(filename: str) -> bool:
-    target = _safe_file(filename)
+def delete_auth_account(filename: str, auth_dir: Path | None = None) -> bool:
+    target = _safe_file(filename, auth_dir)
     if target.exists():
         target.unlink()
         return True
@@ -303,7 +311,7 @@ DISABLED_SUFFIX = '.disabled'
 _DISABLED_SUFFIX = DISABLED_SUFFIX
 
 
-def read_account_file_any(filename: str) -> dict:
+def read_account_file_any(filename: str, auth_dir: Path | None = None) -> dict:
     """读账号文件，`workbuddy-x.json` 与 `workbuddy-x.json.disabled` **两种形态都试**。
 
     为什么需要：调用方手里的文件名可能与磁盘上的形态不一致——界面在「停用」
@@ -322,14 +330,15 @@ def read_account_file_any(filename: str) -> dict:
     last: FileNotFoundError | None = None
     for name in candidates:
         try:
-            return read_account_file(name)
+            return read_account_file(name, auth_dir)
         except FileNotFoundError as exc:
             last = exc
     assert last is not None          # 至少两个候选，循环必然执行过
     raise last
 
 
-def set_account_disabled(filename: str, disabled: bool) -> dict:
+def set_account_disabled(filename: str, disabled: bool,
+                         auth_dir: Path | None = None) -> dict:
     """临时禁用 / 启用一个账号（改名实现）。返回 {file, disabled, ...}。
 
     实现原理
@@ -363,11 +372,12 @@ def set_account_disabled(filename: str, disabled: bool) -> dict:
     · 只接受 `workbuddy*.json(.disabled)` 形态（走 `_safe_file` 的校验）；
     · 文件不存在时报错，避免「禁用成功」的假象。
     """
-    target = _safe_file(filename)
+    base_dir = auth_dir or config.AUTH_DIR
+    target = _safe_file(filename, base_dir)
     # 规范化成「原始账号名」与「禁用名」两种形态
     base = target.name[:-len(_DISABLED_SUFFIX)] if target.name.endswith(_DISABLED_SUFFIX) else target.name
-    base_path = _safe_file(base)
-    disabled_path = config.AUTH_DIR / (base + _DISABLED_SUFFIX)
+    base_path = _safe_file(base, base_dir)
+    disabled_path = base_dir / (base + _DISABLED_SUFFIX)
 
     if disabled:
         if disabled_path.exists():
@@ -394,16 +404,19 @@ def _err_text(exc: Exception) -> str:
     return f'{type(exc).__name__}: {detail}' if detail else type(exc).__name__
 
 
-def _auth_headers() -> dict:
-    key = config.upstream_api_key()
+def _auth_headers(api_key: str | None = None) -> dict:
+    """鉴权头。api_key=None 时取默认上游那把（config）；空串 = 不带鉴权头。"""
+    key = config.upstream_api_key() if api_key is None else api_key
     return {'Authorization': f'Bearer {key}'} if key else {}
 
 
-async def get_status() -> dict:
+async def get_status(*, base_url: str | None = None, api_key: str | None = None) -> dict:
+    """上游 /status。base_url / api_key 非空时查**指定分组**的实例（多分组）。"""
     # 连接超时短一些：上游未运行时快速失败，避免拖慢管理端页面
+    base = (base_url or config.WB2API_BASE).rstrip('/')
     try:
         async with config.http_client(10, connect=3) as client:
-            resp = await client.get(f'{config.WB2API_BASE}/status', headers=_auth_headers())
+            resp = await client.get(f'{base}/status', headers=_auth_headers(api_key))
         if resp.status_code >= 400:
             return {'connected': False, 'error': f'上游返回 {resp.status_code}'}
         data = resp.json()
@@ -439,7 +452,9 @@ def _admin_route_missing(resp: object) -> bool:
     return not (isinstance(data, dict) and isinstance(data.get('error'), dict))
 
 
-async def set_manual_disabled(uid: str, disabled: bool, reason: str = '') -> tuple[bool, str, str]:
+async def set_manual_disabled(uid: str, disabled: bool, reason: str = '',
+                              *, base_url: str | None = None,
+                              api_key: str | None = None) -> tuple[bool, str, str]:
     """用上游的 `manual_disabled` 状态位停用/启用账号。
 
     返回 `(是否成功, 说明文案, 结果码)`。结果码用于调用方决定是否回退：
@@ -477,11 +492,12 @@ async def set_manual_disabled(uid: str, disabled: bool, reason: str = '') -> tup
     if not uid:
         return False, 'uid 为空', 'error'
     action = 'disable' if disabled else 'enable'
-    url = f'{config.WB2API_BASE}/admin/accounts/{uid}/{action}'
+    base = (base_url or config.WB2API_BASE).rstrip('/')
+    url = f'{base}/admin/accounts/{uid}/{action}'
     body: dict = {'reason': reason} if (disabled and reason) else {}
     try:
         async with config.http_client(10, connect=3) as client:
-            resp = await client.post(url, json=body, headers=_auth_headers())
+            resp = await client.post(url, json=body, headers=_auth_headers(api_key))
     except Exception as exc:  # noqa: BLE001
         return False, _err_text(exc), 'error'
     if resp.status_code == 404:
@@ -877,8 +893,15 @@ def _kill_quietly(proc) -> None:
         pass
 
 
-async def restart_container() -> tuple[bool, str]:
-    """重启上游；native 模式走启停脚本，其余部署保持 Docker 行为。"""
+async def restart_container(container: str | None = None) -> tuple[bool, str]:
+    """重启上游；native 模式走启停脚本，其余部署保持 Docker 行为。
+
+    container 非空时**总是走 `docker restart <name>`**：多分组部署里每组一个
+    容器，而面板并不知道各组是 docker 还是 native —— 名字是用户在分组里填的，
+    填错会得到 docker 的原样报错（找不到容器），不会误伤别的对象。
+    """
+    if container:
+        return await _docker_restart(container)
     if config.WB2API_MODE == 'native':
         scripts = (config.WB2API_STOP_SCRIPT, config.WB2API_START_SCRIPT)
         missing = [str(path) for path in scripts if not path.is_file()]
@@ -918,7 +941,11 @@ async def restart_container() -> tuple[bool, str]:
                 return False, f'{script.name} 退出码 {proc.returncode}'
         return True, '原生 workbuddy2api 已重启'
 
-    name = config.WB2API_CONTAINER
+    return await _docker_restart(config.WB2API_CONTAINER)
+
+
+async def _docker_restart(name: str) -> tuple[bool, str]:
+    """`docker restart <name>`。抽出来是因为「默认上游」与「分组」都要用它。"""
     try:
         proc = await asyncio.create_subprocess_exec(
             'docker', 'restart', name,

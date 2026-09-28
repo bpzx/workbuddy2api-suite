@@ -1,8 +1,9 @@
 'use client';
 
-import {useCallback, useEffect, useState} from 'react';
-import {Gift, Plus, Copy, Check, Download, Undo2, Link2, RefreshCw} from 'lucide-react';
+import {useState} from 'react';
+import {Gift, Plus, Copy, Check, Download, Undo2, Link2} from 'lucide-react';
 import {useHeartbeat} from '@/lib/use-heartbeat';
+import {useAsyncAll} from '@/lib/use-async-data';
 import {notify} from '@/lib/toast';
 import {redPacketApi, errText} from '@/lib/api';
 import type {
@@ -12,6 +13,8 @@ import {fmtDateTime, fmtNumber} from '@/lib/format';
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {EmptyState} from '@/components/common/layout/EmptyState';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
+import {LoadError} from '@/components/common/states/LoadError';
+import {SkeletonBar} from '@/components/common/states/SkeletonBar';
 import {useAuth} from '@/lib/auth-context';
 import {Button} from '@/components/ui/button';
 import {Input} from '@/components/ui/input';
@@ -46,8 +49,20 @@ export default function RedPacketsPage() {
   const t = useT();
   const {isAdmin} = useAuth();
 
-  const [list, setList] = useState<RedPacket[]>([]);
-  const [loading, setLoading] = useState(true);
+  /**
+   * 红包列表 = 这一页的**主数据**，接统一状态系统。
+   *
+   * 原实现是「`loading` 初值 true，`finally` 里置 false」+ 裸 `try/catch`：
+   * 取数失败时 `loading` 也会变 false，于是页面落进 `list.length === 0` 那一支，
+   * 渲染出「暂无红包」——而事实是**没取到**。用户据此会以为红包发完了/被清了。
+   * 失败只弹一个几秒后消失的 toast，切回来时页面上看不出任何异常。
+   */
+  const {values, isInitialLoading, isInitialFailed, isRefreshing, reload} =
+    useAsyncAll({list: () => redPacketApi.list()}, []);
+
+  /** 红包列表；`undefined` = 还没取到（首屏加载中，或它自己失败了） */
+  const list: RedPacket[] | undefined = values.list;
+
   /** 创建结果 —— 含**明文 key**，只在这一刻有；关掉就再也拿不到。 */
   const [created, setCreated] = useState<CreatedRedPacket | null>(null);
   const [detail, setDetail] = useState<RedPacketDetail | null>(null);
@@ -63,20 +78,7 @@ export default function RedPacketsPage() {
   /** 模型白名单（逗号或换行分隔）。**token 红包必填、积分红包不显示**。 */
   const [models, setModels] = useState('');
 
-  const load = useCallback(async () => {
-    try {
-      setList(await redPacketApi.list());
-    } catch (e) {
-      notify.err(t('redPacket.loadFailed'), errText(e));
-    } finally {
-      setLoading(false);
-    }
-  }, [t]);
-
-  useEffect(() => {
-    void load();
-  }, [load]);
-  useHeartbeat(load, 30000);
+  useHeartbeat(reload, 30000);
 
   async function submit() {
     const amount = Number(total);
@@ -116,7 +118,7 @@ export default function RedPacketsPage() {
       setCreated(out);
       setFormOpen(false);
       setTitle('');
-      await load();
+      await reload();
     } catch (e) {
       notify.err(t('redPacket.createFailed'), errText(e));
     } finally {
@@ -192,20 +194,47 @@ export default function RedPacketsPage() {
     URL.revokeObjectURL(url);
   }
 
+  const header = (
+    <PageHeader
+      title={t('redPacket.title')}
+      description={t('redPacket.desc')}
+      actions={
+        isAdmin ? (
+          <Button className="rounded-full" onClick={() => setFormOpen((v) => !v)}>
+            <Plus className="mr-1.5 h-4 w-4" />
+            {t('redPacket.new')}
+          </Button>
+        ) : null
+      }
+    />
+  );
+
+  /**
+   * 首屏守卫：数据还没到（或根本没取到）时不渲染列表区。
+   *
+   * 必须**排在**「暂无红包」之前 —— 否则取数失败时那句空态会照常出现，等于告诉
+   * 用户「红包列表是空的」，而事实是没取到。判据用 `isInitialLoading` /
+   * `isInitialFailed`（按「有没有数据」判定），不用「请求在不在飞」：后者会让
+   * 30 秒一次的心跳把骨架闪一遍。
+   *
+   * 只有列表这一份数据，所以这里可以直接早返回；`created`（明文 key 面板）在
+   * 创建后才会出现，那时列表已经加载过，不会再回到 isInitialLoading。
+   */
+  if (isInitialFailed || isInitialLoading) {
+    return (
+      <div className="flex flex-col gap-4">
+        {header}
+        {isInitialFailed ? <LoadError variant="page" onRetry={reload} /> : <RedPacketsSkeleton />}
+      </div>
+    );
+  }
+
+  /** 首屏守卫之后 `list` 必然已取到；`?? []` 只为类型收窄（见下方注释） */
+  const rows: RedPacket[] = list ?? [];
+
   return (
-    <div className="flex flex-col gap-4">
-      <PageHeader
-        title={t('redPacket.title')}
-        description={t('redPacket.desc')}
-        actions={
-          isAdmin ? (
-            <Button className="rounded-full" onClick={() => setFormOpen((v) => !v)}>
-              <Plus className="mr-1.5 h-4 w-4" />
-              {t('redPacket.new')}
-            </Button>
-          ) : null
-        }
-      />
+    <div className="flex flex-col gap-4" aria-busy={isRefreshing}>
+      {header}
 
       {/* 创建表单 */}
       {formOpen && isAdmin && (
@@ -344,13 +373,10 @@ export default function RedPacketsPage() {
         </section>
       )}
 
-      {/* 列表 */}
+      {/* 列表。走到这里 `list` 一定已经取到了（首屏守卫已在上方返回），
+          `?? []` 只是给类型收窄用，不会真的落空。 */}
       <section className="overflow-hidden rounded-[20px] bg-muted">
-        {loading ? (
-          <div className="flex items-center justify-center py-10 text-muted-foreground">
-            <RefreshCw className="mr-2 h-4 w-4 animate-spin" />{t('common.loading')}
-          </div>
-        ) : list.length === 0 ? (
+        {rows.length === 0 ? (
           <EmptyState
             icon={Gift}
             title={t('redPacket.empty')}
@@ -370,7 +396,7 @@ export default function RedPacketsPage() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {list.map((p) => (
+              {rows.map((p) => (
                 <TableRow key={p.id} className="cursor-pointer border-b border-border/40"
                           onClick={() => openDetail(p)}>
                   <TableCell className="pl-4 text-xs">{p.title || '—'}</TableCell>
@@ -442,7 +468,7 @@ export default function RedPacketsPage() {
                                     const r = await redPacketApi.revoke(p.id);
                                     notify.ok(t('redPacket.revoked'),
                                               t('redPacket.revokedDetail', {n: r.revoked}));
-                                    await load();
+                                    await reload();
                                   } catch (e) {
                                     notify.err(t('redPacket.revokeFailed'), errText(e));
                                   }
@@ -509,5 +535,37 @@ export default function RedPacketsPage() {
       </Drawer>
 
     </div>
+  );
+}
+
+/**
+ * 首屏骨架：与真实版面逐块对应（一张 `bg-muted` 卡片 + 表头 + 若干行）。
+ *
+ * 换掉原来的「转圈 + 加载中…」有两个理由：一是转圈只说明「在忙」，说不出
+ * 「忙完这里会出现什么」；二是它与空态的位置/尺寸差得远，数据到达时会跳一下。
+ * 骨架把版面形状先摆出来，加载完成时内容**填进原位**，不跳。
+ *
+ * 行数固定 4：真实行数未知，固定值只为给出「这是一张表」的形状。
+ */
+function RedPacketsSkeleton() {
+  return (
+    <section className="overflow-hidden rounded-[20px] bg-muted">
+      <div className="flex items-center gap-4 border-b border-border/60 px-4 py-3">
+        {Array.from({length: 4}, (_, i) => (
+          <SkeletonBar key={i} className="h-3 w-16" />
+        ))}
+      </div>
+      <div className="divide-y divide-border/40">
+        {Array.from({length: 4}, (_, i) => (
+          <div key={i} className="flex items-center gap-4 px-4 py-3.5">
+            <SkeletonBar className="h-3.5 w-32 max-w-[30%]" />
+            <SkeletonBar className="h-3.5 w-14" />
+            <SkeletonBar className="h-3.5 w-16" />
+            <SkeletonBar className="hidden h-3.5 w-12 sm:block" />
+            <SkeletonBar className="hidden h-3.5 w-20 md:block" />
+          </div>
+        ))}
+      </div>
+    </section>
   );
 }

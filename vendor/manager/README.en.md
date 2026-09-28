@@ -110,6 +110,20 @@ upstream repo is gone, and its source is now maintained here.
   credits and credentials stay alive and you can bring it back at any time. On older
   upstream versions the panel falls back to fully removing the account from the pool and
   says so in the message
+- **Account groups (multiple account pools)** — switch between groups at the top of the
+  account page; "Add group" only asks for a name (the upstream URL defaults to the default
+  group's, the API key is inherited when the URL matches it, and the account directory gets
+  a suggested path). Clients still see **one address**: each group's upstream instance
+  listens on localhost only (e.g. `127.0.0.1:7865`), and a key bound to a group only ever
+  reaches that group's accounts. "Move to group" transfers the account file itself —
+  credentials are untouched — and refuses to overwrite a same-named file in the target.
+  Groups with no account directory are **forwarding-only** (the account page is read-only
+  there, and add / move / delete report an explicit error instead of silently falling back
+  to the default group). A group that shares the default group's instance (same URL) will
+  **never load its accounts**: the upstream only reads its own account directory, so those
+  accounts show "not loaded" and are never used for forwarding or check-in — deploy a second
+  instance and point the group's URL at it to really separate the pools (the account page
+  says so in place)
 - **Credit change ledger** — every channel that increases the balance is recorded. The
   upstream only logs travel rewards; check-in and activity reports log nothing, so we
   compare balances after each credit query and record any increase

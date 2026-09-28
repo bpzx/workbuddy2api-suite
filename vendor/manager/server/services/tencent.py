@@ -246,7 +246,8 @@ def _atomic_write_json(target: Path, payload: dict) -> None:
         raise
 
 
-def update_auth_tokens(filename: str, fields: dict) -> None:
+def update_auth_tokens(filename: str, fields: dict,
+                       auth_dir: Path | None = None) -> None:
     """就地更新账号文件里的 token 字段，**其余原样保留**（issue #40）。
 
     与 `write_auth_file` 的分工：那个是「新建/重登」，按登录响应重建整份文件；
@@ -261,7 +262,7 @@ def update_auth_tokens(filename: str, fields: dict) -> None:
     文件不存在时抛 FileNotFoundError；解析失败时抛 ValueError（宁可不写，
     也不要把一份坏内容覆盖到用户仅存的凭证上）。
     """
-    target = _safe_auth_path(filename)
+    target = _safe_auth_path(filename, auth_dir)
     try:
         raw = json.loads(target.read_text(encoding='utf-8'))
     except FileNotFoundError:
@@ -291,18 +292,22 @@ def update_auth_tokens(filename: str, fields: dict) -> None:
     _atomic_write_json(target, raw)
 
 
-def _safe_auth_path(filename: str) -> Path:
-    """把文件名解析为 auths 目录下的真实路径（与 wb2api._safe_file 同口径）。"""
+def _safe_auth_path(filename: str, auth_dir: Path | None = None) -> Path:
+    """把文件名解析为 auths 目录下的真实路径（与 wb2api._safe_file 同口径）。
+
+    auth_dir 非空时按该**分组**的账号目录解析（多分组 / 账号池）；缺省仍读
+    config.AUTH_DIR。
+    """
     if ('/' in filename or '\\' in filename or '..' in filename
             or '\x00' in filename):
         raise ValueError('非法的文件名')
     base = filename[:-len('.disabled')] if filename.endswith('.disabled') else filename
     if not re.fullmatch(r'workbuddy[A-Za-z0-9_.-]*\.json', base):
         raise ValueError('非法的文件名')
-    return config.AUTH_DIR / filename
+    return (auth_dir or config.AUTH_DIR) / filename
 
 
-def write_auth_file(account: dict) -> tuple[str, bool]:
+def write_auth_file(account: dict, auth_dir: Path | None = None) -> tuple[str, bool]:
     """严格按 workbuddy2api 的嵌套结构落盘，返回 (文件名, 是否覆盖)。
 
     realm 写在 `auth` 对象内（与 domain 同级）——上游就是从这里读的。
@@ -323,8 +328,9 @@ def write_auth_file(account: dict) -> tuple[str, bool]:
     # 白名单，这里把**写**路径补齐，两边口径一致。
     if not re.fullmatch(r'[0-9A-Za-z_-]{1,80}', uid):
         raise ValueError(f'账号 uid 形态异常，已拒绝写入（{uid[:40]!r}）')
-    config.AUTH_DIR.mkdir(parents=True, exist_ok=True)
-    target = config.AUTH_DIR / f'workbuddy-{uid}.json'
+    base = auth_dir or config.AUTH_DIR
+    base.mkdir(parents=True, exist_ok=True)
+    target = base / f'workbuddy-{uid}.json'
     existed = target.exists()
     domain = account.get('domain', '')
     resolved = resolve_realm(account.get('realm'), domain)

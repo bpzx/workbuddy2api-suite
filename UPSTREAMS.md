@@ -23,34 +23,48 @@
 | 上游 | 仓库 | 分支 | Commit | 提交时间 | 快照位置 |
 |---|---|---|---|---|---|
 | wb2api | `Sliverkiss/workbuddy2api` ⚠️ **已删除** | `master` | `d1023f3` | 2026-09-21 09:52 | `vendor/wb2api` |
-| manager | [ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) | `main` | [`1a48761`](https://github.com/ithtelab/workbuddy-manager/commit/1a487612) | 2026-09-25 09:14 | `vendor/manager` |
+| manager | [ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) | `main` | [`9604e00`](https://github.com/ithtelab/workbuddy-manager/commit/9604e001) | 2026-09-28 12:39 | `vendor/manager` |
 
 > wb2api 那一行**不再有可点的链接**：仓库已 404（见下节）。
 > 它是**我们开始自行维护时的起点**，不是"待同步的目标"。
 
 - wb2api：`Merge pull request #184 from .../fix/image-url-`（+764/−21，15 个文件）
   含图片 URL 修复、积分口径、成长任务链、WAF 403 处理等
-- manager：`Merge PR #83: 仪表盘首屏如实呈现状态`（142 文件 / +18092 −455）
-  **面板显示版本 v1.0.70**；期间跨 **10 个发版**（v1.0.61~v1.0.70）：红包（批量生成
-  带额度的密钥 + 公开抽奖页）、作用域化 API Token、请求日志显示实际调用账号与
-  缓存命中、`thinking.type=adaptive`、账号备注、密钥列错位修复、仪表盘骨架/错误态、
-  模型中心按厂商资料区分原生文本与多模态等。
-  上游还在 v1.0.67 明确记录了「上游（wb2api）已停更」，并支持 `UPSTREAM_SRC`
-  本地源码安装 —— 与我们的"自行维护"判断一致。
+- manager：`chore(release): v1.0.74`（149 文件 / +17949 −1285，62 个提交）
+  **面板显示版本 v1.0.74**；期间跨 **4 个发版**（v1.0.71~v1.0.74）：账号分组 /
+  多账号池（密钥绑定上游、组间转移、分组实例重启）、密钥导出为 cc-switch / ZCode
+  配置片段与一键导入到本机、全站「统一异步状态」（日志 / 统计 / 测试台 / 账号 /
+  模型 / 红包 / 安全 / 设置取不到时不再冒充空态）、危险操作二次确认与渲染异常
+  兜底页、账号管理可搜可筛可排序可分页、Windows 一键更新卡死与 GBK 中断修复、
+  每日签到「睡眠跨过签到槽位」修复等。
 
-> **本次同步触发的锚点更新（1 处）**：`main.py` 导入块（上游新增 redpackets /
-> tokens 两个路由模块，收尾行变了）。预检测试在同步后**立刻**报出，正是它存在的
-> 意义。另注意上游新增了 `test_issue69_cache_tokens`，其中两个用例在 Windows 上
-> 与既有 `test_first_token` 一样报目录错误（已核实与我们的改动无关）。
+> **本次同步带来一处实质改进**：上游把「加账号落盘后立即重启上游」改成
+> **「先等最多 8 秒热加载、超时才重启」**（`server/services/reload.py`）。v1.0.70
+> 是无条件重启 —— 账号文件几秒就落盘了，重启却会打断上游（影响在途请求），
+> 面板随后那次刷新还要等上游回来（上游记录的"用户看到 20-30 秒"就是这个）。
+> 现在正常路径靠 wb2api 的 auths 热加载（约 5 秒）自动收录，**不重启**。
+> 注意别把这条改进**误读成**"我们的部署里重启本来就失败"：本套件的 manager 经
+> `dockerproxy`（`CONTAINERS=1` + `POST=1`，见 `docker-compose.yml`）**本来就能**
+> 成功执行 `docker restart`，改进体现为**更快、更少打扰**。
 
-> 本次同步顺带修掉一处**配置模板漂移**（此前一直存在，非本次引入）：
-> 上游已 BREAKING 移除 `server.max_body_mb`（请求体改为无上限），而我们的
+> **本次同步触发的锚点更新（1 处）**：`main.py` 导入块（上游新增 `upstreams`
+> 路由模块，收尾行变成 `system, tokens, upstreams,`）。与上次同因 —— 这个块上游
+> 改得频繁，预检测试在同步后**立刻**报出，按新收尾行更新即可。
+> 另外 `server/services/updater.py`（我们 stub 的**读取端**）本轮改了 91 行，
+> 但内容全是 Windows 进程探活 / 子进程 UTF-8 编码 / 启动时的占位状态，
+> **状态 JSON 的字段口径未变**，`docker/stub/update.py` 无需调整。
+> 上游本轮只新增了一个环境变量（`WB_LOCAL_IMPORT`，默认关闭，见下），
+> 没有"该设而未设"的项。
+
+> 上次同步（v1.0.60 → v1.0.70）顺带修掉一处**配置模板漂移**（此前一直存在，非那次
+> 引入）：上游已 BREAKING 移除 `server.max_body_mb`（请求体改为无上限），而我们的
 > `docker/wb2api.config.template.json` 仍留着它 —— 生成的 `config.json` 会
 > **声称一个不存在的 8MB 限制**（上游容忍旧键，所以不报错、只是说错话）。
 > 现已改为**从上游 example 重新生成**模板，并新增
 > `tests/test_config_template.py` 按**递归键路径**比对，防止再次漂移。
 > 同时补上了模板里缺的 `admin` 段与 `pool` 的 5 个新字段
 > （后者因上游对缺字段套默认值而未造成行为问题，但漏着是隐患）。
+> 本轮 `config.example.json` **未变动**，模板无需再动（防漂移测试会自己盯着）。
 
 > 记录的是**分支 + commit**，不是 Release tag：上游的 CHANGELOG 常滞后于
 > 代码（manager 打完 v1.0.25 后仍有未发版提交），按 tag 记录会失真。
@@ -178,16 +192,27 @@ internal/prompt/prompt.go:17:12: pattern defaultprompt.md: no matching files fou
 | 失效方式 | 上游重构 → 锚点找不到 → 构建失败 | 上游改名/删除文件 → 构建失败 |
 | 适用 | 缺一小段功能 | 要改的是**整个结构**，打补丁等于把整段代码换掉 |
 
-**能不覆写就不要覆写。** 当前只有一处：
+**能不覆写就不要覆写。** 当前有两处，且落位机制不同：
 
-| 目标 | 上游位置 | 原因 | 代价 |
-|---|---|---|---|
-| 更新面板 UI | `web/components/common/settings/UpdatePanel.tsx` | 面板从上游的「3 个更新目标（both/upstream/manager）」重构为「本套件 + 2 个上游」三段式，改的是整个渲染结构；打补丁等于把大部分渲染体换掉，且锚点会随上游每次改动失效 | **放弃该文件的上游后续改进**，每次同步上游都要人工看一眼 |
+| 目标 | 上游位置 | 落位方式 | 原因 | 代价 |
+|---|---|---|---|---|
+| 更新面板 UI | `web/components/common/settings/UpdatePanel.tsx` | `apply.py` 从 `docker/overlay/` 覆写 | 面板从上游的「3 个更新目标（both/upstream/manager）」重构为「本套件 + 2 个上游」三段式，改的是整个渲染结构；打补丁等于把大部分渲染体换掉，且锚点会随上游每次改动失效 | **放弃该文件的上游后续改进**，每次同步上游都要人工看一眼 |
+| 更新器本体 | `deploy/update.py` | `Dockerfile` 直接 `COPY docker/stub/update.py` 覆盖 | 上游这个脚本是**在宿主机/容器内真跑 `docker compose` 重建**的更新器；本套件的一键更新走 updater 侧车 + 一次性 helper（见 README），在 manager 容器里跑上游那套会把运行中的代码改坏 | 同上。**但代价基本为零**：被放弃的是「在容器内自我更新」这条我们根本不走的路径 |
+
+> 关于 `deploy/update.py` 的**代价为零**要说准，因为很容易误判：上游在本轮
+> 又给它加了 74 行（Windows 一键更新卡死、GBK 中断等四处修复），看起来"错过了
+> 一堆修复"。实际上本套件**整文件替换**了它，这些修复针对的代码路径在我们这里
+> 不存在。真正需要维护的只有**读取端契约**：`server/services/updater.py` 读的
+> 状态 JSON（`running/ok/step/logs/started_at/finished_at/duration/target_version`）
+> 必须与 `docker/overlay/update_runner.py` 写出的一致。
 
 同时 `docker/overlay/` 还含两处**新增**文件（上游没有，不冲突）：
 `server/services/suite.py`（版本比对与更新触发）与 `server/routers/suite.py`（三个端点）。
 新增与覆写的落位同样由 `apply.py` 负责，且都带 `SUITE-OVERLAY` 标记 ——
 CI 会用**正向断言**检查它们确实落位（`build.yml`）。
+（`docker/overlay/` 下另有若干**独立脚本** —— `suite_updater.py`、`update_runner.py`、
+`config_merge.py`、`check_device_token.py` —— 它们不落进 manager 包，由 Dockerfile
+拷进 `/opt/suite/`，与上游代码不构成覆盖关系。）
 
 > 覆写 `UpdatePanel.tsx` 时必须保留 `can_update_upstream` 字样：上游
 > `test_docker_deploy.py::test_frontend_uses_capability_flag` 断言本文件要透出
@@ -297,6 +322,18 @@ if !strings.Contains(frame[0], "自 09-14 20:43")   // 期望：UTC+8 渲染
   上游对这个文件的改进**不会自动流进来**。同步上游后建议看一眼
   `git log -p <old>..<new> -- web/components/common/settings/UpdatePanel.tsx`，
   判断有没有值得搬过来的改动。
+  （`deploy/update.py` 也是覆写，但那里的复核只关心**读取端契约**，见「覆写登记」。）
+- **上游新增依赖 docker 的能力时，先分清是哪一类**：本套件的 manager **不挂
+  socket**，而是走 `dockerproxy`（`DOCKER_HOST=tcp://dockerproxy:2375`，
+  只开 `CONTAINERS=1` + `POST=1`）。因此：
+  - **能用**：重启容器、读日志、`docker inspect` 这类只碰 `/containers/*` 的调用
+    —— `services/wb2api.py` 的重启、`services/taskrun.py` 的容器探测都在此列；
+  - **不能用**：`pull` / 创建容器 / 构建 —— 需要 IMAGES 等权限，代理**故意不开**，
+    这正是"一键更新必须走 updater 侧车"的原因（侧车直连 socket，是唯一的例外）。
+  所以判据不是"上游有没有写 docker"，而是"**这次调用需要哪一级权限**"。
+  附带的判据：这条路径在拿不到权限时是否**如实报错**（上游自 v1.0.71 起在统一
+  "取不到就说取不到"）。本轮新增的「分组实例重启」属于第一类；分组**不登记容器名**
+  时它什么都不做（靠热加载），这也是我们推荐的用法。
 
 ---
 
@@ -350,8 +387,9 @@ cd vendor/manager && python3 -m unittest discover -s server/tests -t .
       同步 `docker/Dockerfile` 的对应 `COPY`/`RUN`
 - [ ] 若上游改了 `config.example.json` 的字段，同步
       `docker/wb2api.config.template.json`
-- [ ] 若上游改了 manager 的 `/api/system/*` 或 `deploy/update.py` 的调用约定，
-      复核 `docker/stub/update.py` 是否仍兼容
+- [ ] 若上游改了 `server/services/updater.py`（**读取端** —— 不是被我们覆写的
+      `deploy/update.py`）的状态字段，复核 `docker/stub/update.py` 与
+      `docker/overlay/update_runner.py` 两边写出/读取的口径是否仍一致
 - [ ] 更新套件 `CHANGELOG.md`，注明本次捆绑的上游 commit
 
 ## 漂移检测

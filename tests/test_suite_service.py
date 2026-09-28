@@ -197,6 +197,63 @@ class PinnedUpstreamsTest(unittest.TestCase):
             self.assertEqual(suite.pinned_upstreams(), {})
 
 
+class GhTokenTest(unittest.TestCase):
+    """`WB_GITHUB_TOKEN` 可选：配了就该带上 Authorization（额度 60 → 5000 次/小时）。
+
+    这条直接对应一个真实现象：未认证额度被点「检测更新」用完后，**先查的套件
+    正常、后查的上游管理端停在旧版本**。
+    """
+
+    def _capture_headers(self, token: str) -> dict:
+        captured: dict = {}
+
+        class FakeResp:
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> list:
+                return []
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc) -> None:
+                pass
+
+            async def get(self, url: str, headers: dict | None = None):
+                captured.update(headers or {})
+                return FakeResp()
+
+        with mock.patch.dict(os.environ, {'WB_GITHUB_TOKEN': token}), \
+             mock.patch.object(suite.config, 'http_client', lambda *a, **k: FakeClient()):
+            _run_async(suite._gh_get('/repos/o/r/tags'))
+        return captured
+
+    def test_token_absent_sends_no_authorization(self) -> None:
+        headers = self._capture_headers('')
+        self.assertNotIn('Authorization', headers)
+        self.assertIn('Accept', headers, '基础头仍应有')
+
+    def test_token_present_is_sent(self) -> None:
+        headers = self._capture_headers('ghp_example')
+        self.assertEqual(headers.get('Authorization'), 'Bearer ghp_example')
+
+    def test_403_message_mentions_token_only_when_unset(self) -> None:
+        import httpx
+
+        req = httpx.Request('GET', 'https://api.github.com/x')
+        err = httpx.HTTPStatusError('boom', request=req,
+                                    response=httpx.Response(403, request=req))
+        with mock.patch.dict(os.environ, {'WB_GITHUB_TOKEN': ''}):
+            without = suite._gh_reason(err)
+        with mock.patch.dict(os.environ, {'WB_GITHUB_TOKEN': 'ghp_x'}):
+            with_tok = suite._gh_reason(err)
+        self.assertIn('WB_GITHUB_TOKEN', without, '没配 token 时提示怎么解决')
+        self.assertNotIn('WB_GITHUB_TOKEN', with_tok, '配了就别再提它')
+        self.assertIn('403', with_tok)
+
+
 class FetchAllRepoTest(unittest.TestCase):
     """`_fetch_all` 只查套件与 manager 的仓库。"""
 
@@ -290,10 +347,31 @@ class CheckTest(unittest.TestCase):
         out = self._run('v1.2.3', self._fetch())
         self.assertNotIn('wb2api', out)
 
-    def test_has_any_aggregates(self) -> None:
-        out = self._run('v1.2.4', self._fetch(manager={'latest': 'v1.0.57'}),
-                        mg_current='v1.0.57')
-        self.assertFalse(out['has_any'])
+    def test_two_sections_are_independent(self) -> None:
+        """套件与上游管理端各自判断，互不影响（也不再有聚合的 has_any 字段）。
+
+        以前返回过 `has_any`，但界面改用分段字段拼提示后它就没人用了 ——
+        没有消费方的字段留着就是死数据，已删除。
+        """
+        out = self._run('v1.2.3', self._fetch(suite={'latest': 'v1.2.2'},
+                                             manager={'latest': 'v1.0.57'}),
+                        mg_current='v1.0.58')
+        self.assertFalse(out['suite']['has_update'], '套件：最新 1.2.2 不高于当前 1.2.3')
+        self.assertFalse(out['manager']['has_update'], '管理端：最新 1.0.57 不高于当前 1.0.58')
+        self.assertNotIn('has_any', out)
+
+    def test_manager_failure_is_surfaced_with_stale_note(self) -> None:
+        """上游管理端这一块**以前不渲染 error**，查询失败完全静默 ——
+        表现就是"上游明明发了新版，面板却说无更新"。后端必须把原因和
+        "这个版本号是上次的"一起给出，界面才有东西可显示。
+        """
+        self.cache.write_text(json.dumps({'checked_at': 1, **self._fetch()}),
+                              encoding='utf-8')
+        fresh = self._fetch(manager={'latest': '', 'error': 'GitHub 拒绝（可能已限流）'})
+        out = self._run('v1.2.3', fresh)
+        self.assertEqual(out['manager']['latest'], 'v1.0.58', '上次成功的值应保留')
+        self.assertIn('GitHub 拒绝', out['manager']['error'])
+        self.assertIn('上次成功检测', out['manager']['error'])
 
     def test_uses_cache_unless_forced(self) -> None:
         """未 force 且缓存新鲜时不再请求 GitHub（未授权 API 限流很紧）。"""

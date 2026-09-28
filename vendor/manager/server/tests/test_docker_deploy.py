@@ -139,6 +139,12 @@ class RestartBehaviorTest(unittest.TestCase):
 
         with mock.patch.object(mod, 'run', side_effect=lambda cmd, **k: (calls.append(cmd), (0, ''))[1]):
             mod.restart_service(Rep())
+        if os.name == 'nt':
+            # Windows 没有 systemd，宿主形态在这里走的是 Windows 分支（如实提示
+            # 「新代码已就位，重启面板」）—— 调用一个不存在的命令会让本来已经成功的
+            # 更新被判成失败。该分支的细则见 test_update_lifecycle.RestartStepOnWindows。
+            self.assertEqual(calls, [], f'Windows 上不该执行任何命令，实际：{calls}')
+            return
         self.assertTrue(any('systemctl' in c for c in calls),
                         f'宿主形态应调用 systemctl，实际：{calls}')
 

@@ -8,17 +8,18 @@ import {
   Info,
   Loader2,
   RefreshCw,
-  ThumbsDown,
-  ThumbsUp,
   User as UserIcon,
 } from 'lucide-react';
 
 import {PageHeader} from '@/components/common/layout/PageHeader';
+import {LoadError} from '@/components/common/states/LoadError';
 import {Button} from '@/components/ui/button';
 import {Badge} from '@/components/ui/badge';
+import {Skeleton} from '@/components/ui/skeleton';
 import {AiChatInput, type ChatModelOption} from '@/components/ui/ai-chat-input';
 import {CopyButton} from '@/components/ui/copy-button';
 import {playgroundApi, errText} from '@/lib/api';
+import {useAsyncAll} from '@/lib/use-async-data';
 import {withBasePath} from '@/lib/base-path';
 import {notify} from '@/lib/toast';
 import {useT} from '@/lib/i18n/provider';
@@ -26,6 +27,15 @@ import {fmtCredit} from '@/lib/format';
 import {cn} from '@/lib/utils';
 import {useAuth} from '@/lib/auth-context';
 import {useRealm} from '@/lib/realm-context';
+
+/**
+ * 模型列表的占位。
+ *
+ * 必须是**模块级常量**而不是每次渲染现写的 `[]`：下面用 `useEffect` 监听
+ * `models` 来重置当前选中的模型，依赖若是每帧新建的数组，那个 effect 会每帧
+ * 触发一次，选中项会被反复重置成第一个。
+ */
+const NO_MODELS: ChatModelOption[] = [];
 
 interface Msg {
   role: 'user' | 'assistant';
@@ -42,7 +52,25 @@ export default function PlaygroundPage() {
   const t = useT();
   const {isAdmin} = useAuth();
   const {realm, label: realmName} = useRealm();
-  const [models, setModels] = useState<ChatModelOption[]>([]);
+  /**
+   * 模型列表。走统一的取数状态：首屏还没拿到之前显示骨架，而不是先写一句
+   * 「暂无可用模型」——那句话在数据还在路上时是错的，用户会以为这个版本没模型。
+   *
+   * 依赖是 [realm]：切版本等于换了一套账号池与模型，旧列表属于旧版本，必须清掉。
+   */
+  const {
+    values,
+    errors,
+    isInitialLoading,
+    isInitialFailed,
+    isRefreshing,
+    reload: reloadModels,
+  } = useAsyncAll(
+    {models: async () => (await playgroundApi.models(realm)).models || []},
+    [realm],
+  );
+  const models: ChatModelOption[] = values.models ?? NO_MODELS;
+
   const [model, setModel] = useState('');
   const [effort, setEffort] = useState('');
   const [input, setInput] = useState('');
@@ -55,21 +83,13 @@ export default function PlaygroundPage() {
   const scrollerRef = useRef<HTMLDivElement>(null);
   const pinToBottom = useRef(true);
 
-  const loadModels = useCallback(async () => {
-    try {
-      const r = await playgroundApi.models(realm);
-      setModels(r.models || []);
-      // 切版本后旧模型多半不在新列表里，直接选第一个，避免发出去被上游拒
-      setModel(r.models?.[0]?.id || '');
-      setEffort('');
-    } catch (e) {
-      notify.err(errText(e));
-    }
-  }, [realm]);
-
+  // 模型列表变了就重置选择：切版本后旧模型多半不在新列表里，直接选第一个，
+  // 避免发出去被上游拒。`NO_MODELS` 是模块级常量，所以首屏还没数据时这个
+  // effect 不会反复触发（原因见它的注释）。
   useEffect(() => {
-    loadModels();
-  }, [loadModels]);
+    setModel(models[0]?.id || '');
+    setEffort('');
+  }, [models]);
 
   // 切换版本 = 换了一套账号池与模型，旧对话留着会造成误解（模型不同、额度不同）
   useEffect(() => {
@@ -223,42 +243,71 @@ export default function PlaygroundPage() {
 
   const currentModel = useMemo(() => models.find((m) => m.id === model), [models, model]);
 
+  const header = (
+    <PageHeader
+      title={t('playground.title')}
+      description={t('playground.description', {realm: realmName})}
+      actions={
+        <>
+          <Button
+            variant="outline"
+            size="sm"
+            className="rounded-full"
+            onClick={() => {
+              reloadModels();
+              notify.info(t('playground.modelsRefreshed'));
+            }}
+          >
+            <RefreshCw />
+            {t('playground.refreshModels')}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="rounded-full"
+            disabled={streaming || msgs.length === 0}
+            onClick={clear}
+          >
+            <Eraser />
+            {t('playground.clearChat')}
+          </Button>
+        </>
+      }
+    />
+  );
+
+  /**
+   * 首屏还没拿到模型列表：先给骨架，别让输入区写着「暂无可用模型」。
+   *
+   * 只对管理员生效——非管理员看到的是「需要管理员权限」那句说明，模型取没取到
+   * 与他的问题无关，拿整页错误态盖掉那句说明反而更糟。
+   */
+  if (isAdmin && (isInitialFailed || isInitialLoading)) {
+    return (
+      <div className="flex min-h-0 flex-1 flex-col gap-4 md:gap-6">
+        {header}
+        {isInitialFailed ? (
+          <LoadError variant="page" onRetry={reloadModels} />
+        ) : (
+          <PlaygroundSkeleton />
+        )}
+      </div>
+    );
+  }
+
   return (
     // flex-1 + min-h-0：让页面占满可用高度，对话区随剩余空间自适应。
     // 原先给对话区写死 calc(100dvh-290px)，一旦底部再加说明块就会顶到浮动
     // 底栏下面被遮住（实测遮了 43px）。改用 flex 后不再依赖魔法数字，
     // 任何视口高度都不会重叠。
-    <div className="flex min-h-0 flex-1 flex-col gap-4 md:gap-6">
-      <PageHeader
-        title={t('playground.title')}
-        description={t('playground.description', {realm: realmName})}
-        actions={
-          <>
-            <Button
-              variant="outline"
-              size="sm"
-              className="rounded-full"
-              onClick={() => {
-                loadModels();
-                notify.info(t('playground.modelsRefreshed'));
-              }}
-            >
-              <RefreshCw />
-              {t('playground.refreshModels')}
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              className="rounded-full"
-              disabled={streaming || msgs.length === 0}
-              onClick={clear}
-            >
-              <Eraser />
-              {t('playground.clearChat')}
-            </Button>
-          </>
-        }
-      />
+    <div className="flex min-h-0 flex-1 flex-col gap-4 md:gap-6" aria-busy={isRefreshing}>
+      {header}
+
+      {/* 模型列表刷不上的时候说一声，但不把已经能用的对话区顶掉——
+          旧列表仍然是对的，只是可能不是最新的。 */}
+      {Object.keys(errors).length > 0 && (
+        <LoadError message={t('state.partialFailed')} onRetry={reloadModels} />
+      )}
 
       {!isAdmin ? (
         <div className="flex items-start gap-2.5 rounded-[20px] border border-amber-500/30 bg-amber-500/10 p-4 text-xs">
@@ -334,24 +383,11 @@ export default function PlaygroundPage() {
                               title={t('playground.copyAnswer')}
                               className="h-6 w-6"
                             />
-                            <button
-                              type="button"
-                              title={t('playground.goodAnswer')}
-                              className="transition-colors hover:text-foreground"
-                              onClick={() => notify.ok(t('playground.feedbackRecorded'))}
-                            >
-                              <ThumbsUp className="h-3 w-3" />
-                            </button>
-                            <button
-                              type="button"
-                              title={t('playground.badAnswer')}
-                              className="transition-colors hover:text-foreground"
-                              onClick={() =>
-                                notify.info(t('playground.feedbackRecorded'), t('playground.feedbackDetail'))
-                              }
-                            >
-                              <ThumbsDown className="h-3 w-3" />
-                            </button>
+                            {/* 这里**故意没有**点赞 / 点踩按钮：它们原先只弹一句
+                                「已记录反馈」，不写任何数据——看起来能用其实没用，
+                                比没有更糟（用户会以为自己真的反馈过了，于是不再
+                                另想办法提意见）。产品上也决定不做这个功能，所以
+                                直接删掉，不留占位。 */}
                             {typeof m.credit === 'number' && (
                               <span
                                 className="inline-flex items-center gap-1 text-[10px] tabular-nums"
@@ -432,6 +468,35 @@ export default function PlaygroundPage() {
           </p>
         </>
       )}
+    </div>
+  );
+}
+
+/**
+ * 首屏骨架。
+ *
+ * 形状对着真实版面来：一块撑满的对话区 + 底部一条输入框。对话区用 `flex-1`，
+ * 与真实布局一致——若这里写成固定高度，数据到位时整页会跳一下（CLS），
+ * 比没有骨架更难受。
+ */
+function PlaygroundSkeleton() {
+  return (
+    <div className="flex min-h-0 flex-1 flex-col gap-4">
+      <section className="flex min-h-[240px] min-w-0 flex-1 flex-col overflow-hidden">
+        <div className="flex flex-1 items-center justify-center">
+          <div className="w-full max-w-md space-y-3 px-4">
+            <Skeleton className="mx-auto h-7 w-7 rounded-full" />
+            <Skeleton className="mx-auto h-4 w-40" />
+            <Skeleton className="mx-auto h-3 w-64" />
+          </div>
+        </div>
+      </section>
+      <div className="shrink-0 px-3 pb-3 pt-2.5">
+        <div className="mx-auto w-full max-w-3xl space-y-2">
+          <Skeleton className="h-11 w-full rounded-[16px]" />
+          <Skeleton className="h-3 w-32" />
+        </div>
+      </div>
     </div>
   );
 }

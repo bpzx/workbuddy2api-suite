@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 
@@ -375,6 +376,35 @@ def cached_ids(realm: str) -> set[str] | None:
     if not models:
         return None
     return {str(m.get('id') or '') for m in models if isinstance(m, dict) and m.get('id')}
+
+
+def fetch_ids_blocking(realm: str) -> dict:
+    """**同步**拉一次该版本的模型目录，返回 `catalog()` 的结果（给同步路由用）。
+
+    为什么要这个同步桥：本应用的路由多数写成 `def`，跑在线程池里——这是刻意的，
+    为的是让 sqlite、子进程、写盘这些阻塞动作不去占用事件循环。而 `catalog()`
+    是 async，所以这里在线程内自建一个临时事件循环跑一次。
+
+    为什么自建循环是安全的（不是碰运气）：
+      * 上游的 HTTP 客户端全部是「每次调用新建 + `async with` 用完即弃」
+        （见 `config.http_client`），**不绑定任何事件循环**，所以临时循环既不会
+        与主循环抢资源，也不会复用跨循环的连接池；
+      * 线程池里的工作线程本身没有运行中的循环，`asyncio.run` 不会撞上
+        「已有事件循环」的限制；
+      * `asyncio.run` 的信号处理只在主线程生效，工作线程里是空操作。
+
+    若当前线程**已经**在跑事件循环（正常不会发生：同步路由在线程池线程里），
+    就不敢自建第二个循环，直接返回一个"没拉到"的结果，让调用方按"取不到"处理
+    ——宁可少一个模型名，也不要在这里把请求卡死。
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        return {'models': [], 'source': 'none', 'source_label': '', 'via': '',
+                'errors': ['当前上下文已有事件循环，未实时拉取模型清单']}
+    return asyncio.run(catalog(realm))
 
 
 def summarize(models: list[dict]) -> dict:

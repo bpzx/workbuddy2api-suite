@@ -50,14 +50,40 @@ const INTERNATIONAL_REGIONS = [
   {code: 'ID', key: 'region.ID'},
 ] as const;
 
+/**
+ * 「用户回到这个页面了」的信号源列表。
+ *
+ * 为什么不是只挂 visibilitychange：Chrome 对**被遮挡**的窗口（点授权链接后
+ * 那扇页盖住面板就是这种情况）会把定时器节流到约 1 次/分钟，而此时
+ * `document.hidden` 仍是 false、`visibilitychange` 一次都不触发 —— 实测
+ * 2 秒的定时器在 64 秒里只跑了 2 次。所以还要挂在「人确实在操作」的事件上：
+ * 他回来看结果必然会让窗口获得焦点、点一下或敲一下键盘，那一刻立即补一次，
+ * 这些事件不受遮挡节流影响。
+ *
+ * 在**函数内**才去碰 window/document：模块顶层读它们会让静态导出在构建期
+ * 预渲染时直接报错（本项目是 output: 'export'）。
+ */
+function wakeEvents(): Array<[EventTarget, string]> {
+  if (typeof window === 'undefined') return [];
+  return [
+    [document, 'visibilitychange'],
+    [window, 'focus'],
+    [document, 'pointerdown'],
+    [document, 'keydown'],
+  ];
+}
+
 export function AddAccountDialog({
   open,
   onOpenChange,
   onSuccess,
+  upstreamId,
 }: {
   open: boolean;
   onOpenChange: (v: boolean) => void;
   onSuccess?: () => void;
+  /** 目标分组（多账号池）：新账号落进该分组的账号目录；null / 省略 = 默认分组 */
+  upstreamId?: number | null;
 }) {
   const t = useT();
   const [phase, setPhase] = useState<Phase>('loading');
@@ -86,10 +112,13 @@ export function AddAccountDialog({
       window.clearInterval(timerRef.current);
       timerRef.current = null;
     }
-    // 一并摘掉 visibilitychange 监听：否则弹窗关掉后，切标签页仍会去调用
-    // 已作废的 tick（轻则白发请求，重则对着已关闭的弹窗 setState）。
+    // 一并摘掉唤醒监听：否则弹窗关掉后，切标签页/点页面仍会去调用已作废的
+    // tick（轻则白发请求，重则对着已关闭的弹窗 setState）。
+    // 与 start() 里用的是同一个列表，漏摘一个就是内存泄漏 + 白发请求。
     if (tickRef.current !== null) {
-      document.removeEventListener('visibilitychange', tickRef.current);
+      wakeEvents().forEach(([target, event]) =>
+        target.removeEventListener(event, tickRef.current!),
+      );
       tickRef.current = null;
     }
     pollingRef.current = false;
@@ -102,7 +131,9 @@ export function AddAccountDialog({
     setMessage(t('addAccount.requesting'));
     setAuthUrl('');
     try {
-      const data = await accountApi.start(realm);
+      // region 一起发：服务端要替这张码盯着（前端被节流也不影响），而地区
+      // 登记必须在落盘前完成，它那条路径读不到弹窗里的 state，只能在这里给。
+      const data = await accountApi.start(realm, upstreamId, region || undefined);
       stateRef.current = data.state;
       setAuthUrl(data.authUrl);
       setPhase('waiting');
@@ -117,7 +148,8 @@ export function AddAccountDialog({
         if (pollingRef.current) return;  // 上一次还没回来，跳过本轮
         pollingRef.current = true;
         try {
-          const res = await accountApi.poll(stateRef.current, realm, region || undefined);
+          const res = await accountApi.poll(stateRef.current, realm, region || undefined,
+                                            upstreamId);
           // 拿到任何一次正常响应就清零：计数要表达的是「**连续**失败」，
           // 而不是「累计失败了几次」。不清零的话，几分钟内零散抖三次
           // （每次之间都恢复正常）也会触发中断，把一次正常的扫码打断。
@@ -176,17 +208,21 @@ export function AddAccountDialog({
 
       tickRef.current = tick;
       timerRef.current = window.setInterval(tick, 2000);
-      // **切回标签页立即补一次**，这是「点链接登录后界面迟迟不更新」的关键：
-      // 用户点授权链接会跳到新标签（或新窗口）完成登录，原标签进入后台被节流；
-      // 没有这一句的话，他切回来看见的仍是切走前那一帧，要等最久一整分钟才刷新
-      // —— 表现就是「明明登录成功了，界面还卡在等待」。
-      // 项目里的 useHeartbeat 早就这么做了，这里当初漏了。
-      document.addEventListener('visibilitychange', tick);
+      // **兜底不能只挂可见性**：「切回标签页立即补一次」挂在 visibilitychange 上，
+      // 但 Chrome 对**被遮挡**的窗口（授权页盖住面板就是这样）会节流定时器——
+      // 实测 2 秒降到约 1 分钟一次——而 document.hidden 仍是 false、
+      // visibilitychange 一次都不触发，那条兜底因此完全失效，用户切回来只能干等。
+      //
+      // 所以再挂在「用户确实在操作这个页面」的事件上：他回来看结果必然要点一下、
+      // 敲一下或让窗口获得焦点，那一刻立即补一次。这些事件不受遮挡节流影响。
+      // 检测本身已经在服务端跑了（见 server/routers/accounts.py 的说明），
+      // 这里只是去读结果，所以补得越勤也只是读一次内存。
+      wakeEvents().forEach(([target, event]) => target.addEventListener(event, tick));
     } catch (e) {
       setPhase('error');
       setMessage(errText(e));
     }
-  }, [onOpenChange, onSuccess, stopPoll, realm, region, t]);
+  }, [onOpenChange, onSuccess, stopPoll, realm, region, t, upstreamId]);
 
   useEffect(() => {
     if (open) {

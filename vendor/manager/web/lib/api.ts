@@ -1,8 +1,9 @@
 import axios, {AxiosError} from 'axios';
 import {BASE_PATH} from './base-path';
-import {tp} from './i18n';
+import {t, tp} from './i18n';
 import type {Realm} from './realm-context';
 import type {
+  UpstreamEndpoint,
   Account,
   CheckinLogPage,
   CreditExpiry,
@@ -20,6 +21,10 @@ import type {
   CreatedApiToken,
   IpAccessLog,
   IpRule,
+  KeyExportResult,
+  KeyImportDetectResult,
+  KeyImportResult,
+  KeyImportStatus,
   Me,
   AuditLogPage,
   ModelCatalog,
@@ -58,12 +63,25 @@ export const http = axios.create({
  * 后端的报错是中文（服务端不做多语言，见 README 的多语言说明），这里过一遍
  * 短语表：命中已收录的后端文案就换成当前语言，没收录的原样展示——既不需要
  * 后端改造，也不会因为漏收录而显示成键名或空白。
+ *
+ * 403 **不做统一改写**。这个状态码在本项目里有四种互不相干的含义：角色不够
+ * （`require_admin`）、接口只收会话不收 API Token（`require_session_admin`）、
+ * 本机导入的开关没开、以及调用方不是面板所在的机器。后两种的原文是**可照做的
+ * 操作说明**（去哪儿开开关、改用「导出配置」），一律改写成「权限不足」会把
+ * 用户唯一能照着做的那句话抹掉。所以只要后端给了文案，就永远优先用它。
+ *
+ * 兜底只在后端**没给**文案时生效。那种情况下原本会露出 axios 自己的英文
+ * message（"Request failed with status code 403"）——界面明明是多语言的，
+ * 偏偏在这条路径上漏出英文，而且对用户没有任何指导意义。
  */
 export function errText(e: unknown): string {
   const ax = e as AxiosError<{detail?: string; error?: string}>;
   const d = ax?.response?.data;
-  const raw = (typeof d === 'string' ? d : d?.detail || d?.error) || ax?.message || '';
-  return raw ? tp(raw) : tp('请求失败');
+  const raw = (typeof d === 'string' ? d : d?.detail || d?.error) || '';
+  if (raw) return tp(raw);
+  if (ax?.response?.status === 403) return t('error.forbidden');
+  const fallback = ax?.message || '';
+  return fallback ? tp(fallback) : tp('请求失败');
 }
 
 http.interceptors.response.use(
@@ -112,13 +130,36 @@ export const authApi = {
 };
 
 /* ── 账号 ───────────────────────────────────────────── */
+/**
+ * 账号接口的分组参数（`?upstream_id=`）。默认分组（null / undefined）= 不带
+ * 参数，与升级前的请求逐字一致——「默认分组的定义」只有后端一份（upstreamsvc）。
+ */
+const groupQs = (upstreamId?: number | null): string =>
+  upstreamId == null ? '' : `?upstream_id=${encodeURIComponent(String(upstreamId))}`;
+
 export const accountApi = {
-  list: () => get<AccountsResponse>('/api/accounts'),
-  /** 发起扫码登录；realm 决定国内版 / 国际版端点 */
-  start: (realm: Realm = 'cn') =>
-    post<{state: string; authUrl: string; realm: Realm}>('/api/auth/start', {realm}),
+  /**
+   * 某分组的账号列表。upstreamId 省略 / null = 默认分组。
+   *
+   * 「分组」= 一套上游实例（账号池）：账号文件读该分组的目录、运行状态问该
+   * 分组的上游。两者必须成对——只换其中一个会把别的组的账号标错状态。
+   */
+  list: (upstreamId?: number | null) =>
+    get<AccountsResponse>('/api/accounts',
+                          upstreamId == null ? undefined : {upstream_id: upstreamId}),
+  /**
+   * 发起扫码登录；realm 决定国内版 / 国际版端点。
+   *
+   * region 也一并带上：服务端会替我们盯着这张码（前端被节流也不影响），
+   * 而地区登记必须在落盘**前**完成 —— 后台那条路径拿不到 region 就会漏掉它
+   * （国际版新号聊天报 14017）。用户在弹窗里改地区会重新发码，所以这里带的
+   * 总是当前这张码对应的地区。
+   */
+  start: (realm: Realm = 'cn', upstreamId?: number | null, region?: string) =>
+    post<{state: string; authUrl: string; realm: Realm}>(
+      '/api/auth/start' + groupQs(upstreamId), {realm, region}),
   /** 轮询扫码结果。region 仅国际版需要（新号必须先做地区注册） */
-  poll: (state: string, realm?: Realm, region?: string) =>
+  poll: (state: string, realm?: Realm, region?: string, upstreamId?: number | null) =>
     get<{
       status: 'waiting' | 'success' | 'expired' | 'invalid' | 'realm_mismatch';
       uid?: string;
@@ -128,23 +169,36 @@ export const accountApi = {
       region_note?: string;
       expected?: Realm;
       got?: Realm;
-    }>('/api/auth/poll', {state, realm, region}),
-  remove: (file: string) => del<{success: boolean}>(`/api/accounts/${encodeURIComponent(file)}`),
+    }>('/api/auth/poll', {state, realm, region, upstream_id: upstreamId ?? undefined}),
+  remove: (file: string, upstreamId?: number | null) =>
+    del<{success: boolean}>(`/api/accounts/${encodeURIComponent(file)}${groupQs(upstreamId)}`),
+  /**
+   * 把账号**移动**到另一个分组（账号页「移动到分组…」）。
+   *
+   * 后端移动的是账号文件本身（凭证不改一个字节）；`toUpstreamId = 0` 表示
+   * 移回默认分组（见 routers/accounts.py 的 move 端点）。upstreamId = 源分组。
+   */
+  move: (file: string, toUpstreamId: number, upstreamId?: number | null) =>
+    post<{ok: boolean; file: string; uid: string;
+          from: {id: number | null; name: string};
+          to: {id: number | null; name: string}}>(
+      `/api/accounts/${encodeURIComponent(file)}/move${groupQs(upstreamId)}`,
+      {to_upstream_id: toUpstreamId}),
   /** 临时禁用 / 启用账号（issue #21）：改文件名 + 触发上游重载。 */
-  setDisabled: (file: string, disabled: boolean) =>
+  setDisabled: (file: string, disabled: boolean, upstreamId?: number | null) =>
     post<{ok: boolean; file: string; disabled: boolean; changed: boolean;
           reload_triggered: boolean; message: string}>(
-      `/api/accounts/${encodeURIComponent(file)}/disabled`, {disabled}),
-  checkin: (file: string) =>
+      `/api/accounts/${encodeURIComponent(file)}/disabled${groupQs(upstreamId)}`, {disabled}),
+  checkin: (file: string, upstreamId?: number | null) =>
     post<{
       code: number;
       message: string;
       /** 今天已经签过：后端没打上游请求，直接就地返回。提示语要与「刚签上」分开 */
       already?: boolean;
       credits?: number | null;
-    }>(`/api/accounts/${encodeURIComponent(file)}/checkin`),
+    }>(`/api/accounts/${encodeURIComponent(file)}/checkin${groupQs(upstreamId)}`),
   /** 单个账号的实时积分（直接向腾讯查询） */
-  credits: (file: string) =>
+  credits: (file: string, upstreamId?: number | null) =>
     get<{
       ok: boolean;
       credits: number | null;
@@ -152,18 +206,20 @@ export const accountApi = {
       cached: boolean;
       cache_age: number | null;
       expiries?: CreditExpiry[];
-    }>(`/api/accounts/${encodeURIComponent(file)}/credits`),
+    }>(`/api/accounts/${encodeURIComponent(file)}/credits`,
+       upstreamId == null ? undefined : {upstream_id: upstreamId}),
   /** 并发刷新所有账号的实时积分 */
   /** 查询全部账号积分；force=false 时 60 秒内命中服务端缓存 */
-  refreshCredits: (force = true) =>
+  refreshCredits: (force = true, upstreamId?: number | null) =>
     post<{
       total: number;
       succeeded: number;
       credits: Record<string, number | null>;
       meta: Record<string, CreditsMeta>;
       failed: string[];
-    }>('/api/accounts/refresh-credits' + (force ? '?force=true' : '?force=false')),
-  checkinAll: () =>
+    }>('/api/accounts/refresh-credits?force=' + (force ? 'true' : 'false')
+       + (upstreamId == null ? '' : `&upstream_id=${encodeURIComponent(String(upstreamId))}`)),
+  checkinAll: (upstreamId?: number | null) =>
     post<{
       /**
        * 只统计**本次真正发起签到**的账号：国际版（不适用）与今天已签到的都不进
@@ -180,7 +236,7 @@ export const accountApi = {
         nickname: string; ok: boolean; message: string;
         code?: number; skipped?: boolean; already?: boolean;
       }[];
-    }>('/api/accounts/checkin-all'),
+    }>('/api/accounts/checkin-all' + groupQs(upstreamId)),
   /** 签到记录（分页）。days 用于时间范围筛选 */
   checkinLogs: (limit = 20, offset = 0, uid?: string, days?: number, realm?: Realm) =>
     get<CheckinLogPage>('/api/checkin-logs', {limit, offset, uid, days, realm}),
@@ -192,25 +248,28 @@ export const accountApi = {
   clearTaskLogs: () => post<{ok: boolean}>('/api/task-logs/clear'),
   upstreamLogs: (limit = 200) =>
     get<{available: boolean; lines: string[]; total: number}>('/api/upstream/logs', {limit}),
-  test: (file: string) =>
-    post<{ok: boolean; message: string}>(`/api/accounts/${encodeURIComponent(file)}/test`),
-  refresh: (file: string) =>
-    post<{ok: boolean; message: string}>(`/api/accounts/${encodeURIComponent(file)}/refresh`),
+  test: (file: string, upstreamId?: number | null) =>
+    post<{ok: boolean; message: string}>(
+      `/api/accounts/${encodeURIComponent(file)}/test${groupQs(upstreamId)}`),
+  refresh: (file: string, upstreamId?: number | null) =>
+    post<{ok: boolean; message: string}>(
+      `/api/accounts/${encodeURIComponent(file)}/refresh${groupQs(upstreamId)}`),
   /** 强制清除账号级冷却、熔断/降权与模型级限流（会重启一次上游）。 */
-  clearCooling: (file: string) =>
+  clearCooling: (file: string, upstreamId?: number | null) =>
     post<{ok: boolean; message: string; uid?: string; backup?: string}>(
-      `/api/accounts/${encodeURIComponent(file)}/clear-cooling`,
+      `/api/accounts/${encodeURIComponent(file)}/clear-cooling${groupQs(upstreamId)}`,
     ),
   /**
    * 给账号写备注（issue #67）。传空串 = 清除备注。
    * 存的是本端库、按 uid 关联——临时停用（改文件名）不会丢。
    */
-  setNote: (file: string, note: string) =>
+  setNote: (file: string, note: string, upstreamId?: number | null) =>
     put<{ok: boolean; uid: string; note: string}>(
-      `/api/accounts/${encodeURIComponent(file)}/note`,
+      `/api/accounts/${encodeURIComponent(file)}/note${groupQs(upstreamId)}`,
       {note},
     ),
-  restart: () => post<{ok: boolean; message: string}>('/api/restart'),
+  restart: (upstreamId?: number | null) =>
+    post<{ok: boolean; message: string}>('/api/restart' + groupQs(upstreamId)),
 
   /* ── 成长任务一键执行（issue #19）─────────────────────
    * 调用上游自带的 scripts/task_runner.py。full（点亮）会伪造活跃上报，
@@ -226,7 +285,10 @@ export const accountApi = {
 
 /* ── 上游状态 ───────────────────────────────────────── */
 export const upstreamApi = {
-  status: () => get<UpstreamStatus>('/api/status'),
+  /** 上游运行状态。upstreamId 非空时查**该分组**的实例（多账号池）。 */
+  status: (upstreamId?: number | null) =>
+    get<UpstreamStatus>('/api/status',
+                        upstreamId == null ? undefined : {upstream_id: upstreamId}),
   /** 上游模型简表；realm 非空时只返回该版本的条目 */
   models: (realm?: Realm) => get<ModelListResponse>('/api/models', {realm}),
 };
@@ -246,6 +308,37 @@ export const playgroundApi = {
 };
 
 /* ── API 密钥 ───────────────────────────────────────── */
+/* ── 多上游（账号池分组，见 server/upstreamsvc.py）────
+ * 密钥绑定上游后，它的请求只走那个上游的账号池；未绑定 = 默认上游。
+ * 写接口是**会话管理员**专属（带着上游 api_key，属配置级凭据）。
+ *
+ * 注意 `UpstreamWrite` 与 `UpstreamEndpoint` 是**两套形状**：`api_key` 只在请求里
+ * 出现（响应只回脱敏值与 has_key，见 routers/upstreams.py 的 _serialize）。 */
+export type UpstreamWrite = {
+  name: string;
+  base_url: string;
+  api_key?: string;
+  note?: string;
+  enabled?: boolean;
+  /**
+   * 该分组的本地账号目录（绝对路径）。账号页的「分组」视图按它列账号 /
+   * 添号 / 移动账号；空串 = 该分组只用于密钥转发。
+   */
+  auth_dir?: string;
+  /** 该分组上游实例的容器名（可选）：「重启该分组」按它 docker restart。 */
+  container?: string;
+};
+
+export const upstreamsApi = {
+  list: () => get<{items: UpstreamEndpoint[]}>('/api/upstreams'),
+  create: (body: UpstreamWrite) => post<UpstreamEndpoint>('/api/upstreams', body),
+  update: (id: number, body: Partial<UpstreamWrite>) =>
+    patch<UpstreamEndpoint>(`/api/upstreams/${id}`, body),
+  remove: (id: number) => del<{ok: boolean}>(`/api/upstreams/${id}`),
+  /** 探测该上游是否可达（走它的 /healthz）；失败原因原样返回给界面。 */
+  probe: (id: number) => post<{ok: boolean; message: string}>(`/api/upstreams/${id}/probe`),
+};
+
 export const keyApi = {
   list: () => get<ApiKey[]>('/api/keys'),
   create: (body: Partial<ApiKey>) => post<ApiKey>('/api/keys', body),
@@ -262,6 +355,74 @@ export const keyApi = {
   checkModels: (models: string[], realm: string) =>
     post<{checked: boolean; unknown: string[]; reason?: string}>(
       '/api/keys/check-models', {models, realm}),
+  /**
+   * 把一把**刚创建**的密钥导出为客户端配置片段（cc-switch / ZCode）。
+   *
+   * 必须传明文 `token`：面板只存哈希，库里拿不回明文——这个端点的存在前提
+   * 就是「调用方此刻手里有明文」。因此它只在一次性展示弹窗里被调用，
+   * 密钥列表那行（只有 prefix）导不出来。
+   */
+  exportConfig: (body: {
+    client: 'ccswitch' | 'zcode';
+    token: string;
+    app?: 'claude' | 'codex';
+    baseUrl?: string;
+    providerName?: string;
+    models?: string[];
+    defaultModel?: string;
+  }) => post<KeyExportResult>('/api/keys/export', body),
+  /**
+   * 本机导入的可用状态（**只读探测**，不写任何东西）。
+   *
+   * 要看三件事：面板侧开关是否打开、这次请求是否来自面板所在机器、目标
+   * 客户端是否已安装且未在运行。三者齐了才谈得上「一键导入」——界面据此
+   * 提前把不能用的原因说清楚，用户就不会点完才知道不行。
+   *
+   * 开关关着时返回 200 + `enabled: false`（报错会被当成故障，而这里只是
+   * 一个默认关闭的可选特性）。
+   */
+  importLocalStatus: () => get<KeyImportStatus>('/api/keys/import-local/status'),
+  /**
+   * 把刚创建的密钥**直接写进本机**的 cc-switch / ZCode 配置（真一键）。
+   *
+   * 与 `exportConfig` 同一份参数、同一份配置生成逻辑，区别只在去向：导出把
+   * 片段交给用户，导入替用户落盘。返回体里**没有密钥**。
+   *
+   * 可预期的失败都有明确状态码，`errText` 能直接取到可照做的说明：
+   * 403 = 开关没开或不是本机访问；404 = 本机没装该客户端；
+   * 409 = 客户端正在运行（或探测不到），退出客户端后可重试。
+   */
+  importLocal: (body: {
+    client: 'ccswitch' | 'zcode';
+    token: string;
+    app?: 'claude' | 'codex';
+    baseUrl?: string;
+    providerName?: string;
+    models?: string[];
+    defaultModel?: string;
+    /** 是否把导入的供应商设为当前（cc-switch 置 is_current；ZCode 移到最前） */
+    setCurrent?: boolean;
+    /**
+     * 导入方式。`auto`（默认）= 能走客户端官方深链就走深链；
+     * `deeplink` / `direct` 是给它兜底和排障用的强制值。
+     */
+    mode?: 'auto' | 'deeplink' | 'direct';
+    /**
+     * 直写方式下，客户端正在运行就替用户关掉、写完再拉起来。
+     * 关掉前会先确认定位得到它的可执行文件——关掉却拉不起来比不改更糟。
+     */
+    closeRunning?: boolean;
+  }) => post<KeyImportResult>('/api/keys/import-local', body),
+  /**
+   * 自动检测客户端装在哪（「自动检测」按钮）。
+   *
+   * 为什么需要：安装路径因机器而异——绿色版可能解压在 `E:\cc swich\`，安装版在
+   * `%LOCALAPPDATA%\Programs\…`。检测顺序是"可信度从高到低"：环境变量 →
+   * 运行中的进程 → 注册表里的协议处理器 → 上次结果 → 常见安装位 → 受限扫描。
+   * 命中后会缓存在面板数据目录，之后不用再扫。**只读**，不写用户配置。
+   */
+  importLocalDetect: (client: 'ccswitch' | 'zcode' = 'ccswitch') =>
+    get<KeyImportDetectResult>('/api/keys/import-local/detect', {client}),
 };
 
 /* ── 红包：批量发放带额度的密钥（见 server/redpacket.py）────

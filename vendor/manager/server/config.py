@@ -21,6 +21,14 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    """布尔开关。空值取默认；其余按 1/true/yes/on 判真（与既有 `== '1'` 写法兼容）。"""
+    v = os.environ.get(name, '').strip().lower()
+    if not v:
+        return default
+    return v in ('1', 'true', 'yes', 'on')
+
+
 PORT = _env_int('WB_MANAGER_PORT', 7864)
 HOST = _env('WB_MANAGER_HOST', '0.0.0.0')
 
@@ -101,6 +109,17 @@ AUDIT_ALL_ACCESS = _env('WB_AUDIT_ALL_ACCESS', '0') == '1'
 # 留空时所有请求都不使用任何代理：httpx 默认 trust_env=True 会读取系统/环境代理，
 # 会把内网请求（如 127.0.0.1:7863）也交给系统代理，导致连接被劫持或长时间超时。
 HTTP_PROXY = _env('WB_HTTP_PROXY', '')
+
+# 本机一键导入：允许把新密钥直接写进**本机的** cc-switch / ZCode 配置。
+#
+# 默认关闭。理由：这是本面板唯一会写用户桌面应用数据的动作，写坏的代价是
+# 客户端里原本可用的供应商一起受影响。而且它只在「面板与客户端同一台机器」
+# 时才有意义，所以端点还会再校验**来源必须是回环地址**
+# （见 routers/keys.py 的 `_require_local_caller`），仅靠开关不足以开启。
+#
+# 路径可用 WB_CCSWITCH_DIR / WB_ZCODE_DIR 覆盖（非默认安装位置），
+# 见 services/keyimport.py。
+LOCAL_IMPORT_ENABLED = _env_bool('WB_LOCAL_IMPORT', False)
 # 会话**总时长**上限（天）：登录后最多维持这么久，到点必须重新登录。
 #
 # 下限钳到 1 天：0（或负数）会让 cookie 的 exp 等于签发时刻，即「登录成功但

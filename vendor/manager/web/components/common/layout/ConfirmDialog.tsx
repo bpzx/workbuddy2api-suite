@@ -18,33 +18,59 @@ export function ConfirmDialog({
   trigger,
   title,
   description,
+  content,
   confirmText,
   destructive = false,
+  confirmDisabled = false,
   onConfirm,
+  onOpenChange,
 }: {
   trigger: ReactNode;
   title: string;
   description?: string;
+  /**
+   * 插在说明与按钮之间的额外内容，用于「确认前还要填点什么」的场景
+   * （目前只有设置页的重置密码：要输新密码）。
+   *
+   * 为什么做成插槽而不是给 ConfirmDialog 加业务 props：弹窗本身只负责
+   * 「问一句、等一个答复」，把密码框的校验规则塞进来会让它变成一个懂业务的
+   * 组件，下次再要别的输入就得再加一组 props。
+   */
+  content?: ReactNode;
   confirmText?: string;
   destructive?: boolean;
+  /** 条件不满足时锁住确认键（例如密码不足 8 位），比点完再报错少一次往返 */
+  confirmDisabled?: boolean;
   onConfirm: () => void | Promise<void>;
+  /**
+   * 开关变化时通知调用方。给 `content` 里的受控输入用：弹窗关掉后要清空，
+   * 否则下次打开会带着上一次输的密码（同一个弹窗按用户名复用时会串）。
+   */
+  onOpenChange?: (open: boolean) => void;
 }) {
   const t = useT();
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
 
   return (
-    <AlertDialog open={open} onOpenChange={setOpen}>
+    <AlertDialog
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        onOpenChange?.(next);
+      }}
+    >
       <AlertDialogTrigger asChild>{trigger}</AlertDialogTrigger>
       <AlertDialogContent>
         <AlertDialogHeader>
           <AlertDialogTitle>{title}</AlertDialogTitle>
           {description && <AlertDialogDescription>{description}</AlertDialogDescription>}
         </AlertDialogHeader>
+        {content}
         <AlertDialogFooter>
           <AlertDialogCancel disabled={busy}>{t('common.cancel')}</AlertDialogCancel>
           <AlertDialogAction
-            disabled={busy}
+            disabled={busy || confirmDisabled}
             className={destructive ? 'bg-destructive text-white hover:bg-destructive/90' : ''}
             onClick={async (e) => {
               e.preventDefault();

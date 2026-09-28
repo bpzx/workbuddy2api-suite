@@ -9,7 +9,7 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .. import config, db, iputil, keysvc
+from .. import config, db, iputil, keysvc, upstreamsvc
 from ..config import _env_int
 from ..routers.security import get_config as get_security_config
 
@@ -462,12 +462,37 @@ def _map_model(model: str | None) -> str | None:
     return mapping.get(model, model)
 
 
-def _upstream_headers() -> dict:
+def _upstream_headers(upstream: dict | None = None) -> dict:
+    """转发时用的请求头；`upstream` 为空 = 默认上游。
+
+    多上游（密钥绑定上游）之后，请求头**必须按密钥解析出来的上游来构造** ——
+    拿错上游的 api_key 会打到别的账号池上，而这正是本功能要隔离的东西。
+    默认参数只为兼容「没有密钥」的调用方（探活 / 管理端调试台）。
+    """
+    up = upstream if upstream is not None else upstreamsvc.default_upstream()
     headers = {'Content-Type': 'application/json'}
-    api_key = config.upstream_api_key()
+    # 分组把 api_key 留空、且地址与默认上游相同时沿用默认那把（见
+    # upstreamsvc.forward_api_key）——「添加分组」只填名称就是这个形态，
+    # 不沿用的话绑定这类分组的密钥一调用就吃上游 401。
+    api_key = upstreamsvc.forward_api_key(up)
     if api_key:
         headers['Authorization'] = f'Bearer {api_key}'
     return headers
+
+
+def _upstream_for(key: dict | None, *, ip: str, model: str, mapped: str,
+                  ua: str | None) -> tuple[dict | None, JSONResponse | None]:
+    """按密钥解析本次请求该走哪个上游；不可用时返回**明确报错**。
+
+    不静默回落默认上游的原因见 upstreamsvc 模块注释第 2 条：那把密钥本应只碰
+    某个分组的账号，回落到默认上游会让它打到全池——隔离失效而且无人察觉。
+    失败同时记一条请求日志（503 + 原因），排障的人第一时间就能看到。
+    """
+    try:
+        return upstreamsvc.resolve_for_key(key), None
+    except upstreamsvc.UpstreamUnavailable as exc:
+        _record(key, ip, model, mapped, 503, 0, 0, 0, ua, str(exc), False)
+        return None, _oai_error(str(exc), 503, 'api_error', 'upstream_unavailable')
 
 
 def _scan_sse(pending: str, usage: dict) -> tuple[str, bool]:
@@ -516,10 +541,17 @@ async def list_models(request: Request):
     key, ip, err = _authorize(request, None, is_model_list=True)
     if err:
         return err
+    # 模型列表也按密钥的上游取：不同上游的模型清单未必一致（版本 / 部署差异），
+    # 拿默认上游的清单给一把绑定了别的上游的密钥，会给出它其实调不了的模型。
+    upstream, upstream_err = _upstream_for(
+        key, ip=ip, model='', mapped='', ua=request.headers.get('user-agent'))
+    if upstream_err:
+        return upstream_err
     started = time.time()
     try:
         async with config.http_client(30, connect=3) as client:
-            resp = await client.get(f'{config.WB2API_BASE}/v1/models', headers=_upstream_headers())
+            resp = await client.get(f'{upstream["base_url"]}/v1/models',
+                                    headers=_upstream_headers(upstream))
         latency = int((time.time() - started) * 1000)
         _record(key, ip, '', '', resp.status_code, 0, 0, latency, request.headers.get('user-agent'), None, False)
         payload = _scope_models(resp.json(), key)
@@ -670,14 +702,18 @@ async def _chat(request: Request, upstream_path: str):
         if isinstance(body['stream_options'], dict):
             body['stream_options'].setdefault('include_usage', True)
 
-    url = f'{config.WB2API_BASE}{upstream_path}'
     ua = request.headers.get('user-agent')
+    upstream, upstream_err = _upstream_for(key, ip=ip, model=requested_model or '',
+                                           mapped=mapped or '', ua=ua)
+    if upstream_err:
+        return upstream_err
+    url = f'{upstream["base_url"]}{upstream_path}'
     started = time.time()
 
     if not stream:
         try:
             async with config.http_client(config.UPSTREAM_TIMEOUT, connect=5) as client:
-                resp = await client.post(url, json=body, headers=_upstream_headers())
+                resp = await client.post(url, json=body, headers=_upstream_headers(upstream))
             latency = int((time.time() - started) * 1000)
             usage = {}
             try:
@@ -703,7 +739,7 @@ async def _chat(request: Request, upstream_path: str):
     # 流式转发
     client = config.http_client(config.UPSTREAM_TIMEOUT, connect=5)
     try:
-        req = client.build_request('POST', url, json=body, headers=_upstream_headers())
+        req = client.build_request('POST', url, json=body, headers=_upstream_headers(upstream))
         resp = await client.send(req, stream=True)
     except Exception as exc:  # noqa: BLE001
         await client.aclose()

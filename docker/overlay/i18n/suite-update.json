@@ -44,6 +44,7 @@
       "upstreamTitle": "上游依赖",
       "upstreamMgr": "上游管理端 workbuddy-manager",
       "noUpdate": "无更新",
+      "checkFailed": "检测失败",
       "resultOk": "更新完成",
       "resultFail": "更新失败"
     },
@@ -68,6 +69,7 @@
       "upstreamTitle": "上游依賴",
       "upstreamMgr": "上游管理端 workbuddy-manager",
       "noUpdate": "無更新",
+      "checkFailed": "檢測失敗",
       "resultOk": "更新完成",
       "resultFail": "更新失敗"
     },
@@ -92,6 +94,7 @@
       "upstreamTitle": "Upstream dependencies",
       "upstreamMgr": "Upstream manager workbuddy-manager",
       "noUpdate": "No update",
+      "checkFailed": "Check failed",
       "resultOk": "Update finished",
       "resultFail": "Update failed"
     },
@@ -116,6 +119,7 @@
       "upstreamTitle": "上流の依存",
       "upstreamMgr": "上流管理コンソール workbuddy-manager",
       "noUpdate": "更新なし",
+      "checkFailed": "検出失敗",
       "resultOk": "更新が完了しました",
       "resultFail": "更新に失敗しました"
     },
@@ -140,6 +144,7 @@
       "upstreamTitle": "업스트림 의존성",
       "upstreamMgr": "업스트림 관리 콘솔 workbuddy-manager",
       "noUpdate": "업데이트 없음",
+      "checkFailed": "확인 실패",
       "resultOk": "업데이트 완료",
       "resultFail": "업데이트 실패"
     }

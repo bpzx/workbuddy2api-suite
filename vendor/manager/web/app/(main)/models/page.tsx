@@ -1,6 +1,6 @@
 'use client';
 
-import {useCallback, useEffect, useMemo, useState} from 'react';
+import {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
   Boxes,
   Brain,
@@ -14,6 +14,8 @@ import {
 
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {EmptyState} from '@/components/common/layout/EmptyState';
+import {LoadError} from '@/components/common/states/LoadError';
+import {SkeletonBar} from '@/components/common/states/SkeletonBar';
 import {Button} from '@/components/ui/button';
 import {Badge} from '@/components/ui/badge';
 import {Input} from '@/components/ui/input';
@@ -25,7 +27,8 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
-import {modelApi, errText} from '@/lib/api';
+import {modelApi} from '@/lib/api';
+import {useAsyncAll} from '@/lib/use-async-data';
 import {useRealm} from '@/lib/realm-context';
 import {notify} from '@/lib/toast';
 import {useT} from '@/lib/i18n/provider';
@@ -134,10 +137,6 @@ function StatCard({
 export default function ModelsPage() {
   const t = useT();
   const {realm, label: realmName} = useRealm();
-  const [data, setData] = useState<ModelCatalog | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-  const [error, setError] = useState('');
 
   const [q, setQ] = useState('');
   const [series, setSeries] = useState('all');
@@ -149,29 +148,55 @@ export default function ModelsPage() {
    */
   const [sort, setSort] = useState<'default' | 'credits'>('default');
 
-  // realm 变化时重新拉取：两个版本的模型清单不同，且后端已按版本分开缓存
-  const load = useCallback(async (force = false) => {
-    if (force) setRefreshing(true);
-    else setLoading(true);
-    try {
-      const res = await modelApi.catalog(realm, force);
-      setData(res);
-      setError('');
-    } catch (e) {
-      setError(errText(e));
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-    }
+  /**
+   * 「强制刷新」= 绕过**后端**缓存再拉一次（`modelApi.catalog` 的第二个参数）。
+   *
+   * 用 ref 而不是 state：它描述的是**下一次请求**要不要绕缓存，不参与渲染，也不该
+   * 触发重渲染；放 state 里还容易被误放进依赖数组，造成「一改就重新取数」。
+   */
+  const forceNext = useRef(false);
+
+  /**
+   * 模型目录 = 这一页的**主数据**，接统一状态系统。
+   *
+   * `realm` 进 `deps`：两个版本的模型清单不同（后端也按版本分开缓存），换版本就是
+   * 换数据集，必须清空重取并显示骨架——留着上一版的模型列表，标题已经写着新版本，
+   * 列表却还是旧版本的东西。
+   *
+   * 原实现把「加载中」和「失败」压进两个字符串 state（`loading` / `error`），
+   * 失败时渲染的是 `EmptyState`（没有「重试」），加载中是一行纯文本——两者长得
+   * 都很像空态，用户分不清「在取」「取不到」「确实没有」。
+   */
+  const {values, isInitialLoading, isInitialFailed, isRefreshing, reload} = useAsyncAll({
+    catalog: () => modelApi.catalog(realm, forceNext.current),
   }, [realm]);
 
+  const data: ModelCatalog | null = values.catalog ?? null;
+
+  /**
+   * 切版本时清掉筛选状态，避免「上一版的系列筛选把新版过滤成空」。
+   *
+   * 这一步**不能**省：系列是按版本各自的清单来的，上一版选中的系列在新版里可能
+   * 一个模型都没有，于是页面看起来像「新版没有模型」——而数据其实是好的。
+   *
+   * 依赖从原来的 `[load]` 改成 `[realm]`：取数交给 `useAsyncAll` 之后 `load` 不存在了，
+   * 而这里要的本来就是「版本变了才清」，直接用 `realm` 更贴合意图。
+   */
   useEffect(() => {
-    // 切版本时清掉筛选状态，避免「上一版的系列筛选把新版过滤成空」
     setSeries('all');
     setCap('all');
     setQ('');
-    load();
-  }, [load]);
+  }, [realm]);
+
+  /** 强制刷新：绕过服务端缓存重新拉一次（与首屏那次区分开，只有它才绕缓存） */
+  const refetch = useCallback(async () => {
+    forceNext.current = true;
+    try {
+      await reload();
+    } finally {
+      forceNext.current = false;
+    }
+  }, [reload]);
 
   const models = data?.models ?? [];
 
@@ -211,31 +236,55 @@ export default function ModelsPage() {
   const summary = data?.summary;
   const seriesOptions = summary?.series ?? [];
 
+  const header = (
+    <PageHeader
+      title={t('models.title')}
+      description={t('models.description', {realm: realmName})}
+      actions={
+        <Button
+          variant="outline"
+          size="sm"
+          className="rounded-full"
+          disabled={isRefreshing}
+          title={t('models.refetchTitle')}
+          onClick={() => {
+            void refetch();
+            notify.info(t('models.refetching'));
+          }}
+        >
+          {isRefreshing ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+          {t('models.refetch')}
+        </Button>
+      }
+    />
+  );
+
+  /**
+   * 首屏守卫：目录还没到（或根本没取到）时不渲染列表与统计卡。
+   *
+   * 必须**排在**「暂无模型」之前——否则取数失败时那句空态会照常出现，等于告诉
+   * 用户「腾讯那边没有可用模型」，而事实是没取到。判据用 `isInitialLoading` /
+   * `isInitialFailed`（按「有没有数据」判定），不用「请求在不在飞」：后者会让
+   * 「强制刷新」把整页闪成骨架。
+   *
+   * 只有目录这一份数据，所以可以直接早返回；统计卡与筛选条都派生自 `data`，
+   * 数据没到时本来也渲染不出来。
+   */
+  if (isInitialFailed || isInitialLoading) {
+    return (
+      <div className="flex flex-col gap-4 md:gap-6">
+        {header}
+        {isInitialFailed ? <LoadError variant="page" onRetry={reload} /> : <ModelsSkeleton />}
+      </div>
+    );
+  }
+
   return (
-    <div className="flex flex-col gap-4 md:gap-6">
-      <PageHeader
-        title={t('models.title')}
-        description={t('models.description', {realm: realmName})}
-        actions={
-          <Button
-            variant="outline"
-            size="sm"
-            className="rounded-full"
-            disabled={refreshing}
-            title={t('models.refetchTitle')}
-            onClick={() => {
-              load(true);
-              notify.info(t('models.refetching'));
-            }}
-          >
-            {refreshing ? <Loader2 className="animate-spin" /> : <RefreshCw />}
-            {t('models.refetch')}
-          </Button>
-        }
-      />
+    <div className="flex flex-col gap-4 md:gap-6" aria-busy={isRefreshing}>
+      {header}
 
       {/* 来源说明：如实标注，不把回退数据说成实时数据 */}
-      {data && !loading && (
+      {data && (
         <div
           className={cn(
             'flex flex-wrap items-center gap-x-2 gap-y-1 rounded-[16px] border px-3.5 py-2.5 text-[11px]',
@@ -358,16 +407,9 @@ export default function ModelsPage() {
         </div>
       </section>
 
-      {/* 列表 */}
+      {/* 列表。走到这里 `data` 一定已经取到了（首屏守卫已在上方返回）。 */}
       <section className="overflow-hidden rounded-[20px] bg-muted">
-        {loading ? (
-          <div className="flex items-center justify-center gap-2 py-16 text-xs text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin" />
-            {t('models.loadingList')}
-          </div>
-        ) : error ? (
-          <EmptyState icon={Boxes} title={t('models.loadFailed')} description={error} />
-        ) : models.length === 0 ? (
+        {models.length === 0 ? (
           <EmptyState
             icon={Boxes}
             title={t('models.noModels')}
@@ -502,5 +544,58 @@ export default function ModelsPage() {
         {t('models.footnote')}
       </p>
     </div>
+  );
+}
+
+/**
+ * 首屏骨架：与真实版面逐块对应——来源说明条 + 四张统计卡 + 筛选条 + 模型表。
+ *
+ * 换掉原来的「转圈 + 正在读取模型列表…」：转圈只说明「在忙」，说不出「忙完这里
+ * 会出现什么」；而且它与空态的位置、尺寸差得远，数据到达时整页会跳一下。骨架把
+ * 版面形状先摆出来，数据到位时内容填进原位。
+ *
+ * 行数固定 4（统计卡固定 4 张，与真实一致）：真实行数未知，固定值只为给出形状。
+ */
+function ModelsSkeleton() {
+  return (
+    <>
+      <SkeletonBar className="h-9 w-full rounded-[16px]" />
+
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        {Array.from({length: 4}, (_, i) => (
+          <div key={i} className="rounded-[20px] bg-muted p-3.5">
+            <SkeletonBar className="h-3 w-16" />
+            <SkeletonBar className="mt-2.5 h-5 w-20" />
+          </div>
+        ))}
+      </div>
+
+      <section className="rounded-[20px] bg-muted px-3.5 py-3">
+        <div className="flex flex-wrap gap-2">
+          {Array.from({length: 5}, (_, i) => (
+            <SkeletonBar key={i} className="h-7 w-20 rounded-full" />
+          ))}
+        </div>
+      </section>
+
+      <section className="overflow-hidden rounded-[20px] bg-muted">
+        <div className="flex items-center gap-4 border-b border-border/60 px-4 py-3">
+          {Array.from({length: 5}, (_, i) => (
+            <SkeletonBar key={i} className="h-3 w-16" />
+          ))}
+        </div>
+        <div className="divide-y divide-border/40">
+          {Array.from({length: 6}, (_, i) => (
+            <div key={i} className="flex items-center gap-4 px-4 py-3.5">
+              <SkeletonBar className="h-3.5 w-36 max-w-[35%]" />
+              <SkeletonBar className="h-3.5 w-14" />
+              <SkeletonBar className="hidden h-3.5 w-14 sm:block" />
+              <SkeletonBar className="hidden h-3.5 w-24 md:block" />
+              <SkeletonBar className="hidden h-3.5 w-16 lg:block" />
+            </div>
+          ))}
+        </div>
+      </section>
+    </>
   );
 }

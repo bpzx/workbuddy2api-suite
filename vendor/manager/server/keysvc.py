@@ -55,6 +55,24 @@ def _norm_realm(value: object) -> str:
     return v if v in ('cn', 'global') else ''
 
 
+def _norm_upstream_id(value: object) -> int | None:
+    """归一化密钥绑定的上游 id：空 / 非法一律当「未绑定」（= 默认上游）。
+
+    与 realm 的归一化同口径：**不报错**。原因是这个值来自管理端表单，
+    而「未绑定」本身是合法且有意义的取值（存量密钥全是这个形态），
+    把脏值吃掉成「未绑定」既安全又不会让保存整个失败。
+    真正「绑了一个不存在的上游」由路由层拦（见 routers/keys.py），
+    那里能拿到准确的 400 文案。
+    """
+    if value in (None, '', 0, '0'):
+        return None
+    try:
+        uid = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return uid if uid > 0 else None
+
+
 def _norm_credit_quota(value: object) -> float:
     """归一化积分额度。0 = 不限（与 token 额度同口径）。
 
@@ -156,6 +174,9 @@ def _parse(row) -> dict:
         'ip_allowlist': _json_list(row['ip_allowlist']),
         'models': _json_list(row['models']),
         'realm': _norm_realm(row['realm']),
+        # 绑定的上游接入点（多上游 / 分组隔离）。None = 默认上游 —— 见 upstreamsvc
+        # 的模块注释：默认上游不是数据库里的某一行，所以这里保持 None 而不是补 0。
+        'upstream_id': _norm_upstream_id(row['upstream_id']),
         'quota': row['quota'],
         'used_tokens': row['used_tokens'],
         'quota_credit': row['quota_credit'],
@@ -195,6 +216,7 @@ def create_key(
     quota: int = 0,
     realm: str = '',
     quota_credit: float = 0,
+    upstream_id: int | None = None,
     *,
     _conn: sqlite3.Connection | None = None,
 ) -> dict:
@@ -211,7 +233,7 @@ def create_key(
     token = TOKEN_PREFIX + secrets.token_urlsafe(32)
     sql = ('INSERT INTO api_keys(name, key_hash, prefix, enabled, expires_at, max_ips, '
            'ip_allowlist, models, realm, quota, used_tokens, quota_credit, used_credit, '
-           'created_at) VALUES(?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?)')
+           'created_at, upstream_id) VALUES(?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?)')
     args = (
         name,
         _hash(token),
@@ -224,6 +246,7 @@ def create_key(
         quota,
         _norm_credit_quota(quota_credit),
         int(time.time()),
+        _norm_upstream_id(upstream_id),
     )
     if _conn is not None:
         key_id = int(_conn.execute(sql, args).lastrowid or 0)
@@ -262,6 +285,10 @@ def update_key(key_id: int, patch: dict) -> dict | None:
         fields['quota'] = int(patch['quota'] or 0)
     if 'quota_credit' in patch:
         fields['quota_credit'] = _norm_credit_quota(patch['quota_credit'])
+    if 'upstream_id' in patch:
+        # 显式传 null / 0 是**允许**的：管理员可以把密钥改回「默认上游」。
+        # 与 realm 同口径，不能用真值判断（否则改不回默认上游）。
+        fields['upstream_id'] = _norm_upstream_id(patch['upstream_id'])
     if fields:
         assignments = ', '.join(f'{k} = ?' for k in fields)
         db.execute(f'UPDATE api_keys SET {assignments} WHERE id = ?', (*fields.values(), key_id))

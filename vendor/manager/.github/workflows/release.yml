@@ -56,7 +56,10 @@ jobs:
       - name: 安装 Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # 22 起才有 ESM 的 TypeScript type stripping：几处「借 Node 直接跑真实 .ts
+          # 实现」的用例（async-state / display-prefs 等）在 20 上会自我 skip —— 也就是
+          # 那些断言在 CI 里从来没跑过。升到 22 让它们真正执行。
+          node-version: '22'
           cache: npm
           cache-dependency-path: web/package-lock.json
 

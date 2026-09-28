@@ -161,9 +161,20 @@ def _direct_client(timeout: float):
 
 
 async def _gh_get(path: str) -> object:
-    """调 GitHub API。外网请求，**走** WB_HTTP_PROXY（如果有配）。"""
+    """调 GitHub API。外网请求，**走** WB_HTTP_PROXY（如果有配）。
+
+    可选带 token（`WB_GITHUB_TOKEN`）：未认证的 GitHub API 只有 **60 次/小时**，
+    而一次版本检测要花 2 次（套件 + 上游管理端）—— 点几次「检测更新」就可能把额度
+    用完。此时**先查的那个（套件，响应小）成功、后查的（管理端，73 个 tag 的大响应）
+    403**，表现就是"套件显示正常、上游管理端却停在旧版本"（这个现象真实出现过）。
+    带 token 后额度是 5000 次/小时，不必再关心。
+    """
+    headers = dict(_GH_HEADERS)
+    token = (os.environ.get('WB_GITHUB_TOKEN') or '').strip()
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
     async with config.http_client(15) as client:
-        resp = await client.get(f'https://api.github.com{path}', headers=_GH_HEADERS)
+        resp = await client.get(f'https://api.github.com{path}', headers=headers)
         resp.raise_for_status()
         return resp.json()
 
@@ -179,7 +190,10 @@ def _gh_reason(exc: Exception) -> str:
     if code == 404:
         return '仓库不可访问（不存在或为私有）'
     if code == 403:
-        return 'GitHub 拒绝（未认证接口每小时 60 次，可能已限流）'
+        if (os.environ.get('WB_GITHUB_TOKEN') or '').strip():
+            return 'GitHub 拒绝（HTTP 403）'
+        return ('GitHub 拒绝（未认证接口每小时 60 次，很可能已限流；'
+                '在 .env 里设 WB_GITHUB_TOKEN 可提到 5000 次）')
     if code:
         return f'GitHub 返回 HTTP {code}'
     return f'{type(exc).__name__}: {str(exc)[:80]}'
@@ -310,7 +324,6 @@ async def check(force: bool = False) -> dict:
             'repo': str(mg.get('repo') or ''),
             'error': str(mg.get('error') or ''),
         },
-        'has_any': s_has or mg_has,
     }
 
 

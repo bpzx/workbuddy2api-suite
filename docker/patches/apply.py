@@ -158,15 +158,15 @@ GO_NEW = """func newTransport() *http.Transport {
 # 一概不动（那是本项目的既定边界，CI 有反向断言守着）。
 # 上游位置：vendor/manager/server/main.py（导入块）
 #
-# 锚点取导入块的**收尾两行**。⚠️ 这个块上游改得频繁（v1.0.70 就新增了
-# redpackets / tokens 两个路由模块，使收尾行从 `system,` 变成 `system, tokens,`），
-# 上游再加模块时这里会失效 —— 预检测试会在本地先报出来，按新收尾行更新即可。
+# 锚点取导入块的**收尾两行**。⚠️ 这个块上游改得频繁（v1.0.70 新增了
+# redpackets / tokens，v1.0.71~74 又新增 upstreams），上游再加模块时这里会
+# 失效 —— 预检测试会在本地先报出来，按新收尾行更新即可。
 MAIN_IMPORT_OLD = """    redpackets, responses, security as security_router, settings, stats,
-    system, tokens,
+    system, tokens, upstreams,
 )"""
 
 MAIN_IMPORT_NEW = """    redpackets, responses, security as security_router, settings, stats,
-    system, tokens,
+    system, tokens, upstreams,
 )
 # 【集成补丁】本发行版新增的套件自更新路由（实现见 server/routers/suite.py）
 from .routers import suite as suite_router"""

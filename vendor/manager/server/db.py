@@ -317,6 +317,34 @@ CREATE TABLE IF NOT EXISTS red_packet_shares (
   claimed_at    INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_packet_shares ON red_packet_shares(packet_id);
+
+-- 多上游接入点（账号池分组）。
+--
+-- 为什么需要：本服务是**转发型**反代 —— 账号由上游挑，本端只做鉴权 / 限流 /
+-- 记日志。要让「不同下游密钥走不同账号池」，本端唯一能落地的形态就是配置多个
+-- 上**游接入点**，再让密钥绑定其中之一；每个接入点天然就是一个账号池分组。
+--
+-- 默认上游（环境变量 / 上游 config.json 那套）**不在这里** —— 它不是一行数据，
+-- 而是 config.WB2API_BASE + config.upstream_api_key() 的运行时结果。这样存量
+-- 部署升级后一行都不用改：密钥的 upstream_id 为空 = 走默认上游，行为与从前一致。
+--
+-- api_key 明文存储：与上游 config.json 里的 api_key 同等敏感，而本库权限已收到
+-- 仅属主可读写（见 _restrict_db_permissions）。不引加密依赖的理由同 red_packet_shares
+-- 的注释：自己写加密比明文更危险（会让人以为它是安全的）。
+CREATE TABLE IF NOT EXISTS upstreams (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  name       TEXT    NOT NULL,
+  base_url   TEXT    NOT NULL,
+  api_key    TEXT    NOT NULL DEFAULT '',
+  note       TEXT    NOT NULL DEFAULT '',
+  enabled    INTEGER NOT NULL DEFAULT 1,
+  -- 该分组的**本地账号目录**：面板按它列账号 / 添号 / 移动账号（见迁移注释）。
+  auth_dir   TEXT    NOT NULL DEFAULT '',
+  -- 该分组上游实例的容器名（可选）：面板「重启该分组」按它 docker restart。
+  container  TEXT    NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
 """
 
 
@@ -435,6 +463,18 @@ _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     # 人家正在用的密钥悄悄限死（那会让线上调用突然 403）。管理员在界面上
     # 看到「未限定」标记后可按需补填。
     ('api_keys', 'realm', "TEXT NOT NULL DEFAULT ''"),
+    # 密钥绑定的上游接入点（多上游 / 分组隔离）。可空 = **默认上游** ——
+    # 存量密钥一律为空，行为与升级前完全一致（走 WB2API_BASE 那一套）。
+    # 不设外键约束：SQLite 的外键要开 PRAGMA 且删除上游时语义是「级联删密钥」还是
+    # 「拒绝删」都不合适 —— 本项目在应用层做「被引用就拒绝删」（见 upstreamsvc）。
+    ('api_keys', 'upstream_id', 'INTEGER'),
+    # 分组（账号池）的**本地账号目录**：面板据此列账号 / 添号 / 移动账号。
+    # 空 = 不做账号管理（该分组只用于密钥转发）。默认分组的目录来自 WB_AUTH_DIR，
+    # 是运行时结果、不落库——与「默认上游不是数据库里的一行」同一个道理。
+    ('upstreams', 'auth_dir', "TEXT NOT NULL DEFAULT ''"),
+    # 分组上游实例的容器名（可选）：面板的「重启」用 `docker restart <name>`。
+    # 空 = 从面板重启该分组时明确报错；绝不猜一个名字去重启别的服务。
+    ('upstreams', 'container', "TEXT NOT NULL DEFAULT ''"),
     # 积分额度与已用量（issue #27）。存量密钥为 0/0 = **不限积分**，行为不变。
     #
     # 为什么要在 token 之外单独记一笔：两者**不成比例** —— 同样 1M token，

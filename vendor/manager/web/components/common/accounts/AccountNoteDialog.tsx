@@ -30,12 +30,15 @@ export function AccountNoteDialog({
   open,
   onOpenChange,
   onSaved,
+  upstreamId,
 }: {
   /** null = 未选中任何账号（弹窗关闭态） */
   account: Account | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onSaved: () => void;
+  /** 账号所在分组（多账号池）：备注端点按分组解析账号文件；null = 默认分组 */
+  upstreamId?: number | null;
 }) {
   const t = useT();
   const [note, setNote] = useState('');
@@ -54,7 +57,7 @@ export function AccountNoteDialog({
     if (!account || busy) return;
     setBusy(true);
     try {
-      const r = await accountApi.setNote(account.file, note.trim());
+      const r = await accountApi.setNote(account.file, note.trim(), upstreamId);
       notify.ok(t('accounts.noteSaved'), r.note ? r.note : t('accounts.noteCleared'));
       onOpenChange(false);
       onSaved();

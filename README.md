@@ -408,7 +408,7 @@ docker compose pull && docker compose up -d
 #### 更新前先看新镜像捆绑的上游版本
 
 ```bash
-docker inspect ghcr.io/<owner>/workbuddy2api-suite:latest \
+docker inspect ghcr.io/bpzx/workbuddy2api-suite:latest \
   --format '{{range $k, $v := .Config.Labels}}{{$k}}={{$v}}{{"\n"}}{{end}}' \
   | grep upstream
 ```

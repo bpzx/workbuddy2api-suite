@@ -351,7 +351,8 @@ class RouteIntegrationTest(unittest.TestCase):
             return _Client(resp, calls)
 
         with mock.patch.object(config, 'http_client', fake_client), \
-             mock.patch.object(acct_router.reload, 'request_restart', lambda: True):
+             mock.patch.object(acct_router.reload, 'request_restart',
+                               lambda upstream=None: True):
             out = asyncio.run(acct_router.account_set_disabled(
                 self.fname, {'disabled': disabled}, {'username': 'admin'}))
         return out, calls

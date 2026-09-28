@@ -68,3 +68,35 @@ export function asyncFlags(
     isRefreshing: pending && hasData,
   };
 }
+
+/**
+ * 两组依赖的指纹。
+ *
+ * `context` 是**数据上下文**（切换国内版/国际版这类），`query` 是**同一上下文里的
+ * 查询范围**（翻页、改统计时段这类）。两者对界面的要求恰好相反，所以要分开记。
+ */
+export interface DepPrints {
+  /** 数据上下文。用 `null` 表示「还没跑过首屏」，于是首次一定算出 initial */
+  context: string | null;
+  /** 查询范围 */
+  query: string;
+}
+
+/**
+ * 依赖变化 → 该用哪种取数模式。返回 `null` 表示什么都没变，不必重取。
+ *
+ * 为什么非要区分这两种依赖：翻页和切版本的要求正好相反。
+ *
+ *  · **切版本 = 换了数据上下文**，屏幕上的数字属于旧版本，**必须清掉**。
+ *    标题已经写着国际版、数字还是国内版的，比空着更误导。
+ *  · **翻页 / 改时段 = 只是换了个查询范围**，**旧内容要留在屏幕上直到新数据到达**。
+ *    若也清空，每翻一页闪一次骨架——而翻页是高频操作，看起来像页面在抽搐。
+ *
+ * 两者同时变化时按「上下文变了」处理：先清空、再立刻把旧数据合并回来毫无意义，
+ * 而且会白发一次请求（切版本时页码归 1 就会同时命中这两条）。
+ */
+export function depMode(prev: DepPrints, next: DepPrints): FetchMode | null {
+  if (prev.context !== next.context) return 'initial';
+  if (prev.query !== next.query) return 'refresh';
+  return null;
+}

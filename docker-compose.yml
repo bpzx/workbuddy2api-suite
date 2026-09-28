@@ -102,17 +102,17 @@ services:
       WB_TRUST_PROXY: "1"
       WB_TRUSTED_PROXY_HOPS: ${WB_TRUSTED_PROXY_HOPS:-1}
       # ── 版本检测 ──
-      # WB_MANAGER_REPO：manager 拿它去 GitHub 查"最新 Release"，
-      # 与容器内的当前版本比较，在界面上显示
-      #   「管理端：v1.0.31 → v1.0.35」
-      # 这个提示的用途是**提醒你上游发新版了、该去同步快照**，
-      # 而不是说本套件镜像需要更新（本套件更新走 compose pull）。
-      #
-      # 因此**保持指向上游仓库**（默认值即 ithtelab/workbuddy-manager）：
-      # 容器内的 current_version 读的正是 vendored 快照带进来的上游版本号，
-      # 两边同源，比较才有意义。
+      # 本套件的「系统更新」面板**不读这两个变量**：它查的仓库地址来自镜像内烤好的
+      # upstreams.json（套件自身的仓库来自构建期注入的 WB_SUITE_REPO）。
+      # 这两个变量只供上游自带的 /api/system/check-update 端点使用 —— 本发行版的
+      # 面板已不调用它，保留是为了那个端点仍然可用。
       # WB_MANAGER_REPO: ithtelab/workbuddy-manager   # 需要覆盖时解开
       WB_UPSTREAM_API_REPO: Sliverkiss/workbuddy2api
+      # GitHub 可选 token：**未认证接口只有 60 次/小时**，而一次版本检测要花 2 次
+      # （套件 + 上游管理端）—— 点几次「检测更新」就可能撞限流，表现为
+      # 「先查的套件正常、后查的上游管理端停在旧版本」。配了它额度是 5000 次/小时。
+      # 留空也能用；面板会在查询失败时**把原因显示出来**。
+      WB_GITHUB_TOKEN: ${WB_GITHUB_TOKEN:-}
       # docker CLI 走 socket 代理，而不是直接挂宿主 socket
       DOCKER_HOST: tcp://dockerproxy:2375
       # ── 出口代理 ──

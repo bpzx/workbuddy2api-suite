@@ -69,7 +69,6 @@ type SuiteCheck = {
   cached: boolean;
   suite: VersionSide & {is_dev: boolean};
   manager: VersionSide;
-  has_any: boolean;
 };
 
 type LogLine = {ts: number; level: string; text: string};
@@ -187,22 +186,29 @@ export function UpdatePanel() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [logs.length]);
 
-  const recheck = useCallback(async () => {
-    setChecking(true);
-    try {
-      const c = await suiteApi.check(true);
-      setCheck(c);
-      const parts: string[] = [];
-      if (c.suite.has_update && c.suite.latest) parts.push(`${t('suiteUpdate.title')} ${c.suite.latest}`);
-      if (c.manager.has_update && c.manager.latest) parts.push(`workbuddy-manager ${c.manager.latest}`);
-      if (parts.length) notify.warn(t('suiteUpdate.hasUpdate'), parts.join(' · '));
-      else notify.ok(t('suiteUpdate.upToDate'));
-    } catch (e) {
-      notify.err(errText(e));
-    } finally {
-      setChecking(false);
-    }
-  }, [t]);
+    const recheck = useCallback(async () => {
+      setChecking(true);
+      try {
+        const c = await suiteApi.check(true);
+        setCheck(c);
+        const parts: string[] = [];
+        if (c.suite.has_update && c.suite.latest) parts.push(`${t('suiteUpdate.title')} ${c.suite.latest}`);
+        if (c.manager.has_update && c.manager.latest) parts.push(`workbuddy-manager ${c.manager.latest}`);
+        if (parts.length) {
+          notify.warn(t('suiteUpdate.hasUpdate'), parts.join(' · '));
+        } else if (c.suite.error || c.manager.error) {
+          // 有查询失败时**不能**报"已是最新" —— 版本号可能是上次成功检测留下的，
+          // 那会给出一个自信但错误的结论（曾静默显示"无更新"，而实际上游已发新版）。
+          notify.warn(t('suiteUpdate.checkFailed'), c.manager.error || c.suite.error);
+        } else {
+          notify.ok(t('suiteUpdate.upToDate'));
+        }
+      } catch (e) {
+        notify.err(errText(e));
+      } finally {
+        setChecking(false);
+      }
+    }, [t]);
 
   const start = useCallback(async () => {
     setBusy(true);
@@ -243,7 +249,12 @@ export function UpdatePanel() {
               <Badge variant="secondary" className="rounded-full text-amber-600">
                 {t('suiteUpdate.hasUpdate')}
               </Badge>
-            ) : suite && !suite.error ? (
+            ) : suite?.error ? (
+              // 查询失败时不表态：版本号可能是上次成功检测留下的
+              <Badge variant="secondary" className="rounded-full text-muted-foreground">
+                {t('suiteUpdate.checkFailed')}
+              </Badge>
+            ) : suite ? (
               <Badge variant="secondary" className="rounded-full text-emerald-600">
                 {t('suiteUpdate.upToDate')}
               </Badge>
@@ -410,7 +421,14 @@ export function UpdatePanel() {
             <div className="mb-2 flex items-center justify-between gap-2">
               <span className="text-xs font-medium">{t('suiteUpdate.upstreamMgr')}</span>
               {mg &&
-                (mg.has_update ? (
+                // 查询失败时不表态：下面的版本号可能是**上次成功检测**留下的，
+                // 拿它下"有/无更新"的结论会给出自信的错误答案（曾静默显示"无更新"，
+                // 而上游其实已经发了三个版本）。
+                (mg.error ? (
+                  <Badge variant="secondary" className="rounded-full text-muted-foreground">
+                    {t('suiteUpdate.checkFailed')}
+                  </Badge>
+                ) : mg.has_update ? (
                   <Badge variant="secondary" className="rounded-full text-amber-600">
                     {t('suiteUpdate.hasUpdate')}
                   </Badge>
@@ -422,6 +440,14 @@ export function UpdatePanel() {
             </div>
             <VersionRow label={t('suiteUpdate.current')} value={mg?.current || ''} />
             <VersionRow label={t('suiteUpdate.latest')} value={mg?.latest || ''} />
+            {/* 失败原因必须显示出来：这一块以前不渲染 error，于是查询失败完全静默 ——
+                表现就是"上游明明发了新版，面板却说无更新"。 */}
+            {mg?.error && (
+              <div className="mt-1.5 flex items-start gap-2 text-[11px] text-amber-600">
+                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                <span>{mg.error}</span>
+              </div>
+            )}
           </div>
         </div>
 

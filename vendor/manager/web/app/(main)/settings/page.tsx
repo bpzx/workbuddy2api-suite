@@ -26,11 +26,16 @@ import {useI18n} from '@/lib/i18n/provider';
 import {t as tGlobal, tp as tpGlobal} from '@/lib/i18n';
 import {RichText} from '@/lib/i18n/rich-text';
 import {settingsApi, upstreamApi, errText} from '@/lib/api';
+import {useAsyncAll} from '@/lib/use-async-data';
+import {UpstreamEndpoints} from '@/components/settings/UpstreamEndpoints';
 import {BASE_PATH} from '@/lib/base-path';
 import type {ModelInfo, ModelSource, UpstreamConfig, UserItem} from '@/lib/types';
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {EmptyState} from '@/components/common/layout/EmptyState';
+import {LoadError} from '@/components/common/states/LoadError';
+import {SkeletonBar} from '@/components/common/states/SkeletonBar';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
+import {ResetPasswordDialog} from '@/components/common/settings/ResetPasswordDialog';
 import {useAuth} from '@/lib/auth-context';
 import {UpdatePanel} from '@/components/common/settings/UpdatePanel';
 import {TokensPanel} from '@/components/common/settings/TokensPanel';
@@ -799,7 +804,40 @@ for (const g of GROUPS) for (const f of g.fields) FIELD_BY_KEY[f.key] = f;
 export default function SettingsPage() {
   const {t, tp} = useI18n();
   const {isAdmin} = useAuth();
-  const [cfg, setCfg] = useState<UpstreamConfig | null>(null);
+  /**
+   * 三份数据一次并发取。
+   *
+   * 主数据是 `cfg`（上游配置）——页面主体（上游配置 Tab 的整张表单）就是它的副本，
+   * 所以**它没到就不能渲染表单**：`form` 的初值是 `defaultValues(...)`，那等于把
+   * 硬编码默认值当成「你现在的配置」显示出来。原先的写法是 `allSettled` 之后
+   * `if (c.status === 'fulfilled')`，**失败分支什么都不做** —— 于是取数挂掉时页面
+   * 照常渲染那张默认值表单，而写入路径又都被 `upstreamReady` 禁用，用户看到的是
+   * 一张「能看不能改」的假配置（见下面首屏守卫）。
+   *
+   * `modelMap` / `users` 是配件（模型映射 Tab / 用户 Tab），与主数据同 hook 但
+   * 各自独立成败：其中一个失败不该把另一个也判成失败。
+   */
+  const {values, errors, isRefreshing, reload} = useAsyncAll({
+    cfg: () => settingsApi.upstream(),
+    modelMap: () => settingsApi.modelMap(),
+    users: () => settingsApi.users(),
+  }, []);
+
+  /** 配置：null = 还没取到（首屏加载中，或它自己失败了）。**不要**用假默认值兜底 */
+  const cfg: UpstreamConfig | null = values.cfg ?? null;
+  const users: UserItem[] = values.users ?? [];
+  /**
+   * 用户列表**从未**取到（首屏那次就失败了，所以 values 里始终没有它）。
+   *
+   * 用来把「没有用户」与「不知道有没有用户」分开——两者都会渲染成空表，含义却
+   * 完全相反：「暂无管理用户」在这页等于告诉管理员「系统里一个账号都没有」，
+   * 而实际可能只是这次没取到。宁可说「未取到」。
+   */
+  const usersFailed = 'users' in errors;
+  /** 模型映射的乐观值：保存成功后、刷新落地前先显示新值（见 saveModelMap） */
+  const [optimisticMap, setOptimisticMap] = useState<Record<string, string> | null>(null);
+  const modelMap: Record<string, string> = optimisticMap ?? values.modelMap ?? {};
+
   const [models, setModels] = useState<ModelInfo[]>([]);
   /** 模型列表来源：dynamic = 上游实时拉取，static = 上游内置回退表 */
   const [modelSource, setModelSource] = useState<ModelSource>('unknown');
@@ -857,68 +895,62 @@ export default function SettingsPage() {
   const [upText, setUpText] = useState('');
   const [globalText, setGlobalText] = useState('');
 
-  const [modelMap, setModelMap] = useState<Record<string, string>>({});
   const [mapAlias, setMapAlias] = useState('');
   const [mapTarget, setMapTarget] = useState('');
-  const [users, setUsers] = useState<UserItem[]>([]);
   const [newUser, setNewUser] = useState({username: '', password: '', role: 'viewer'});
   const [busy, setBusy] = useState(false);
   /** Upstash（Redis 持久化）表单 */
   const [upstashForm, setUpstashForm] = useState({url: '', token: ''});
   const [upstashBusy, setUpstashBusy] = useState(false);
 
-  const load = useCallback(async () => {
-    // 本地数据很快（配置/映射/用户），先取到即渲染，不被上游探测拖慢
-    const [c, mm, u] = await Promise.allSettled([
-      settingsApi.upstream(),
-      settingsApi.modelMap(),
-      settingsApi.users(),
-    ]);
-    if (c.status === 'fulfilled') {
-      const v = c.value;
-      setCfg(v);
-      if (v.available !== false) {
-        const picked = {
-          schedule: pickValues(SCHEDULE_FIELDS, v.schedule),
-          prompt: pickValues(PROMPT_FIELDS, v.prompt),
-          cooldown: pickValues(COOLDOWN_FIELDS, v.cooldown),
-          pool: pickValues(POOL_FIELDS, v.pool),
-          features: pickValues(FEATURES_FIELDS, v.features),
-          session: pickValues(SESSION_FIELDS, v.session_sticky),
-          server: pickValues(SERVER_FIELDS, v.server),
-          upstream: pickValues(UPSTREAM_FIELDS, v.upstream),
-          global: pickValues(GLOBAL_FIELDS, v.global),
-          admin: pickValues(ADMIN_FIELDS, v.admin),
-        };
-        setForm(picked);
-        original.current = {
-          schedule: {...picked.schedule},
-          prompt: {...picked.prompt},
-          cooldown: {...picked.cooldown},
-          pool: {...picked.pool},
-          features: {...picked.features},
-          session: {...picked.session},
-          server: {...picked.server},
-          upstream: {...picked.upstream},
-          global: {...picked.global},
-          admin: {...picked.admin},
-        };
-        setSchedText(JSON.stringify(v.schedule ?? {}, null, 2));
-        setCoolText(JSON.stringify(v.cooldown ?? {}, null, 2));
-        setPoolText(JSON.stringify(v.pool ?? {}, null, 2));
-        setFeatText(JSON.stringify(v.features ?? {}, null, 2));
-        setSessText(JSON.stringify(v.session_sticky ?? {}, null, 2));
-        setPromptText(JSON.stringify(v.prompt ?? {}, null, 2));
-        setServerText(JSON.stringify(v.server ?? {}, null, 2));
-        setUpText(JSON.stringify(v.upstream ?? {}, null, 2));
-        setGlobalText(JSON.stringify(v.global ?? {}, null, 2));
-        // url 可回显；token 不回显明文，留空表示不修改
-        setUpstashForm({url: v.upstash?.url || '', token: ''});
-      }
-    }
-    if (mm.status === 'fulfilled') setModelMap(mm.value);
-    if (u.status === 'fulfilled') setUsers(u.value);
-  }, []);
+  /**
+   * 配置到达（首屏取到 / 手动刷新 / 保存后重取）时，把表单重置为服务端的值。
+   *
+   * 依赖 `cfg` 的**引用**而不是 `values`：刷新失败时 useAsyncAll 把上一次的值合并
+   * 回来，`cfg` 仍是同一个对象，于是不会把用户正在编辑的内容冲掉。
+   *
+   * `available === false` 表示「配置读到了、但上游连不上」——那份配置本身仍是可读的，
+   * 只是所有写入路径都被 `upstreamReady` 禁掉；此时不重置表单（与改造前一致）。
+   */
+  useEffect(() => {
+    if (!cfg || cfg.available === false) return;
+    const picked = {
+      schedule: pickValues(SCHEDULE_FIELDS, cfg.schedule),
+      prompt: pickValues(PROMPT_FIELDS, cfg.prompt),
+      cooldown: pickValues(COOLDOWN_FIELDS, cfg.cooldown),
+      pool: pickValues(POOL_FIELDS, cfg.pool),
+      features: pickValues(FEATURES_FIELDS, cfg.features),
+      session: pickValues(SESSION_FIELDS, cfg.session_sticky),
+      server: pickValues(SERVER_FIELDS, cfg.server),
+      upstream: pickValues(UPSTREAM_FIELDS, cfg.upstream),
+      global: pickValues(GLOBAL_FIELDS, cfg.global),
+      admin: pickValues(ADMIN_FIELDS, cfg.admin),
+    };
+    setForm(picked);
+    original.current = {
+      schedule: {...picked.schedule},
+      prompt: {...picked.prompt},
+      cooldown: {...picked.cooldown},
+      pool: {...picked.pool},
+      features: {...picked.features},
+      session: {...picked.session},
+      server: {...picked.server},
+      upstream: {...picked.upstream},
+      global: {...picked.global},
+      admin: {...picked.admin},
+    };
+    setSchedText(JSON.stringify(cfg.schedule ?? {}, null, 2));
+    setCoolText(JSON.stringify(cfg.cooldown ?? {}, null, 2));
+    setPoolText(JSON.stringify(cfg.pool ?? {}, null, 2));
+    setFeatText(JSON.stringify(cfg.features ?? {}, null, 2));
+    setSessText(JSON.stringify(cfg.session_sticky ?? {}, null, 2));
+    setPromptText(JSON.stringify(cfg.prompt ?? {}, null, 2));
+    setServerText(JSON.stringify(cfg.server ?? {}, null, 2));
+    setUpText(JSON.stringify(cfg.upstream ?? {}, null, 2));
+    setGlobalText(JSON.stringify(cfg.global ?? {}, null, 2));
+    // url 可回显；token 不回显明文，留空表示不修改
+    setUpstashForm({url: cfg.upstash?.url || '', token: ''});
+  }, [cfg]);
 
   /**
    * 上游模型列表。
@@ -944,10 +976,10 @@ export default function SettingsPage() {
     }
   }, []);
 
+  // 配置 / 映射 / 用户由 useAsyncAll 在挂载时自己取（首屏一次），这里只管模型列表。
   useEffect(() => {
-    load();
     loadModels();
-  }, [load, loadModels]);
+  }, [loadModels]);
 
   const upstreamReady = !!cfg && cfg.available !== false;
   const upstreamError = cfg && cfg.available === false ? cfg.error : undefined;
@@ -971,7 +1003,7 @@ export default function SettingsPage() {
       notify.ok(t('settings.upstashSaved'), t('settings.applying'));
       // （Upstash 属于上游外部依赖，改完无需重启上游容器）
       setUpstashForm((f) => ({...f, token: ''}));
-      await load();
+      await reload();
     } catch (e) {
       notify.err(errText(e));
     } finally {
@@ -1021,7 +1053,7 @@ export default function SettingsPage() {
       } else {
         notify.ok(t('settings.saved'), t('settings.applying'));
       }
-      await load();
+      await reload();
     } catch (e) {
       notify.err(errText(e));
     } finally {
@@ -1050,7 +1082,7 @@ export default function SettingsPage() {
     try {
       await settingsApi.saveUpstream({[field]: parsed});
       notify.ok(t('settings.saved'), t('settings.applying'));
-      await load();
+      await reload();
     } catch (e) {
       notify.err(errText(e));
     } finally {
@@ -1058,37 +1090,67 @@ export default function SettingsPage() {
     }
   }
 
+  /**
+   * 保存模型映射。
+   *
+   * 乐观更新：先切到新值让表格立刻响应，再 `await reload()` 把服务端确认过的那份
+   * 拉回来。**刷新成功才撤乐观值**——若这一次刷新失败，撤早了表格会跳回旧值，
+   * 用户会以为没保存上（其实写操作是成功的）。与 `security` 页的 saveConfig 同一套。
+   */
   async function saveModelMap(next: Record<string, string>) {
+    setOptimisticMap(next);
     try {
       await settingsApi.saveModelMap(next);
-      setModelMap(next);
       notify.ok(t('settings.modelMapSaved'));
+      if (await reload()) setOptimisticMap(null);
     } catch (e) {
+      setOptimisticMap(null);
       notify.err(errText(e));
     }
   }
 
+  const header = (
+    <PageHeader
+      title={t('settings.title')}
+      description={t('settings.description')}
+      actions={
+        <Button
+          variant="outline"
+          size="sm"
+          className="rounded-full"
+          title={t('settings.reloadTitle')}
+          onClick={() => {
+            reload();
+            loadModels(false);
+          }}
+        >
+          <RefreshCw />
+          {t('settings.reload')}
+        </Button>
+      }
+    />
+  );
+
+  /**
+   * 首屏：配置还没取到（加载中，或它自己失败了）。
+   *
+   * **不能**渲染下面的表单——`form` 的初值是 `defaultValues(...)`，那等于把硬编码
+   * 默认值当成「你现在的配置」显示出来。而写入路径又都被 `upstreamReady` 禁掉，
+   * 用户看到的是一张「能看不能改」的假配置，会据此以为「我的配置就是这样」，
+   * 或者以为「面板坏了」。取不到就说取不到，并给「重试」。
+   */
+  if (!cfg) {
+    return (
+      <div className="flex flex-col gap-4 md:gap-6">
+        {header}
+        {'cfg' in errors ? <LoadError variant="page" onRetry={reload} /> : <SettingsSkeleton />}
+      </div>
+    );
+  }
+
   return (
-    <div className="flex flex-col gap-4 md:gap-6">
-      <PageHeader
-        title={t('settings.title')}
-        description={t('settings.description')}
-        actions={
-          <Button
-            variant="outline"
-            size="sm"
-            className="rounded-full"
-            title={t('settings.reloadTitle')}
-            onClick={() => {
-              load();
-              loadModels(false);
-            }}
-          >
-            <RefreshCw />
-            {t('settings.reload')}
-          </Button>
-        }
-      />
+    <div className="flex flex-col gap-4 md:gap-6" aria-busy={isRefreshing}>
+      {header}
 
       <Tabs defaultValue="upstream">
         {/* 标签较多，手机上会撑破容器，这里允许横向滚动 */}
@@ -1106,6 +1168,10 @@ export default function SettingsPage() {
 
         {/* ═══ 上游配置 ═══ */}
         <TabsContent value="upstream" className="mt-3 space-y-3">
+          {/* 多上游（账号池分组）：密钥绑定上游 = 请求只走那个池，见 server/upstreamsvc.py。
+              放在 config.json 字段之前：它是「本端接了几个上游」的清单，
+              而下面那批字段描述的是**默认上游自身**的配置。 */}
+          <UpstreamEndpoints />
           {upstreamError && (
             <div className="flex items-start gap-2.5 rounded-[20px] border border-amber-500/30 bg-amber-500/10 p-4">
               <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
@@ -1516,7 +1582,7 @@ export default function SettingsPage() {
                       await settingsApi.saveUpstream({upstash: {clear: true}});
                       setUpstashForm({url: '', token: ''});
                       notify.ok(t('settings.upstashCleared'), t('settings.applyingShort'));
-                      await load();
+                      await reload();
                     } catch (e) {
                       notify.err(errText(e));
                     } finally {
@@ -1829,7 +1895,7 @@ export default function SettingsPage() {
                       await settingsApi.addUser(newUser);
                       notify.ok(t('settings.usersCreated'));
                       setNewUser({username: '', password: '', role: 'viewer'});
-                      load();
+                      reload();
                     } catch (e) {
                       notify.err(errText(e));
                     } finally {
@@ -1865,34 +1931,17 @@ export default function SettingsPage() {
                     {isAdmin && (
                       <TableCell className="pr-4 text-right">
                         <div className="flex justify-end gap-1">
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="h-7 rounded-full text-xs"
-                            onClick={async () => {
-                              const pwd = window.prompt(
-                                t('settings.resetPasswordPrompt', {name: u.username}));
-                              if (!pwd) return;
-                              try {
-                                const r = await settingsApi.updateUser(u.username, {password: pwd});
-                                // 改密码会吊销该用户既有会话。若改的是自己，
-                                // 当前登录态也随之失效——必须明确告知要去重新登录，
-                                // 否则用户会以为「界面卡住了」（下次请求就是 401）。
-                                if (r?.relogin_required) {
-                                  notify.ok(t('settings.passwordUpdated'), t('settings.passwordRelogin'));
-                                  window.setTimeout(() => {
-                                    window.location.href = `${BASE_PATH}/login`;
-                                  }, 1800);
-                                  return;
-                                }
-                                notify.ok(t('settings.passwordUpdated'), t('settings.passwordOthersRevoked'));
-                              } catch (e) {
-                                notify.err(errText(e));
-                              }
-                            }}
-                          >
-                            {t('settings.resetPassword')}
-                          </Button>
+                          {/* 重置密码走与「删除用户」同一套对话框（原来这里是
+                              window.prompt，同一行里两种风格）。校验、清空、
+                              改完自己要不要重新登录等逻辑都在组件里。 */}
+                          <ResetPasswordDialog
+                            username={u.username}
+                            trigger={
+                              <Button variant="ghost" size="sm" className="h-7 rounded-full text-xs">
+                                {t('settings.resetPassword')}
+                              </Button>
+                            }
+                          />
                           <ConfirmDialog
                             title={t('settings.deleteUserTitle', {name: u.username})}
                             description={t('settings.deleteUserDesc')}
@@ -1902,7 +1951,7 @@ export default function SettingsPage() {
                               try {
                                 await settingsApi.removeUser(u.username);
                                 notify.ok(t('keys.deleted'));
-                                load();
+                                reload();
                               } catch (e) {
                                 notify.err(errText(e));
                               }
@@ -1920,13 +1969,20 @@ export default function SettingsPage() {
                 ))}
               </TableBody>
             </Table>
+            {/* 取不到用户列表时**不能**说「暂无管理用户」——那等于断言「这个系统里
+                一个账号都没有」，而实际是没取到。两者含义完全相反（前者会让人以为
+                管理员账号被清空了），所以失败时如实说「未取到」并给「重试」。 */}
             {!users.length && (
-              <EmptyState
-                icon={Users}
-                title={t('settings.usersEmpty')}
-                description={t('settings.usersEmptyDesc')}
-                className="flex flex-col items-center justify-center py-12 text-center"
-              />
+              usersFailed ? (
+                <LoadError message={t('state.partialFailed')} onRetry={reload} />
+              ) : (
+                <EmptyState
+                  icon={Users}
+                  title={t('settings.usersEmpty')}
+                  description={t('settings.usersEmptyDesc')}
+                  className="flex flex-col items-center justify-center py-12 text-center"
+                />
+              )
             )}
           </div>
         </TabsContent>
@@ -1966,5 +2022,39 @@ export default function SettingsPage() {
         </TabsContent>
       </Tabs>
     </div>
+  );
+}
+
+/**
+ * 首屏骨架。
+ *
+ * 形状照着真实版面走（一条 Tab 栏 + 两张卡片），数据到位时不会整版跳一下。
+ * 用 `SkeletonBar` 而不是 `Skeleton`：卡片是 `bg-muted`，而 `Skeleton` 自带的
+ * `bg-accent` 与它在两套主题下是同一个字面量，放上去等于画了看不见的条
+ * （见 components/common/states/SkeletonBar.tsx）。
+ */
+function SettingsSkeleton() {
+  return (
+    <>
+      <SkeletonBar className="h-9 w-72 max-w-full rounded-full" />
+
+      <div className="rounded-[20px] bg-muted p-4">
+        <SkeletonBar className="mb-4 h-3.5 w-24" />
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
+          {Array.from({length: 8}, (_, i) => (
+            <SkeletonBar key={i} className="h-9 w-full rounded-xl" />
+          ))}
+        </div>
+      </div>
+
+      <div className="rounded-[20px] bg-muted p-4">
+        <SkeletonBar className="mb-4 h-3.5 w-32" />
+        <div className="space-y-3">
+          {Array.from({length: 6}, (_, i) => (
+            <SkeletonBar key={i} className="h-9 w-full rounded-xl" />
+          ))}
+        </div>
+      </div>
+    </>
   );
 }
