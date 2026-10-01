@@ -223,26 +223,40 @@ for NAME in $UPSTREAM_NAMES; do
         die "导出结果含 __pycache__，已中止（可能来自本地测试）"
     fi
 
-    # ── 必须移除上游的 .gitignore ─────────────────────────
-    # 上游 .gitignore 的 bare 模式（`*.md`、`config.json`、`out/` 等）是**递归**的，
-    # 而它现在嵌套在 vendor/<name>/ 下，于是会匹配到自己仓库里更深层的文件，
-    # 把快照的必需文件悄悄排除掉。已发生过的事故：
+    # ── 上游 .gitignore：只删**实测会吞掉快照文件**的那些 ─────
+    # 背景（真实事故）：上游 .gitignore 的 bare 模式（`*.md`、`config.json`、
+    # `out/` 等）是**递归**的，嵌套到 vendor/<name>/ 下后会匹配到自己仓库里
+    # 更深层的文件，把快照必需文件悄悄排除掉：
     #
-    #   vendor/wb2api/.gitignore 的 `*.md`  → 排除了
+    #   vendor/wb2api/.gitignore 的 `*.md` → 排除了
     #   internal/prompt/defaultprompt.md（go:embed 编译期必需文件）。
-    #   本地 go build 正常（文件在磁盘上），CI 从 git 全新 clone 后文件不存在，
+    #   本地 go build 正常（文件在磁盘上），CI 从 git 全新 clone 后不存在，
     #   直接 `pattern defaultprompt.md: no matching files found` 编译失败。
+    #   根 .gitignore 的否定规则救不了：Git 是「深层 .gitignore 优先」。
     #
-    # 根 .gitignore 的否定规则**救不了**：Git 的合并规则是「深层 .gitignore 优先」，
-    # 浅层的 `!path` 无法撤销深层 `*.md` 的排除。
+    # 但**一律删除是过度纠正**：上游测试会读自己的 .gitignore。manager 的
+    # test_settings_tabs::test_upstream_route_is_not_gitignored 就断言
+    # 「`upstream/` 必须锚定」—— 删掉文件会让它在**所有平台**报
+    # FileNotFoundError，那是 vendoring 造成的假失败，会污染"上游测试全绿"
+    # 这个我们用来判断上游版本可用性的信号。
     #
-    # 因此统一移除，保护规则改由本项目根 .gitignore 用**锚定路径**表达
-    # （见根 .gitignore 顶部的说明）。移除的是忽略规则本身，不是任何源文件。
-    REMOVED_IGNORES="$(find "$STAGING" -name '.gitignore' | wc -l | tr -d ' ')"
-    find "$STAGING" -name '.gitignore' -delete
-    if [ "$REMOVED_IGNORES" -gt 0 ]; then
-        info "移除 $REMOVED_IGNORES 个上游 .gitignore（其 bare 模式会误伤快照）"
-    fi
+    # 而且那条测试护的坑我们同样会踩：未锚定的 `upstream/` 会吞掉
+    # web/app/(main)/settings/upstream/page.tsx，本地测试照样绿、部署里那页 404。
+    #
+    # 所以改成「有证据才删」：只删下面这份实测有害的，其余原样保留；
+    # 将来出现新的有害模式，由脚本末尾的**纳出完整性校验**兜住（它 die 并提示
+    # 用 `git check-ignore -v` 定位，把命中的 .gitignore 加进这里即可）。
+    case "$NAME" in
+        # 末尾的 `*.md` + `!README.md` 就是吞掉 defaultprompt.md 的那条规则
+        wb2api) DROP_IGNORES=".gitignore" ;;
+        *)      DROP_IGNORES="" ;;
+    esac
+    for drop in $DROP_IGNORES; do
+        if [ -f "$STAGING/$drop" ]; then
+            rm -f "$STAGING/$drop"
+            info "移除 $drop（实测会吞掉快照必需文件）"
+        fi
+    done
 
     if [ -d "$DEST" ]; then
         info "替换 $VENDOR_PATH（原目录整体移除）"
@@ -327,7 +341,11 @@ if [ "$DRY_RUN" != "1" ]; then
             warn "以上文件在 vendor/ 磁盘上存在，但**未被 git 纳入**。"
             warn "  CI 从 git 全新 clone 后会缺少这些文件，可能出现编译失败。"
             warn "  排查：git check-ignore -v <文件>  看是哪条 .gitignore 规则命中；"
-            warn "  修法：把规则改成锚定路径（见根 .gitignore 顶部说明）。"
+            warn "  修法二选一："
+            warn "    a) 若上游只是漏了锚定（如未锚定的 upstream/），等上游修 ——"
+            warn "       不要自己改 vendor，那会破坏「快照 == 上游 commit」；"
+            warn "    b) 若该规则确实与嵌套快照冲突，把这份 .gitignore 加进上面"
+            warn "       DROP_IGNORES 的对应上游（附一行实测说明）。"
             rm -f "$DISK_LIST" "$TRACKED_LIST"
             die "纳出完整性校验未通过"
         fi

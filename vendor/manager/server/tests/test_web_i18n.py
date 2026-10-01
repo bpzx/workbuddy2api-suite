@@ -381,7 +381,9 @@ class WebPhraseTest(unittest.TestCase):
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
 
-        src = (_ROOT / 'web/app/(main)/settings/page.tsx').read_text(encoding='utf-8')
+        # 批次 4 起设置页的外壳在 `layout.tsx`（7 个 Tab 变成 `/settings/<tab>`
+        # 子路由，取数与表单状态必须留在不随子路由重挂载的 layout 上）
+        src = (_ROOT / 'web/app/(main)/settings/layout.tsx').read_text(encoding='utf-8')
         concats = mod._concat_strings(src)
         self.assertTrue(concats, '没解析到任何拼接文案 —— 解析器失效了（会假通过）')
         for text in concats:

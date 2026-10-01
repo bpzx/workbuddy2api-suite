@@ -19,6 +19,84 @@
 
 ## [未发布]
 
+### 同步上游：manager v1.0.74 → v1.0.76（跨 2 个发版）
+
+`9604e00` → `8c92da9`（166 文件 / +13800 −2487）。wb2api 侧无可同步目标。
+
+用户可见的主要变化（全部来自上游）：
+
+- **设置页 7 个 Tab 改成可寻址子路由**（外壳搬到 `settings/layout.tsx`，
+  `/settings/upstream` 等可直接开）；命令面板（⌘K）；底栏入口 11 → 8，
+  被吸收的三页改为页内二级导航，底栏加了分组语义且"固定底部"不再遮挡正文。
+- **PostgreSQL 异地备份**：把本地数据镜像到自建 PG，需要时拉回来
+  （默认**关闭**；开启后按间隔定时推送，也可手动）。驱动是新增依赖
+  `psycopg[binary]`（自带预编译 libpq，不需要系统包）。备份过程会在 `data/`
+  里临时落一份 sqlite 快照（`.pgsync-snapshot-<pid>.db`），恢复前另存
+  `pre-restore-*.db` —— 都在我们的数据卷内。
+- **被上游「系统自动禁用」的账号可救回来**：补调 revive + 重新登录自动恢复
+  （issue #115）；同时修掉"读不到状态就当确认没被禁用"的推断。
+- 今日趋势图按小时（粒度随范围走）；更新记录可清除（issue #105）；
+  Windows 本机原生运维脚本增强（发布包验签、环境自愈、一键更新，issue #117）。
+
+**集成层核对**：锚点更新 1 处 —— `main.py` 导入块（上游新增 `pgsync` 路由模块，
+且把 `pgsync as pgsync_router` 插到了行首，收尾行整体位移）。这已是该锚点
+**第三次**失效，`apply.py` 里已注明"照抄新收尾两行、不要凭记忆手写"。
+`server/services/updater.py` 只多了 `clear_status()`，**状态 JSON 口径未变**，
+stub 无需调整。**没有新增环境变量**；`config.example.json` 未变动。
+
+> `UpdatePanel.tsx`（我们**整文件覆写**的那个）上游这次自己也改了：新增
+> 「清除更新记录」。我们**没有搬**，依据是**功能对应物不存在** —— 本面板不渲染
+> 上游的更新状态与日志（它读的是套件侧车的状态），所以没有可清除的对象。
+> 这是"覆写代价"的第一次真实发生，判定标准已写进 UPSTREAMS.md 的「覆写登记」。
+
+**验证**：上游 Python 全套 **1967** 项（4 个错误仍是那批 Windows 专有的迁移
+用例 `tearDown` 清理临时目录报 `NotADirectoryError`，断言本身通过）；
+Go 关无变化（`vendor/wb2api` 本轮零改动，与上一轮已验的树逐字节相同）；
+前端静态导出编译通过；本项目 119 项 + 预检 13 项全绿；CI 的 14 条集成断言
+逐条复刻通过；**纯净副本** 822 个文件 = 索引 822 个（含 `defaultprompt.md`、
+`vendor/manager/.gitignore`，以及那条新测试护着的
+`settings/upstream/page.tsx`）。
+
+### 变更：同步脚本不再"一律删除"上游 `.gitignore`（过度纠正的代价回来了）
+
+`sync-upstreams.sh` 此前把 `vendor/` 下所有 `.gitignore` **一律删除**，起因是
+wb2api 那份的 `*.md` 会吞掉 `//go:embed` 依赖的 `defaultprompt.md`（真实事故）。
+
+上游 v1.0.75 新增了 `test_settings_tabs::test_upstream_route_is_not_gitignored`：
+它**读 `.gitignore`** 断言 `upstream/` 必须写成 `/upstream/`（未锚定会吞掉
+`web/app/(main)/settings/upstream/`，本地测试照样绿、部署里那页 404）。文件被我们
+删掉 → 这条用例在**所有平台**报 FileNotFoundError，**CI 必红**。
+
+**改法**：只移除**实测会吞掉快照必需文件**的那一份（当前仅
+`vendor/wb2api/.gitignore`），其余**原样保留**；纳出完整性校验保持**报错退出**，
+作为"将来出现新的有害模式"的兜底（失败时提示 `git check-ignore -v` 定位，
+并把该份加进脚本里的 `DROP_IGNORES`）。`vendor/manager/.gitignore` 与
+`vendor/manager/web/.gitignore` 现在进入快照。
+
+> 教训：**"一律删除"这类过度纠正，代价会以"上游测试假失败"的形式回来** ——
+> 假失败最坏的地方是它会让人开始忽略测试信号，而"上游测试全绿"正是本项目
+> 判断某个上游版本能不能用的主要依据。文档同步改写：UPSTREAMS.md 的
+> 「嵌套 .gitignore 陷阱」与「快照保留范围」、MAINTAINING.md 的同步流程说明。
+
+### 变更：移除 GitHub 的「上游有更新」issue 提醒
+
+删掉 `.github/workflows/upstream-check.yml`：它每天比对 `upstreams.json` 与上游
+最新 commit，漂移时自动开（或更新）一个标题为「上游有更新可同步」的 issue。
+**为什么删**：
+
+- **信息重复**：面板「系统更新」页第 2 块显示的正是同一件事（manager 快照版本 →
+  上游最新 Release），部署机上直接可见，不必被 GitHub 通知叫去看；
+- **一半早已失效**：wb2api 仓库已删除，那条比对每天只记一行"查询失败"，
+  永远不会有结果；
+- 它要求仓库给 `issues: write` 权限 —— 为一条重复信息付这个权限不划算。
+
+**现在怎么判断该不该同步**：看面板第 2 块；想主动核对用
+`./scripts/sync-upstreams.sh --dry-run --only manager`。两者都只回答"差多少"，
+"该不该同步"仍是人的判断（纯治理类提交不值得为它跑一次 149 文件的全量重测）。
+
+> 删除工作流**不会**自动回收它已经开出的 issue —— 历史 issue 需要手工关闭
+> （它自己的正文末行就写着"同步完成后关闭即可"，而内容会随下一次同步过期）。
+
 ### 同步上游：manager v1.0.70 → v1.0.74（跨 4 个发版）
 
 `1a48761` → `9604e001`（149 文件 / +17949 −1285，62 个提交）。

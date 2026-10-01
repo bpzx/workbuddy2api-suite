@@ -10,6 +10,7 @@ import {BASE_PATH} from '@/lib/base-path';
 import type {ApiKey, KeyImportResult, KeyImportStatus, UpstreamEndpoint} from '@/lib/types';
 import {fmtDateTime, fmtNumber} from '@/lib/format';
 import {PageHeader} from '@/components/common/layout/PageHeader';
+import {PageSectionTabs} from '@/components/common/layout/PageSectionTabs';
 import {EmptyState} from '@/components/common/layout/EmptyState';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
 import {LoadError} from '@/components/common/states/LoadError';
@@ -491,20 +492,27 @@ export default function KeysPage() {
   const shownKeys = tab === 'packet' ? packetKeys : normalKeys;
 
   const header = (
-    <PageHeader
-      title={t('keys.title')}
-      description={t('keys.description')}
-      actions={
-        <>
-          {isAdmin && (
-            <Button size="sm" className="rounded-full" onClick={openCreate}>
-              <Plus />
-              {t('keys.newKey')}
-            </Button>
-          )}
-        </>
-      }
-    />
+    <>
+      <PageHeader
+        title={t('keys.title')}
+        description={t('keys.description')}
+        actions={
+          <>
+            {isAdmin && (
+              <Button size="sm" className="rounded-full" onClick={openCreate}>
+                <Plus />
+                {t('keys.newKey')}
+              </Button>
+            )}
+          </>
+        }
+      />
+      {/* 二级导航（批次 4 ②：本页吸收了「红包」——红包产出的就是密钥，
+          一份一个 key，只是多了「一次建一批、额度随机分配」这层封装）。
+          放进 `header` 而不是两个 return 分支里各写一遍：下面的首屏守卫
+          是**早返回**，漏一处就会出现「取不到密钥时 Tab 不见了」。 */}
+      <PageSectionTabs />
+    </>
   );
 
   // 首屏：一次都没取到。

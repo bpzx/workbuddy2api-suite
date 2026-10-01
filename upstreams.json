@@ -30,10 +30,10 @@
       "repo": "ithtelab/workbuddy-manager",
       "repo_url": "https://github.com/ithtelab/workbuddy-manager.git",
       "branch": "main",
-      "commit": "9604e0012f41285ee88efde2a9cf15f3ad558043",
-      "commit_short": "9604e00",
-      "commit_date": "2026-09-28T12:39:59+08:00",
-      "subject": "chore(release): v1.0.74",
+      "commit": "8c92da9b285df009519ad1fe0817b3d3d3643fd1",
+      "commit_short": "8c92da9",
+      "commit_date": "2026-09-30T19:33:28+08:00",
+      "subject": "chore(release): v1.0.76",
       "vendor_path": "vendor/manager",
       "license": "MIT",
       "license_file": "vendor/manager/LICENSE",
@@ -41,7 +41,7 @@
         ".git"
       ],
       "note": "镜像内置于 /opt/manager；deploy/update.py 在构建期由 docker/stub/update.py 覆盖（容器内无 git/systemctl）。保留 .github：上游测试会读 .github/workflows/release.yml",
-      "synced_at": "2026-09-28T13:30:12+08:00"
+      "synced_at": "2026-10-01T11:45:27+08:00"
     }
   }
 }

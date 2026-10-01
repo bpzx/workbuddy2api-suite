@@ -460,6 +460,24 @@ def start_update(target: str) -> tuple[bool, str]:
     return True, f'更新已开始（pid={proc.pid}）'
 
 
+def clear_status() -> tuple[bool, str]:
+    """清除上次更新的结果与日志。返回 (是否成功, 说明)。
+
+    为什么需要它（issue #105）：一次失败的更新会**长期驻留** —— 状态文件只在下次
+    `start_update` 时被删，`update.log` 只追加从不截断，于是界面上那条「更新未完成」
+    与日志永远擦不掉，用户只能进容器手删文件。而失败记录恰恰是最想清掉的东西。
+    """
+    if _lock_active():
+        # 运行中清状态会让前端把「正在更新」看丢；等它结束（或锁过期）再清。
+        return False, '更新正在进行中，等它结束后再清除'
+    for f in (STATUS_FILE, LOG_FILE):
+        try:
+            f.unlink(missing_ok=True)
+        except OSError as exc:
+            return False, f'清除失败：{exc}'
+    return True, '已清除上次更新的结果与日志'
+
+
 def tail_log(lines: int = 80) -> str:
     if not LOG_FILE.is_file():
         return ''

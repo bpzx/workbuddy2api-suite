@@ -376,3 +376,136 @@ class RestartStepOnWindows(unittest.TestCase):
         self.assertEqual(calls, [('systemctl', 'restart', worker.SERVICE_NAME)],
                          'POSIX 分支被改坏了：不再走 systemctl')
         self.assertIn('已重启', text)
+
+
+class ClearStatusTest(unittest.TestCase):
+    """清除上次更新的结果与日志（issue #105）。
+
+    现场：一次失败的更新会长期驻留 —— 状态文件只在下次 start_update 时被删、
+    update.log 只追加不截断，界面上那条「更新未完成」与日志永远擦不掉，用户只能
+    进容器手删 /app/data/update-status.json 与 update.log。而失败记录恰恰是最想
+    清掉的东西。这里锁住三件事：能清、运行中拒绝、把两个文件都清掉。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = pathlib.Path(self._tmp.name)
+        self._orig = {k: getattr(updater, k) for k in
+                      ('STATUS_FILE', 'LOCK_FILE', 'LOG_FILE')}
+        updater.STATUS_FILE = self.dir / 'update-status.json'
+        updater.LOCK_FILE = self.dir / 'update.lock'
+        updater.LOG_FILE = self.dir / 'update.log'
+
+    def tearDown(self) -> None:
+        for k, v in self._orig.items():
+            setattr(updater, k, v)
+        self._tmp.cleanup()
+
+    def test_clears_both_status_and_log(self) -> None:
+        updater.STATUS_FILE.write_text('{"running": false, "ok": false}', encoding='utf-8')
+        updater.LOG_FILE.write_text('更新失败：The read operation timed out\n', encoding='utf-8')
+        ok, msg = updater.clear_status()
+        self.assertTrue(ok, msg)
+        self.assertFalse(updater.STATUS_FILE.exists(), '状态文件没清掉 —— 界面还会显示失败')
+        self.assertFalse(updater.LOG_FILE.exists(), 'update.log 没清掉 —— 日志区还会显示历史')
+        # 清完再读：没有任何结果，界面因此不显示结果卡片与日志区
+        st = updater.read_status()
+        self.assertIsNone(st['ok'])
+        self.assertFalse(st['running'])
+        self.assertEqual(updater.tail_log(80), '')
+
+    def test_refuses_while_an_update_is_running(self) -> None:
+        """运行中清除会让前端把「正在更新」看丢 —— 必须拒绝。"""
+        updater.LOCK_FILE.write_text(str(os.getpid()), encoding='utf-8')  # 活着的 pid
+        updater.STATUS_FILE.write_text('{"running": true}', encoding='utf-8')
+        ok, msg = updater.clear_status()
+        self.assertFalse(ok, '更新进行中却允许清除')
+        self.assertIn('进行中', msg)
+        self.assertTrue(updater.STATUS_FILE.exists(), '被拒绝时不该动状态文件')
+
+    def test_stale_lock_does_not_block_clearing(self) -> None:
+        """崩溃遗留的死 pid 锁不该拦住清除（那正是最需要清的现场）。"""
+        updater.LOCK_FILE.write_text('4194304', encoding='utf-8')  # 必不存在
+        updater.STATUS_FILE.write_text('{"running": true, "ok": null}', encoding='utf-8')
+        ok, msg = updater.clear_status()
+        self.assertTrue(ok, msg)
+
+
+class UpdateProxyTest(unittest.TestCase):
+    """一键更新的下载代理（issue #106）。
+
+    容器能连上 api.github.com（版本检测）却连不上 Release 资产所在的 github.com /
+    objects.githubusercontent.com 是常见情形，而「检测成功」会把「下载不可达」
+    掩盖成「更新器坏了」。这里验：WB_UPDATE_PROXY 真的被下载路径用上（用一个本地
+    HTTP 代理收请求来验，不 mock 标准库），且本机地址会被 no_proxy 放行。
+    """
+
+    @staticmethod
+    def _load(**env):
+        import importlib.util
+        keys = list(env)
+        old = {k: os.environ.get(k) for k in keys}
+        for k, v in env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = str(v)
+        try:
+            spec = importlib.util.spec_from_file_location(
+                'upd_proxy', str(pathlib.Path(__file__).resolve().parents[2] / 'deploy' / 'update.py'))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod, {k: os.environ.get(k) for k in keys}
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_download_goes_through_the_configured_proxy(self) -> None:
+        seen: list[str] = []
+
+        class Proxy(BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                # 代理收到的是绝对 URL（http://host/path），不是路径
+                seen.append(self.path)
+                body = b'x' * 101_000
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = ThreadingHTTPServer(('127.0.0.1', 0), Proxy)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            proxy_url = f'http://127.0.0.1:{srv.server_address[1]}'
+            mod, _ = self._load(WB_UPDATE_PROXY=proxy_url)
+            self.assertEqual(mod.UPDATE_PROXY, proxy_url)
+            self.assertIn('127.0.0.1', os.environ.get('no_proxy', ''))
+            dest = pathlib.Path(tempfile.mkdtemp()) / 'pkg.tar.gz'
+            mod.download('http://release.invalid/workbuddy-manager-v9.tar.gz', dest,
+                         _SilentReporter())
+            self.assertEqual(dest.stat().st_size, 101_000, '下载没有成功经过代理')
+            self.assertTrue(seen, '代理一个请求都没收到 —— 下载没走 WB_UPDATE_PROXY')
+            self.assertIn('release.invalid', seen[0])
+        finally:
+            srv.shutdown()
+
+    def test_wb_http_proxy_is_used_when_update_proxy_absent(self) -> None:
+        """用户已经为面板配过出口代理（WB_HTTP_PROXY）时不必再配一遍。"""
+        mod, _ = self._load(WB_UPDATE_PROXY=None, WB_HTTP_PROXY='http://panel-proxy:7890')
+        self.assertEqual(mod.UPDATE_PROXY, 'http://panel-proxy:7890')
+
+    def test_network_failure_hint_mentions_the_proxy_knob(self) -> None:
+        mod, _ = self._load(WB_UPDATE_PROXY=None, WB_HTTP_PROXY=None)
+        hint = mod._download_hint(OSError('The read operation timed out'))
+        self.assertIn('WB_UPDATE_PROXY', hint,
+                      '下载失败时没有告诉用户「可能需要配代理」（issue #106 的第二个诉求）')
+        # 与网络无关的失败不贴这条提示（避免误导）
+        self.assertEqual(mod._download_hint(ValueError('bad url')), '')

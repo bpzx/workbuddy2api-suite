@@ -21,6 +21,7 @@ import {accountApi, errText} from '@/lib/api';
 import type {CheckinLog, TaskLog, TaskLogResponse} from '@/lib/types';
 import {fmtDateTimeMarked, fmtNumber} from '@/lib/format';
 import {PageHeader} from '@/components/common/layout/PageHeader';
+import {PageSectionTabs} from '@/components/common/layout/PageSectionTabs';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
 import {LoadError} from '@/components/common/states/LoadError';
 import {SkeletonBar} from '@/components/common/states/SkeletonBar';
@@ -317,12 +318,17 @@ export default function TasksPage() {
   const hasAnyTask = (taskStats?.total ?? 0) > 0;
 
   /** 页面头与「一键执行」面板都不依赖本页那两份数据，守卫前后渲染同一份，
-   *  免得加载时先消失再出现（同一位置、同一类型，React 会保留实例）。 */
+   *  免得加载时先消失再出现（同一位置、同一类型，React 会保留实例）。
+   *  二级导航（批次 4 ②：本页已并入「账号」）也放进来：它与数据同样无关，
+   *  放进 `header` 就不会出现「加载时 Tab 先消失、加载完再出现」的抖动。 */
   const header = (
-    <PageHeader
-      title={t('tasks.title')}
-      description={t('tasks.description', {realm: realmName})}
-    />
+    <>
+      <PageHeader
+        title={t('tasks.title')}
+        description={t('tasks.description', {realm: realmName})}
+      />
+      <PageSectionTabs />
+    </>
   );
   // 成长任务一键执行（issue #19）。仅管理员：这些操作会对账号发起真实写请求，
   // 后端也以 require_admin 兜底。国际版无成长中心体系，故不显示。

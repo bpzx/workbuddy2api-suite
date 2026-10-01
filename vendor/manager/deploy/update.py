@@ -58,6 +58,49 @@ UPSTREAM_DIR = Path(os.environ.get('WB_UPSTREAM_DIR') or '/opt/workbuddy2api')
 UPSTREAM_PORT = int(os.environ.get('WB_UPSTREAM_PORT') or 7863)
 MANAGER_PORT = int(os.environ.get('WB_MANAGER_PORT') or 7864)
 MANAGER_REPO = os.environ.get('WB_MANAGER_REPO') or 'ithtelab/workbuddy-manager'
+
+# ── 下载代理（issue #106）──────────────────────────────────────
+# 容器里能连上 api.github.com（版本检测走它）却连不上 Release 资产所在的
+# github.com / objects.githubusercontent.com 是常见情形——两条链路可达性不同。
+# 版本检测成功会把「下载不可达」掩盖成「更新器坏了」，所以这里给一个明确的旋钮。
+# 取值顺序：WB_UPDATE_PROXY（更新专用）> WB_HTTP_PROXY（面板的出口代理，
+# 用户已经为它配过代理时不必再配一遍）> 环境变量里的 http_proxy / https_proxy
+# （urllib 的默认行为）。本机地址由 no_proxy 自动放行。
+UPDATE_PROXY = (os.environ.get('WB_UPDATE_PROXY')
+                or os.environ.get('WB_HTTP_PROXY') or '').strip()
+if UPDATE_PROXY:
+    # 本机与内网不走代理：更新器要读本地状态文件，代理配置不该把内网也带偏。
+    os.environ.setdefault('no_proxy', '127.0.0.1,localhost')
+    os.environ.setdefault('NO_PROXY', os.environ['no_proxy'])
+
+
+def _opener() -> urllib.request.OpenerDirector:
+    """按配置构造 opener：设了 WB_UPDATE_PROXY 就用它，否则用环境变量默认。"""
+    handlers: list[urllib.request.BaseHandler] = []
+    if UPDATE_PROXY:
+        handlers.append(urllib.request.ProxyHandler(
+            {'http': UPDATE_PROXY, 'https': UPDATE_PROXY}))
+    handlers.append(urllib.request.HTTPSHandler())
+    return urllib.request.build_opener(*handlers)
+
+
+def _download_hint(exc: BaseException) -> str:
+    """下载失败的**可操作**提示：区分「网络到不了 GitHub」与其它原因。"""
+    text = str(exc)
+    looks_like_network = any(k in text for k in (
+        'timed out', 'Timeout', 'Remote end closed', 'Connection reset',
+        'No address associated', 'Temporary failure', 'Name or service',
+        'Connection refused', 'unreachable',
+    ))
+    if not looks_like_network:
+        return ''
+    if UPDATE_PROXY:
+        return (f'（已配置代理 {UPDATE_PROXY}，仍连不上 —— 检查代理地址是否可从本机访问、'
+                f'以及它是否放行 github.com）')
+    if urllib.request.getproxies():
+        return '（当前使用的是环境变量里的代理；若代理不可用，可用 WB_UPDATE_PROXY 指定一个）'
+    return ('（当前网络似乎无法直连 GitHub。容器/内网环境请在 .env 里设置 '
+            'WB_UPDATE_PROXY=http://<宿主IP>:<端口> 后重试，例如 http://172.17.0.1:7890）')
 UPSTREAM_REPO = os.environ.get('WB_UPSTREAM_REPO') or 'https://github.com/Sliverkiss/workbuddy2api.git'
 SERVICE_NAME = os.environ.get('WB_SERVICE_NAME') or 'workbuddy-web'
 DATA_DIR = Path(os.environ.get('WB_DATA_DIR') or INSTALL_DIR / 'data')
@@ -202,7 +245,7 @@ def http_json(url: str, timeout: int = 20) -> dict:
         'Accept': 'application/vnd.github+json',
         'User-Agent': 'workbuddy-manager-updater',
     })
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _opener().open(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode('utf-8'))
 
 
@@ -220,7 +263,7 @@ def download(url: str, dest: Path, rep: Reporter) -> None:
     for attempt in (1, 2):
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'workbuddy-manager-updater'})
-            with urllib.request.urlopen(req, timeout=120) as resp, open(dest, 'wb') as fh:
+            with _opener().open(req, timeout=120) as resp, open(dest, 'wb') as fh:
                 shutil.copyfileobj(resp, fh)
             last = None
             break
@@ -235,7 +278,10 @@ def download(url: str, dest: Path, rep: Reporter) -> None:
         if attempt == 1:
             rep.log(f'下载失败（{last}），自动重试一次…', 'warn')
     if last is not None:
-        raise last
+        # 只有「看着像网络到不了 GitHub」的失败才补一句可操作提示；其余照原样抛出，
+        # 保持调用方与既有测试看到的异常类型不变。
+        hint = _download_hint(last)
+        raise RuntimeError(f'{last} {hint}') if hint else last
 
     size = dest.stat().st_size
     rep.log(f'  完成（{size / 1024 / 1024:.2f} MB）')
@@ -319,7 +365,7 @@ def download_signature(sig_url: str, archive: Path, rep: Reporter) -> Path:
     rep.log('下载签名文件…')
     try:
         req = urllib.request.Request(sig_url, headers={'User-Agent': 'workbuddy-manager-updater'})
-        with urllib.request.urlopen(req, timeout=60) as resp, open(sig_path, 'wb') as fh:
+        with _opener().open(req, timeout=60) as resp, open(sig_path, 'wb') as fh:
             shutil.copyfileobj(resp, fh)
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(

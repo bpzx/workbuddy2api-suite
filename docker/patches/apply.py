@@ -158,15 +158,17 @@ GO_NEW = """func newTransport() *http.Transport {
 # 一概不动（那是本项目的既定边界，CI 有反向断言守着）。
 # 上游位置：vendor/manager/server/main.py（导入块）
 #
-# 锚点取导入块的**收尾两行**。⚠️ 这个块上游改得频繁（v1.0.70 新增了
-# redpackets / tokens，v1.0.71~74 又新增 upstreams），上游再加模块时这里会
-# 失效 —— 预检测试会在本地先报出来，按新收尾行更新即可。
-MAIN_IMPORT_OLD = """    redpackets, responses, security as security_router, settings, stats,
-    system, tokens, upstreams,
+# 锚点取导入块的**收尾两行**。⚠️ 这个块是本项目**最高频失效**的锚点：
+# v1.0.70 新增 redpackets / tokens，v1.0.71~74 新增 upstreams，v1.0.75 又新增
+# pgsync（还把 `pgsync as pgsync_router` 插到了行首，把 `settings` 挤到第二行）。
+# 上游每加一个路由模块这里就会失效 —— 预检测试会在本地**立刻**报出来，
+# 按新的收尾两行照抄更新即可（不要凭记忆手写，容易被折行位置骗到）。
+MAIN_IMPORT_OLD = """    pgsync as pgsync_router, redpackets, responses, security as security_router,
+    settings, stats, system, tokens, upstreams,
 )"""
 
-MAIN_IMPORT_NEW = """    redpackets, responses, security as security_router, settings, stats,
-    system, tokens, upstreams,
+MAIN_IMPORT_NEW = """    pgsync as pgsync_router, redpackets, responses, security as security_router,
+    settings, stats, system, tokens, upstreams,
 )
 # 【集成补丁】本发行版新增的套件自更新路由（实现见 server/routers/suite.py）
 from .routers import suite as suite_router"""

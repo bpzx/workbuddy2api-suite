@@ -4,8 +4,9 @@
 
 **腾讯 CodeBuddy 账号池管理控制台 · OpenAI 兼容反代网关**
 
-一套给 [`workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api) 配套的 Web 管理端：
-扫码批量纳管账号、自动签到、密钥分发、IP 管控、调用日志与用量统计，一个面板全搞定。
+面向 [`workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api) 的 Web 管理端：
+扫码批量纳管账号、定时签到与 token 保活、密钥分组分发、IP 与模型白名单、调用日志与
+用量统计；安装与更新走带签名校验的发布包。
 
 > 上游 workbuddy2api 的源码**随本项目的发布包一起分发**（MIT）。
 > 已部署的不受影响；重装 / 迁移时怎么取得源码，见
@@ -204,6 +205,18 @@
   验签通过后 `deploy/` 也会随包更新（它里面的更新器本身也需要能升级）；
   若你要手工维护 `deploy/`，设 `WB_SYNC_DEPLOY=0` 即可保持不动。
   发版与密钥管理见 [docs/release-signing.md](docs/release-signing.md)
+
+### 数据备份（PostgreSQL 异地保险库）
+- **面板照旧读写本机数据库**，PostgreSQL 只当一份异地副本 —— 不拖慢任何请求，
+  也不必把整个服务搬到 PostgreSQL 上跑
+- 「设置 → 数据备份」填地址 / 端口 / 库名 / 账号密码，**先「测试连接」再保存**
+- **迁移到 PostgreSQL**：把本机数据整份镜像过去（只读本机，不改动它）
+- **从 PostgreSQL 恢复**：在新机器上装好面板、填同样的连接信息，一键把数据拉回来。
+  恢复前默认先在本机 `data/` 下另存一份，恢复错了还能退回去
+- **备份的是本机数据库里的业务数据**（账号备注 / 密钥 / 请求日志 / 用量 / 设置…）；`.env` 与管理员账号文件**不在其中**，换机器恢复时要自己带过去
+- **定时自动备份**：设个间隔（分钟）到点自动推；不设就只在手动点时推
+- 只对**管理员会话**开放（导出会把数据复制出去、恢复会覆盖本地库）
+- 依赖 `psycopg`（已列入 `requirements.txt`）；未安装时页面会说明要装什么
 
 ### 更新日志
 - 内置「设置 → 更新日志」，读取部署目录的 `CHANGELOG.md`（`server/` 内另有副本兜底）
@@ -745,6 +758,7 @@ export ANTHROPIC_MODEL=glm-5.2
 | `GET` | `/api/logs` `/api/stats/*` | 会话 | 日志与用量 |
 | `GET/POST/DELETE` | `/api/security/*` | 会话 / 管理员 | IP 规则与审计 |
 | `GET/POST` | `/api/settings/*` | 会话 / 管理员 | 上游配置、模型映射 |
+| `GET/POST` | `/api/settings/pg-sync*` | 会话（管理员） | PostgreSQL 异地备份：配置 / 测试连接 / 迁移 / 恢复 |
 
 管理端接口细节可在服务启动后访问 `/docs` 查看（Swagger UI）。
 

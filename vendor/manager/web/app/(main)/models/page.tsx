@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 
 import {PageHeader} from '@/components/common/layout/PageHeader';
+import {PageSectionTabs} from '@/components/common/layout/PageSectionTabs';
 import {EmptyState} from '@/components/common/layout/EmptyState';
 import {LoadError} from '@/components/common/states/LoadError';
 import {SkeletonBar} from '@/components/common/states/SkeletonBar';
@@ -237,26 +238,33 @@ export default function ModelsPage() {
   const seriesOptions = summary?.series ?? [];
 
   const header = (
-    <PageHeader
-      title={t('models.title')}
-      description={t('models.description', {realm: realmName})}
-      actions={
-        <Button
-          variant="outline"
-          size="sm"
-          className="rounded-full"
-          disabled={isRefreshing}
-          title={t('models.refetchTitle')}
-          onClick={() => {
-            void refetch();
-            notify.info(t('models.refetching'));
-          }}
-        >
-          {isRefreshing ? <Loader2 className="animate-spin" /> : <RefreshCw />}
-          {t('models.refetch')}
-        </Button>
-      }
-    />
+    <>
+      <PageHeader
+        title={t('models.title')}
+        description={t('models.description', {realm: realmName})}
+        actions={
+          <Button
+            variant="outline"
+            size="sm"
+            className="rounded-full"
+            disabled={isRefreshing}
+            title={t('models.refetchTitle')}
+            onClick={() => {
+              void refetch();
+              notify.info(t('models.refetching'));
+            }}
+          >
+            {isRefreshing ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+            {t('models.refetch')}
+          </Button>
+        }
+      />
+      {/* 二级导航（批次 4 ②：本页吸收了「聊天测试台」——看模型 → 想试 →
+          试完回来看价格，是同一个来回动作）。放进 `header` 而不是两个 return
+          分支里各写一遍：下面的首屏守卫是**早返回**，漏一处就会出现
+          「取不到目录时 Tab 不见了」。 */}
+      <PageSectionTabs />
+    </>
   );
 
   /**

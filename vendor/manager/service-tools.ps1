@@ -39,8 +39,13 @@ function Get-ManagerProcess {
 }
 
 function Stop-Manager {
+    $upstreamStop = Join-Path $root 'upstream\stop-workbuddy2api.cmd'
+    if (Test-Path $upstreamStop) {
+        & cmd.exe /c $upstreamStop
+    }
+
     $procs = Get-ManagerProcess
-    if (-not $procs) { Write-Host "端口 $port 没有监听进程，服务未运行"; return }
+    if (-not $procs) { Write-Host "端口 $port 没有监听进程，Manager 服务未运行"; return }
     foreach ($proc in $procs) {
         Write-Host "停止 PID $($proc.Id) ($($proc.ProcessName))"
         Stop-Process -Id $proc.Id -Force
@@ -49,6 +54,12 @@ function Stop-Manager {
 }
 
 function Start-Manager {
+    $upstreamStart = Join-Path $root 'upstream\start-workbuddy2api.cmd'
+    if (Test-Path $upstreamStart) {
+        Write-Host "正在启动上游 workbuddy2api 服务..."
+        & cmd.exe /c $upstreamStart
+    }
+
     if (Get-ManagerProcess) { Write-Host "端口 $port 已被占用，服务似乎已在运行（用 status 确认）"; return }
     if (-not (Test-Path $python)) { Write-Error "未找到 $python，请先创建虚拟环境并安装依赖" }
     New-Item -ItemType Directory -Force (Join-Path $root 'data') | Out-Null
@@ -65,7 +76,7 @@ function Start-Manager {
     $proc = Start-Process -FilePath $python -ArgumentList $uvicornArgs `
         -WorkingDirectory $root -WindowStyle Hidden `
         -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru
-    Start-Sleep -Seconds 6
+    Start-Sleep -Seconds 4
     if ($proc.HasExited) {
         Write-Host "启动失败（退出码 $($proc.ExitCode)），错误日志尾部："
         Get-Content $errLog -Tail 20 -ErrorAction SilentlyContinue
@@ -82,7 +93,7 @@ switch ($Action) {
         $procs = Get-ManagerProcess
         if ($procs) {
             $names = ($procs | ForEach-Object { "PID $($_.Id) ($($_.ProcessName))" }) -join ', '
-            Write-Host "运行中：$names"
+            Write-Host "WorkBuddy Manager 运行中：$names"
             try {
                 $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$port/api/healthz" -UseBasicParsing -TimeoutSec 5
                 Write-Host "健康检查：$($resp.StatusCode) $($resp.Content)"
@@ -90,7 +101,13 @@ switch ($Action) {
                 Write-Host "健康检查失败：$($_.Exception.Message)"
             }
         } else {
-            Write-Host '未运行'
+            Write-Host 'WorkBuddy Manager 未运行'
+        }
+
+        $upstreamStatus = Join-Path $root 'upstream\status-workbuddy2api.cmd'
+        if (Test-Path $upstreamStatus) {
+            Write-Host "上游状态："
+            & cmd.exe /c $upstreamStatus
         }
     }
 }

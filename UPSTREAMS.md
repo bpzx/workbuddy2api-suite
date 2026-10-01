@@ -23,38 +23,44 @@
 | 上游 | 仓库 | 分支 | Commit | 提交时间 | 快照位置 |
 |---|---|---|---|---|---|
 | wb2api | `Sliverkiss/workbuddy2api` ⚠️ **已删除** | `master` | `d1023f3` | 2026-09-21 09:52 | `vendor/wb2api` |
-| manager | [ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) | `main` | [`9604e00`](https://github.com/ithtelab/workbuddy-manager/commit/9604e001) | 2026-09-28 12:39 | `vendor/manager` |
+| manager | [ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) | `main` | [`8c92da9`](https://github.com/ithtelab/workbuddy-manager/commit/8c92da9b) | 2026-09-30 19:33 | `vendor/manager` |
 
 > wb2api 那一行**不再有可点的链接**：仓库已 404（见下节）。
 > 它是**我们开始自行维护时的起点**，不是"待同步的目标"。
 
 - wb2api：`Merge pull request #184 from .../fix/image-url-`（+764/−21，15 个文件）
   含图片 URL 修复、积分口径、成长任务链、WAF 403 处理等
-- manager：`chore(release): v1.0.74`（149 文件 / +17949 −1285，62 个提交）
-  **面板显示版本 v1.0.74**；期间跨 **4 个发版**（v1.0.71~v1.0.74）：账号分组 /
-  多账号池（密钥绑定上游、组间转移、分组实例重启）、密钥导出为 cc-switch / ZCode
-  配置片段与一键导入到本机、全站「统一异步状态」（日志 / 统计 / 测试台 / 账号 /
-  模型 / 红包 / 安全 / 设置取不到时不再冒充空态）、危险操作二次确认与渲染异常
-  兜底页、账号管理可搜可筛可排序可分页、Windows 一键更新卡死与 GBK 中断修复、
-  每日签到「睡眠跨过签到槽位」修复等。
+- manager：`chore(release): v1.0.76`（166 文件 / +13800 −2487）
+  **面板显示版本 v1.0.76**；期间跨 **2 个发版**（v1.0.75~v1.0.76）：设置页 7 个
+  Tab 改成可寻址子路由（外壳搬到 `settings/layout.tsx`）、命令面板（⌘K）、底栏入口
+  11→8 且被吸收的三页改为页内二级导航、**PostgreSQL 异地备份**（默认关闭）、
+  账号被上游「系统自动禁用」后可补调 revive 并随重新登录恢复、今日趋势图按小时、
+  Windows 本机原生运维脚本增强（验签 / 环境自愈）、更新记录可清除等。
 
-> **本次同步带来一处实质改进**：上游把「加账号落盘后立即重启上游」改成
-> **「先等最多 8 秒热加载、超时才重启」**（`server/services/reload.py`）。v1.0.70
-> 是无条件重启 —— 账号文件几秒就落盘了，重启却会打断上游（影响在途请求），
-> 面板随后那次刷新还要等上游回来（上游记录的"用户看到 20-30 秒"就是这个）。
-> 现在正常路径靠 wb2api 的 auths 热加载（约 5 秒）自动收录，**不重启**。
-> 注意别把这条改进**误读成**"我们的部署里重启本来就失败"：本套件的 manager 经
-> `dockerproxy`（`CONTAINERS=1` + `POST=1`，见 `docker-compose.yml`）**本来就能**
-> 成功执行 `docker restart`，改进体现为**更快、更少打扰**。
+> **本次同步（v1.0.74 → v1.0.76）有三件事值得记住**：
+>
+> 1. **导入块锚点第三次失效**（v1.0.70 加 redpackets/tokens → v1.0.71~74 加
+>    upstreams → v1.0.75 加 pgsync）。它已是本项目**最高频失效**的锚点；
+>    `apply.py` 里已标注"不要凭记忆手写，照抄新收尾两行"—— 上游这次还把
+>    `pgsync as pgsync_router` 插到行首、把 `settings` 挤到第二行，凭记忆必错。
+> 2. **"一律删除 vendor 下的 .gitignore"这条策略被收窄**（上游 v1.0.75 新增了会
+>    读 `.gitignore` 的测试，一律删会让它在**所有平台**假失败、CI 必红）。
+>    这是本次唯一的**策略级改动**，判断过程与教训写在「嵌套 .gitignore 陷阱」。
+> 3. **`UpdatePanel.tsx` 这个覆写目标，上游这次自己也改了**（新增"清除更新记录"，
+>    issue #105）—— 按覆写的既定代价放弃。判定依据：我们的面板不渲染上游的
+>    更新状态与日志（它读的是套件侧车的状态），所以那个能力在这里没有对应物。
+>    这次是"覆写代价"的第一次真实发生，登记在「覆写登记」。
+>
+> 依赖面：`server/requirements.txt` 新增 `psycopg[binary]>=3.1`（PostgreSQL 异地
+> 备份的驱动，按需导入、功能默认关闭；`[binary]` 自带预编译 libpq，不需要系统包，
+> 镜像会照装）。**没有新增环境变量**。`server/services/updater.py` 只多了
+> `clear_status()`，**状态 JSON 口径未变**，`docker/stub/update.py` 无需调整。
 
-> **本次同步触发的锚点更新（1 处）**：`main.py` 导入块（上游新增 `upstreams`
-> 路由模块，收尾行变成 `system, tokens, upstreams,`）。与上次同因 —— 这个块上游
-> 改得频繁，预检测试在同步后**立刻**报出，按新收尾行更新即可。
-> 另外 `server/services/updater.py`（我们 stub 的**读取端**）本轮改了 91 行，
-> 但内容全是 Windows 进程探活 / 子进程 UTF-8 编码 / 启动时的占位状态，
-> **状态 JSON 的字段口径未变**，`docker/stub/update.py` 无需调整。
-> 上游本轮只新增了一个环境变量（`WB_LOCAL_IMPORT`，默认关闭，见下），
-> 没有"该设而未设"的项。
+> 上次同步（v1.0.70 → v1.0.74）的要点：上游把「加账号落盘后立即重启上游」改成
+> **「先等最多 8 秒热加载、超时才重启」** —— 在我们这里体现为更快、更少打扰。
+> 别把这条**误读**成"我们的部署里重启本来就失败"：manager 经 `dockerproxy`
+> （`POST=1` + `CONTAINERS=1`）**是能**成功执行 `docker restart` 的。
+> 那次也更新过一次导入块锚点，并确认读取端（`updater.py`）改了 91 行但字段口径未变。
 
 > 上次同步（v1.0.60 → v1.0.70）顺带修掉一处**配置模板漂移**（此前一直存在，非那次
 > 引入）：上游已 BREAKING 移除 `server.max_body_mb`（请求体改为无上限），而我们的
@@ -75,9 +81,9 @@
 **`Sliverkiss/workbuddy2api` 已不可访问**（仓库 API 与网页均返回 404；账号本身仍在，
 其公开仓库列表中已无该项目）。因此 wb2api **不再是"待同步的上游"**：
 
-- **不再有上游可同步**：`./scripts/sync-upstreams.sh --only wb2api` 会 fetch 失败；
-  每日漂移检测（`.github/workflows/upstream-check.yml`）对它会记一行"查询失败"，
-  既不开 issue 也不失败（fail-soft），等于该监控自动失效。
+- **不再有上游可同步**：`./scripts/sync-upstreams.sh --only wb2api` 会 fetch 失败。
+  （曾经的每日漂移检测对它会记一行"查询失败"、既不开 issue 也不失败，等于该监控
+  自动失效 —— 那条监控本身后来也一并删掉了，见「漂移检测」。）
 - **构建不受影响**：`vendor/wb2api` 是自包含快照，构建期**不需要**访问上游。
   这正是当初选择 vendoring 而不是 submodule 换来的保险。
 - **我们还有一份比快照更新的历史**：本地镜像缓存
@@ -101,8 +107,7 @@
 ### 快照保留范围
 
 - **排除**：`.git`（体积）
-- **移除**：上游的 `.gitignore`（**关键，见下方「嵌套 .gitignore 陷阱」**）
-- **保留**：`.github`、`LICENSE`、全部测试
+- **保留**：`.github`、`.gitignore`、`LICENSE`、全部测试
   - 保留 `.github` 有两个原因：GitHub **只搜索仓库根目录**的
     `.github/workflows`，嵌套在 `vendor/` 下的工作流不会被触发（无害）；
     而 manager 的 `test_release_signature.py` 会读自己的
@@ -110,6 +115,10 @@
     污染"测试全绿"这个信号。
   - 保留全部测试：上游那 2.3 万行测试是逆向所得协议知识的护栏，
     也是判断"这个上游版本能不能用"的主要依据。
+  - 保留 `.gitignore`（**与 .github 同理，且踩过一次反例**）：上游测试会读它 ——
+    manager 的 `test_settings_tabs::test_upstream_route_is_not_gitignored` 就
+    断言里面的 `upstream/` 必须写成 `/upstream/`。但**不是全留**：实测会吞掉
+    快照必需文件的那一份要删，见下方「嵌套 .gitignore 陷阱」。
 
 ### 嵌套 .gitignore 陷阱（真实事故，务必理解）
 
@@ -136,13 +145,26 @@ internal/prompt/prompt.go:17:12: pattern defaultprompt.md: no matching files fou
 优先」，浅层写 `!vendor/wb2api/internal/prompt/defaultprompt.md` 无法撤销
 深层 `*.md` 的排除。
 
-**因此本项目采取的方案**：
+**因此本项目采取的方案**（注意第 1 条**曾经是"一律移除"，v1.0.75 起收窄**）：
 
-1. `sync-upstreams.sh` 在导出快照时**自动移除** vendor 下所有 `.gitignore`；
+1. `sync-upstreams.sh` 在导出快照时**只移除实测会吞掉快照必需文件的**
+   `.gitignore`（当前仅 `vendor/wb2api/.gitignore` 一份，其 `*.md` 就是吞掉
+   `defaultprompt.md` 的那条），其余**原样保留**；
 2. 保护规则改由**根 `.gitignore` 用锚定路径**（`/auths/`、`/config.json` …）
    显式表达，不用 bare 模式；
 3. 同步脚本结尾做**纳出完整性校验**：vendor/ 磁盘上每个文件都必须出现在
-   git 索引里，否则报错退出 —— 这是唯一能自动发现此类疏漏的检查。
+   git 索引里，否则**报错退出**（不是警告）—— 这是唯一能自动发现此类疏漏的检查，
+   也是第 1 条敢收窄的**依据**：将来哪份 .gitignore 有了新的有害模式，它会立刻
+   拦住并提示用 `git check-ignore -v` 定位。
+
+> **为什么从"一律移除"收窄**（v1.0.75 的真实反例）：上游新增了
+> `test_settings_tabs::test_upstream_route_is_not_gitignored`，它**读 `.gitignore`**
+> 断言 `upstream/` 必须锚定。文件被我们删掉 → 该用例在**所有平台**报
+> FileNotFoundError，CI 必红；而它护的坑我们同样会踩（未锚定的 `upstream/`
+> 会吞掉 `web/app/(main)/settings/upstream/page.tsx`，本地测试照样绿、
+> 部署里那页 404）。教训：**"一律删除"这类过度纠正，代价会以"上游测试假失败"
+> 的形式回来** —— 假失败最坏的地方是它会让人开始忽略测试信号，而"上游测试全绿"
+> 正是本项目判断某个上游版本能不能用的主要依据。
 
 > 教训：`git add -A` 不报错 ≠ 文件都进了版本库。
 > 只有「磁盘文件集 == git 索引文件集」这个对账才能发现被静默忽略的文件。
@@ -205,6 +227,13 @@ internal/prompt/prompt.go:17:12: pattern defaultprompt.md: no matching files fou
 > 不存在。真正需要维护的只有**读取端契约**：`server/services/updater.py` 读的
 > 状态 JSON（`running/ok/step/logs/started_at/finished_at/duration/target_version`）
 > 必须与 `docker/overlay/update_runner.py` 写出的一致。
+
+> **覆写的代价第一次真实发生了**（v1.0.75，2026-09-30）：上游给
+> `UpdatePanel.tsx` 加了「清除更新记录」（issue #105，配合后端新增的
+> `updater.clear_status()`）。我们的面板**没有搬**它，判定依据是**对应物不存在**：
+> 本面板不渲染上游的更新状态与日志（它读的是套件侧车的状态），所以"清除上游
+> 更新记录"在这个面板里没有可清除的对象。**以后照这个标准判断** —— 先问"上游
+> 这次的改动在我们的面板里有没有对应物"，再决定搬不搬；有对应物就别偷懒。
 
 同时 `docker/overlay/` 还含两处**新增**文件（上游没有，不冲突）：
 `server/services/suite.py`（版本比对与更新触发）与 `server/routers/suite.py`（三个端点）。
@@ -369,13 +398,21 @@ cd vendor/manager && python3 -m unittest discover -s server/tests -t .
 ```
 
 脚本会：`git fetch` 目标分支 → 打印新旧 commit 之间的**提交列表与 diff 统计**
-→ `rsync` 覆盖 `vendor/<name>/`（排除 `.git`、`.github`）→ 回写
-`upstreams.json` 的新 commit 与时间 → 提示重跑测试与提交。
+→ 用 `git archive` 导出到临时目录、校验后**整体替换** `vendor/<name>/`
+（只排除 `.git`；`.github`、`.gitignore` 等按「快照保留范围」保留）
+→ 回写 `upstreams.json` 的新 commit 与时间 → 纳出完整性校验 → 提示重跑测试与提交。
 
 ### 同步后的检查清单
 
 - [ ] 同步脚本末尾的**纳出完整性校验**通过（它会自动检查，不必手动）
 - [ ] 三关测试全绿（Go / Python / 前端构建）
+  - [ ] 特别留意**新增的**错误/失败，逐个归属清楚。已知的两类"假失败"：
+        ① Windows 上 `test_first_token` / `test_issue69_cache_tokens` 的迁移用例
+        在 `tearDown` 清理临时目录时报 `NotADirectoryError`（断言本身通过）；
+        ② 快照被剪掉的文件（`.github/**`、`.gitignore`）被上游测试读到 →
+        FileNotFoundError。第 ② 类**不能忍**：它会在所有平台红、直接打断 CI，
+        而且它护的坑往往我们也会踩 —— 处理方式是**把文件留进快照**，
+        不是去改测试或容忍它。
 - [ ] **在纯净副本上再编译一次**（本地测试通过 ≠ CI 能过）。这一步专门防
       「文件被 .gitignore 静默排除」——本地文件在磁盘上所以不报错，CI 才暴露：
       ```bash
@@ -392,10 +429,29 @@ cd vendor/manager && python3 -m unittest discover -s server/tests -t .
       `docker/overlay/update_runner.py` 两边写出/读取的口径是否仍一致
 - [ ] 更新套件 `CHANGELOG.md`，注明本次捆绑的上游 commit
 
-## 漂移检测
+## 漂移检测（已删除自动 issue 提醒）
 
-`.github/workflows/upstream-check.yml` 每天比对 `upstreams.json` 与上游仓库的
-最新 commit，发现漂移时自动开 issue（同一天重复检测只更新不重复开）。
+曾经有一个每日工作流 `.github/workflows/upstream-check.yml`：比对 `upstreams.json`
+与上游最新 commit，漂移时自动开（或更新）一个标题为「上游有更新可同步」的 issue。
+**已删除**，理由三条：
+
+1. **信息重复**：面板「系统更新」页的第 2 块就是同一件事（manager 快照版本 →
+   上游最新 Release），而且在部署机上直接能看到，不需要被 GitHub 的通知叫去看；
+2. **一半早已失效**：wb2api 仓库已删除，那条比对每天只记一行"查询失败"，
+   永远不会有结果（见「wb2api 上游已删除」）；
+3. 它要求仓库给 `issues: write` 权限 —— 为一条重复信息付这个权限不划算。
+
+**现在怎么判断该不该同步**：面板第 2 块显示「有更新」，就是该同步了。
+想主动核对、不依赖面板：
+
+```bash
+./scripts/sync-upstreams.sh --dry-run --only manager   # 只看差异，不落盘
+```
+
+> 注意它只回答"**锁定值与远端 HEAD 差多少**"，不回答"**该不该同步**" ——
+> 后者始终是人的判断：上游的纯治理类提交（CI 机器人、文档措辞）没有同步价值，
+> 同步一次就是 149 个文件、一次全量重测，不值得为它跑一趟。这类"刻意滞后"
+> 都记在本文件的同步记录与 `CHANGELOG.md` 里。
 
 ## 许可
 

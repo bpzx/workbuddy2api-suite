@@ -2,11 +2,12 @@
 
 # WorkBuddy Manager
 
-**Web console for Tencent CodeBuddy account pools · OpenAI-compatible reverse proxy**
+**Management console for Tencent CodeBuddy account pools · OpenAI-compatible gateway**
 
-A web frontend for [`workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api):
-bulk account onboarding via QR code, automatic daily check-in, API key distribution,
-IP access control, request logs and usage stats — all in one panel.
+A web console for [`workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api):
+bulk QR onboarding, scheduled check-in and token keep-alive, per-group API key
+distribution, IP and model allowlists, request logs and usage analytics; installs and
+updates come from a signed release package.
 
 > The upstream workbuddy2api source **ships inside this project's release package**
 > (MIT). Existing deployments are unaffected — for reinstall/migration, see the
@@ -242,6 +243,27 @@ upstream repo is gone, and its source is now maintained here.
   itself lives there and needs to be upgradeable). Set `WB_SYNC_DEPLOY=0` to keep
   your local `deploy/` untouched.
   See [docs/release-signing.md](docs/release-signing.md)
+
+### Data backup (PostgreSQL off-site vault)
+- **The panel keeps reading and writing its local database**; PostgreSQL is only an
+  off-site copy — it never slows down a request, and the whole service does not have to
+  move onto PostgreSQL
+- Under Settings → Data backup, fill in host / port / database / user / password and
+  **test the connection before saving**
+- **Migrate to PostgreSQL**: mirrors all local data over (reads local data only).
+  The backup covers **the local database** (account notes / keys / request logs / usage /
+  settings…); `.env` and the admin account file are **not** included, so carry those over
+  yourself when restoring on a new machine. Point it at a **dedicated database** — the
+  migration rebuilds tables, so a same-named table already in that database gets replaced
+- **Restore from PostgreSQL**: install the panel on a new machine, enter the same
+  connection details, and pull the data back in one click. A copy of the current local
+  database is saved under `data/` first, so a mistaken restore can be undone
+- **Scheduled backup**: set an interval (minutes) and data is pushed automatically;
+  leave it at 0 to push only when you click the button
+- Restricted to **admin sessions** (a migration copies data out; a restore overwrites the
+  local database)
+- Requires `psycopg` (already listed in `requirements.txt`); if it is missing the page
+  says exactly what to install
 
 ### Changelog
 - Built-in under Settings → Changelog, reading `CHANGELOG.md` from the install directory
@@ -812,6 +834,7 @@ Check Settings → Available models for the live list. Commonly (all with a 1310
 | `GET` | `/api/logs` `/api/stats/*` | session | Logs and usage |
 | `GET/POST/DELETE` | `/api/security/*` | session / admin | IP rules and audit |
 | `GET/POST` | `/api/settings/*` | session / admin | Upstream config, model mapping |
+| `GET/POST` | `/api/settings/pg-sync*` | session (admin) | PostgreSQL off-site backup: config / test / migrate / restore |
 
 Admin API details are available at `/docs` (Swagger UI) when enabled.
 

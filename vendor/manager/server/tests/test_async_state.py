@@ -77,7 +77,11 @@ _PAGES_WITH_LIES = {
         "t('keys.emptyTitle')",           # 「暂无 API 密钥」——在讲凭据的页面上，
                                           # 这句读起来是「我的密钥被删了」，用户会顺手重建
     ],
-    'settings/page.tsx': [
+    # 批次 4 起，设置页的外壳在 `layout.tsx`（7 个 Tab 变成 `/settings/<tab>`
+    # 子路由，而子路由的 page 每次跳转都会重挂载——取数与表单状态必须放在
+    # 不重挂载的 layout 上，见那个文件顶部的说明）。`page.tsx` 现在只是把
+    # `/settings` 重定向到第一个 Tab，所以这条不变式跟着换到了新路径。
+    'settings/layout.tsx': [
         "t('settings.usersEmpty')",       # 「暂无管理用户」——等于说系统里一个账号都没有
     ],
     'accounts/page.tsx': [

@@ -446,6 +446,117 @@ async def _poll_login_background(state: str, realm: str, region: str | None,
     logger.info('后台轮询到时（%ss）：按过期处理', int(_LOGIN_POLL_MAX))
 
 
+# ── 系统自动禁用（disabled）的解除 ────────────────────────────────
+#
+# 上游把「账号不可用」拆成**两位独立的开关**：
+#
+#   · `manual_disabled` —— 运维主动摘的（面板的「临时停用」）；
+#   · `disabled`        —— 系统自动禁的（12153 连败 3 次、或 11140 被封）。
+#
+# 两者由不同的端点解除：`enable` 只清前者，`revive` 只清后者（上游 admin.go
+# 原话：「若账号仍被系统自动禁用，它不会因此回到选号池——那需要 revive」）。
+#
+# 面板此前**只调 disable/enable、从不调 revive**，于是被自动禁用的账号在面板里
+# 没有任何操作能救回来 —— 重新登录只换凭证（上游 upsert 保留 disabled）、签到被
+# `!e.disabled` 挡掉、一次成功又要求先被选中（自锁）、时间也不会让它过期。
+# 用户报的「国际版重新登录后连通性测试通过、账号池就是调不动」就是这条。
+
+
+async def _revive_if_disabled(uid: str, *, base_url: str | None = None,
+                              api_key: str | None = None) -> tuple[bool, str, bool | None]:
+    """账号若被上游**系统自动禁用**，解除它。
+
+    返回 `(是否真的解除了, 说明文案, 之后是否仍被禁用)` —— 第三位是**三态**：
+    `True` 仍禁用 / `False` 确认已回到池子 / `None` 读不到状态（不知道）。
+    为什么不是 bool：把「读不到」当 `False` 会让调用方**无条件报成功**
+    （「已启用」），而那时我们其实什么都没确认 —— 正是这个功能要消灭的误导。
+    调用方必须显式处理 `None`。
+
+    为什么抽成一个函数：有三处要用同一套判断 —— 面板的「启用」按钮、重新登录后的
+    自动恢复、以及将来可能的批量修复。写三遍必然漂移。
+
+    为什么拿 `/status` 而不是 admin 端点的回显做判据：回显里的 `disabled` 字段是
+    较新版本才有的，而 `/status` 一直带着它，且它正是**界面显示的那一份数据** ——
+    用同一个来源判断，才不会出现「接口说好了、界面还红着」。
+    """
+    still = await wb2api.account_disabled(uid, base_url=base_url, api_key=api_key)
+    if still is None:
+        return False, '读不到该账号在上游的状态（上游不可达，或它还没进入账号池）', None
+    if not still:
+        return False, '', False
+    ok, msg, code = await wb2api.revive_account(uid, base_url=base_url, api_key=api_key)
+    if not ok:
+        if code == 'no_route':
+            return False, ('上游未启用管理接口，无法解除系统禁用 —— 请到'
+                           '「设置 → 账号管理接口」开启后重试'), True
+        return False, f'解除系统禁用失败：{msg}', True
+    # 再确认一次：接口回 200 ≠ 真的回到池子（见 revive_account 的说明）。
+    # 这次读不到就如实返回 None（不知道），不要 `bool(None)` 谎报「已清干净」。
+    after = await wb2api.account_disabled(uid, base_url=base_url, api_key=api_key)
+    return True, msg, after
+
+
+# 重新登录后的自动恢复。等待上限比热加载窗口（约 5 秒）宽一档：账号文件刚落盘时
+# 上游可能还没扫到，这时 `/status` 里读不到它（返回 None），要再等一轮。
+_REVIVE_WAIT_SECONDS = 20.0
+_REVIVE_POLL_SECONDS = 2.0
+
+# 在跑的自动恢复任务。**必须持有强引用**：asyncio 只保留对任务的弱引用，
+# `create_task()` 的结果没人接住时，任务可能在执行途中被 GC 掉 —— 症状是
+# 「这次修复有时不生效」，且完全不报错。与上面的 `_login_tasks` 同一套路。
+_revive_tasks: set[asyncio.Task] = set()
+
+
+async def _revive_after_login(uid: str, group: dict) -> None:
+    """登录成功后的后台收尾：等账号入池，若仍被系统禁用就自动解除。
+
+    **为什么重新登录应当自动恢复**：登录在语义上就是「刷新账号状态」—— 用户重新
+    授权了一次，凭证是全新的，上游那句「需重新登录」的禁用理由已经消失，没有道理
+    还让它留在池外。上游自己不做这件事（upsert 只换凭证），所以由面板补上。
+    """
+    base_url = group.get('base_url')
+    api_key = upstreamsvc.forward_api_key(group)
+    deadline = time.monotonic() + _REVIVE_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        still = await wb2api.account_disabled(uid, base_url=base_url, api_key=api_key)
+        if still is None:
+            await asyncio.sleep(_REVIVE_POLL_SECONDS)   # 还没被上游收录，再等等
+            continue
+        if not still:
+            return                                      # 没被禁用，无需处理
+        ok, msg, _ = await wb2api.revive_account(uid, base_url=base_url, api_key=api_key)
+        logger.info('重新登录后自动解除系统禁用 uid=%s：%s%s',
+                    uid[:8], '成功' if ok else '失败', f'（{msg}）' if msg else '')
+        return
+    logger.info('重新登录后等待账号入池超时，跳过自动解除禁用 uid=%s', uid[:8])
+
+
+def _schedule_revive_after_login(uid: str, group: dict) -> None:
+    """调度上面那个后台任务。
+
+    登录**已经成功**（账号文件确实落盘了），所以这里任何失败都不该反过来影响
+    登录结果 —— 拿不到事件循环、排不上任务都静默跳过（测试直呼路由函数、
+    或在没有循环的线程里调用，都是常见情形）。
+
+    整段都包在 try 里，不只包 `get_running_loop`：排任务那一步抛出来同样会
+    顺着 `_save_and_finish` 冒到 `auth_poll`，把一次**已经成功**的登录变成 500。
+    """
+    uid = str(uid or '').strip()
+    if not uid:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+        task = loop.create_task(_revive_after_login(uid, group))
+        # 持有强引用：asyncio 只保留弱引用，没人接住的任务可能在执行途中被 GC 掉，
+        # 症状是「有时不生效」且不报错（与 _login_tasks 同一套路）。
+        if task is not None:
+            _revive_tasks.add(task)
+            task.add_done_callback(_revive_tasks.discard)
+    except Exception:  # noqa: BLE001 —— 排不上就算了，登录本身已经成功
+        logger.debug('调度「登录后自动解除系统禁用」失败（不影响登录结果）',
+                     exc_info=True)
+
+
 def _save_and_finish(result: dict, realm_of_result: str, region_msg: str,
                      state: str, group: dict | None = None) -> dict:
     """落盘 + 收尾（重载上游、丢弃 state）。落盘失败时抛出**可执行**的提示。
@@ -495,6 +606,9 @@ def _save_and_finish(result: dict, realm_of_result: str, region_msg: str,
     # 「登录成功却要等 20-30 秒」。详见 reload.request_reload_or_restart。
     reload.request_reload_or_restart(str(result.get('uid') or ''),
                                      upstream=_reload_target(group))
+    # 重新登录 = 刷新账号状态：若它此前被系统禁用（12153 连败 / 11140 被封），
+    # 这时后台自动解除 —— 否则「重新登录」救不回账号，用户报的就是这条。
+    _schedule_revive_after_login(str(result.get('uid') or ''), group)
 
     return {
         'status': 'success',
@@ -1548,10 +1662,34 @@ async def account_set_disabled(
         if renamed_back and body.get('reload', True) is not False:
             reloaded = reload.request_restart(upstream=_reload_target(group))
         if uid:
+            base_url = group['base_url']
+            api_key = upstreamsvc.forward_api_key(group)
             ok, bit_msg, bit_code = await wb2api.set_manual_disabled(
-                uid, False, base_url=group['base_url'],
-                api_key=upstreamsvc.forward_api_key(group))
+                uid, False, base_url=base_url, api_key=api_key)
             if ok:
+                # 「启用」要清的是**两位**，上面那步只清了 manual_disabled。
+                # 上游的 enable **不管系统自动禁用**（其 admin.go 原话：「若账号仍被
+                # 系统自动禁用（disabled），它不会因此回到选号池——那需要 revive」）。
+                # 面板此前从不调 revive，于是被自动禁用的账号（12153 连败 3 次、
+                # 或 11140 被封）点「启用」看着成功、实际还在池外 —— 这正是用户报的
+                # 「重新登录后连通性测试通过、账号池就是调不动」。
+                revived, revive_msg, still_disabled = await _revive_if_disabled(
+                    uid, base_url=base_url, api_key=api_key)
+                if still_disabled:
+                    # 两位都清了才算真的启用。清不掉就**如实说**，不再像以前那样
+                    # 无条件回一句「已启用」——那正是用户被误导的来源。
+                    return {
+                        'ok': False,
+                        'file': result['file'],
+                        'disabled': True,
+                        'changed': True,
+                        'via': 'manual_disabled',
+                        'reload_triggered': reloaded,
+                        'bit_code': bit_code,
+                        # 文案走 toast（纯文本），别用 markdown 记号
+                        'message': (f'已解除面板停用，但该账号仍被上游系统禁用，'
+                                    f'现在仍不会被调用。{revive_msg}'),
+                    }
                 return {
                     'ok': True,
                     'file': result['file'],
@@ -1559,8 +1697,33 @@ async def account_set_disabled(
                     'changed': True,
                     'via': 'manual_disabled',
                     'reload_triggered': reloaded,
-                    'message': f'已启用该账号（{bit_msg}）'
+                    'revived': revived,
+                    # 两位都清了才算真的回到池子：`still_disabled is None` 表示这一趟
+                    # **没读到**上游状态，那就别把话说满（上面 True 的分支已如实报失败）。
+                    'message': (f'已启用该账号（{bit_msg}'
+                                + ('；并已解除系统禁用' if revived else '')
+                                + ('；但读不到上游状态，未能确认它是否仍被系统禁用'
+                                   if still_disabled is None else '')
+                                + '）')
                                + ('，正在重载上游使其生效' if reloaded else ''),
+                }
+            # 状态位没走通（多半是上游没开管理接口）。这时**必须先看一眼**它是不是
+            # 被系统禁用了：若是，下面的改名回退救不了它 —— 改名只管「文件在不在
+            # 池里」，管不了上游的 disabled 位；而 revive 与 enable 同属那组没注册
+            # 的接口，所以此刻确实无解。如实说清，别跟着兜底文案一起报「已启用」。
+            still = await wb2api.account_disabled(uid, base_url=base_url, api_key=api_key)
+            if still:
+                return {
+                    'ok': False,
+                    'file': result['file'],
+                    'disabled': True,
+                    'changed': renamed_back,
+                    'via': 'rename',
+                    'reload_triggered': reloaded,
+                    'bit_code': bit_code,
+                    'message': ('该账号被上游系统禁用，而解除它需要上游的「账号管理接口」；'
+                                '当前上游没有提供这组接口，面板无法把它放回账号池。'
+                                + _fallback_why(bit_code, False, group)),
                 }
 
     return {

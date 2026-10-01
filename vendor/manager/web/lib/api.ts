@@ -3,22 +3,19 @@ import {BASE_PATH} from './base-path';
 import {t, tp} from './i18n';
 import type {Realm} from './realm-context';
 import type {
-  UpstreamEndpoint,
   Account,
-  CheckinLogPage,
-  CreditExpiry,
-  CreditsMeta,
   AccountsResponse,
   ApiKey,
-  ClaimInfo,
-  CreatedRedPacket,
-  DrawResult,
-  RedPacket,
-  RedPacketDetail,
-  RedPacketKind,
-  RedPacketMode,
   ApiToken,
+  AuditLogPage,
+  Changelog,
+  CheckinLogPage,
+  ClaimInfo,
   CreatedApiToken,
+  CreatedRedPacket,
+  CreditExpiry,
+  CreditsMeta,
+  DrawResult,
   IpAccessLog,
   IpRule,
   KeyExportResult,
@@ -26,24 +23,32 @@ import type {
   KeyImportResult,
   KeyImportStatus,
   Me,
-  AuditLogPage,
   ModelCatalog,
   ModelListResponse,
   Page,
+  PgSyncConfig,
+  PgSyncConfigResponse,
+  PgSyncStatus,
+  PgSyncTestResult,
   PlaygroundModels,
+  RedPacket,
+  RedPacketDetail,
+  RedPacketKind,
+  RedPacketMode,
   ReloadState,
   RequestLog,
-  Changelog,
   SecurityConfig,
   StatsSummary,
   TaskLogResponse,
   TaskRunStatus,
+  UpdateCheck,
+  UpdateStatus,
   UpstreamConfig,
+  UpstreamEndpoint,
   UpstreamStats,
   UpstreamStatus,
   UsageBreakdown,
-  UpdateCheck,
-  UpdateStatus,
+  UsageHourPoint,
   UsagePoint,
   UserItem,
   Versions,
@@ -278,6 +283,20 @@ export const accountApi = {
   taskRunStart: (mode: 'preview' | 'claim' | 'full', target = 'ALL', confirm = false) =>
     post<{ok: boolean; message: string}>('/api/task-run', {mode, target, confirm}),
   taskRunStop: () => post<{ok: boolean; message: string}>('/api/task-run/stop'),
+
+  /* ── 定时领奖配置：**后端有、前端有意不做 UI** ───────────────
+   * 这两个封装是**故意留着但没人调**的，不要当成「漏接线的死代码」删掉，
+   * 也不要顺手补一个入口——这是一次明确的决策，不是疏忽：
+   *
+   *   1. 定时领奖本身只跑幂等认领（不伪造行为），但它是**无人值守**的写操作：
+   *      用户设完就忘了，出了问题（上游限流、账号失效）没有任何人在场看到。
+   *   2. 设置页的「定时任务」区块走的是**上游配置**（`SCHEDULE_FIELDS`），
+   *      而这里走的是**管理端自己的调度器**——两套独立机制。界面只暴露前者时，
+   *      这层困惑不会被放大；**一旦补了入口，用户会看到两个都叫「定时」的东西**。
+   *      所以补入口之前必须先决定这两套是合并还是分层展示。
+   *
+   * 也就是说：入口的问题不是「没做」，是「还差一个前置决策」。详见
+   * `server/services/taskrun.py` 的 `get_schedule()` 与 UI-UX-ROADMAP 的 P1-8 / P1-9。 */
   taskClaimSchedule: () => get<{enabled: boolean; hours: number[]}>('/api/task-claim-schedule'),
   saveTaskClaimSchedule: (enabled: boolean, hours: number[]) =>
     put<{enabled: boolean; hours: number[]}>('/api/task-claim-schedule', {enabled, hours}),
@@ -481,6 +500,12 @@ export const statsApi = {
   /** realm 非空时只统计该版本（界面按版本切换时传） */
   summary: (realm?: Realm) => get<StatsSummary>('/api/stats/summary', {realm}),
   daily: (days = 30, realm?: Realm) => get<UsagePoint[]>('/api/stats/daily', {days, realm}),
+  /**
+   * 某天**按小时**的用量（默认今天）。「今日」趋势图用它 —— 范围只有一天时
+   * 按天聚合只有一根柱子。后端固定返回 24 个桶（补零），前端不必再补。
+   */
+  hourly: (day?: string, realm?: Realm) =>
+    get<UsageHourPoint[]>('/api/stats/hourly', {day, realm}),
   byModel: (days = 30, realm?: Realm) =>
     get<UsageBreakdown[]>('/api/stats/by-model', {days, realm}),
   byKey: (days = 30, realm?: Realm) =>
@@ -553,6 +578,33 @@ export const systemApi = {
   /** 固定上游版本（空串 = 取消固定，恢复跟随分支） */
   setUpstreamRef: (ref: string) =>
     post<{ok: boolean; upstream_ref: string}>('/api/system/upstream-ref', {ref}),
+  /**
+   * 清除上次更新的结果与日志（issue #105）。
+   *
+   * 此前失败记录只能靠「下次发起更新」覆盖：状态文件与 update.log 都留着，
+   * 界面上那条「更新未完成」与日志永远擦不掉，用户得进容器手删文件。
+   * 更新进行中后端会拒绝（409）——那会把「正在更新」看丢。
+   */
+  clearUpdateStatus: () =>
+    del<{ok: boolean; message: string}>('/api/system/update-status'),
   /** 更新日志（解析仓库根目录 CHANGELOG.md，离线可用） */
   changelog: () => get<Changelog>('/api/system/changelog'),
+};
+
+/* ── PostgreSQL 异地备份（设置 → 数据备份）────────────── */
+export const pgSyncApi = {
+  config: () => get<PgSyncConfigResponse>('/api/settings/pg-sync'),
+  /** 保存连接配置；password 传掩码或空串表示沿用已保存的值 */
+  save: (body: Partial<PgSyncConfig>) =>
+    post<{config: PgSyncConfig}>('/api/settings/pg-sync', body),
+  /** 探测连通性。表单里刚填的值优先，没填的字段回落到已保存的配置 */
+  test: (body: Partial<PgSyncConfig>) =>
+    post<PgSyncTestResult>('/api/settings/pg-sync/test', body),
+  /** 把本地数据全量推到 PostgreSQL（只读本地，不会改动它） */
+  exportData: () =>
+    post<{ok: boolean; message: string; status: PgSyncStatus}>('/api/settings/pg-sync/export'),
+  /** 从 PostgreSQL 拉回数据。**会覆盖本地数据**，前端必须先二次确认 */
+  importData: () =>
+    post<{ok: boolean; message: string; status: PgSyncStatus}>('/api/settings/pg-sync/import'),
+  status: () => get<PgSyncStatus>('/api/settings/pg-sync/status'),
 };

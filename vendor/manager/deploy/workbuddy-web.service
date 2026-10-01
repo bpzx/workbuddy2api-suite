@@ -1,5 +1,5 @@
 [Unit]
-Description=WorkBuddy Manager (账号池管理 + OpenAI 兼容反代网关)
+Description=WorkBuddy Manager (CodeBuddy 账号池管理控制台 · OpenAI 兼容网关)
 After=network.target docker.service
 Wants=docker.service
 

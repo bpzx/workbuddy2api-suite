@@ -25,7 +25,12 @@ _ROOT = Path(__file__).resolve().parents[2]
 _WEB = _ROOT / 'web'
 
 _SECURITY = _WEB / 'app' / '(main)' / 'security' / 'page.tsx'
-_SETTINGS = _WEB / 'app' / '(main)' / 'settings' / 'page.tsx'
+# 设置页的外壳在 `layout.tsx`：批次 4 起 7 个 Tab 变成了 `/settings/<tab>`
+# 子路由，而子路由的 page 每次跳转都会重挂载 —— 取数、表单状态与所有危险操作
+# 的确认弹窗都必须留在不重挂载的 layout 上（见那个文件顶部的说明）。
+# `page.tsx` 现在只剩一句重定向，读它会得到「找不到 settingsApi.removeUser」
+# 这种看不出所以然的报错。
+_SETTINGS = _WEB / 'app' / '(main)' / 'settings' / 'layout.tsx'
 _PLAYGROUND = _WEB / 'app' / '(main)' / 'playground' / 'page.tsx'
 _API = _WEB / 'lib' / 'api.ts'
 _MAIN_ERROR = _WEB / 'app' / '(main)' / 'error.tsx'
@@ -81,7 +86,13 @@ def _wired_into_confirm(src: str, pos: int) -> bool:
     fn = _enclosing_function(src, pos)
     if not fn:
         return False
-    return re.search(r'onConfirm=\{[^}]*\b' + re.escape(fn) + r'\s*\(', src) is not None
+    # 两种写法都算「接进了确认弹窗」：`onConfirm={() => fn(item)}` 与
+    # `onConfirm={fn}`（直接交引用）。判据仍收窄在 onConfirm 上——
+    # 裸 `onClick={fn}` 不会因此过关。
+    return (
+        re.search(r'onConfirm=\{[^}]*\b' + re.escape(fn) + r'\s*\(', src) is not None
+        or re.search(r'onConfirm=\{\s*' + re.escape(fn) + r'\s*\}', src) is not None
+    )
 
 
 # 破坏性调用：删掉东西、清空记录、吊销凭据。README 承诺「危险操作一律二次确认」，
@@ -199,6 +210,37 @@ class DangerousActionTest(unittest.TestCase):
         self.assertEqual(
             offenders, [],
             f'有 {len(offenders)} 处破坏性调用没有二次确认：{offenders[:5]}')
+
+
+class ConfirmWiringFormTest(unittest.TestCase):
+    """`onConfirm` 的两种写法都要被认出来，半途而废的写法（裸 onClick）仍要报。
+
+    直接交引用（`onConfirm={fn}`）与包一层（`onConfirm={() => fn(item)}`）都是
+    「接进了确认弹窗」，判据不该只认后者——否则合法的写法会被判成没确认，
+    逼着作者去改代码迁就测试。
+    """
+
+    def test_bare_reference_is_wired(self) -> None:
+        src = ("async function clearResult() {\n"
+               "  await Api.clearUpdateStatus();\n"
+               "}\n"
+               "const A = () => <ConfirmDialog onConfirm={clearResult} />;\n")
+        self.assertTrue(_wired_into_confirm(src, src.index('Api.clearUpdateStatus')))
+
+    def test_call_form_is_wired(self) -> None:
+        src = ("async function removeOne(item) {\n"
+               "  await Api.remove(item);\n"
+               "}\n"
+               "const B = () => <ConfirmDialog onConfirm={() => removeOne(x)} />;\n")
+        self.assertTrue(_wired_into_confirm(src, src.index('Api.remove(')))
+
+    def test_bare_onclick_is_not_enough(self) -> None:
+        src = ("async function clearResult() {\n"
+               "  await Api.clearUpdateStatus();\n"
+               "}\n"
+               "const C = () => <Button onClick={clearResult} />;\n")
+        self.assertFalse(_wired_into_confirm(src, src.index('Api.clearUpdateStatus')),
+                         '裸 onClick 被当成有二次确认了')
 
 
 class NativeDialogTest(unittest.TestCase):

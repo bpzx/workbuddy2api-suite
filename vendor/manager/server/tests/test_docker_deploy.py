@@ -720,7 +720,9 @@ class ContainerReloadHintTest(unittest.TestCase):
         self.assertNotIn('reload_hint', res)
 
     def test_frontend_surfaces_hint(self) -> None:
-        src = (_ROOT / 'web' / 'app' / '(main)' / 'settings' / 'page.tsx'
+        # 设置页的外壳在 `layout.tsx`（批次 4 起 7 个 Tab 变成 `/settings/<tab>`
+        # 子路由，取数与表单状态都留在不重挂载的 layout 上）。
+        src = (_ROOT / 'web' / 'app' / '(main)' / 'settings' / 'layout.tsx'
                ).read_text(encoding='utf-8')
         self.assertIn('reload_hint', src,
                       '设置页没读 reload_hint —— 用户会以为配置已生效')

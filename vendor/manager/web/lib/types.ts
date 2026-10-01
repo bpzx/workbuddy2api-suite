@@ -556,6 +556,26 @@ export interface UsagePoint {
   failed?: number;
 }
 
+/**
+ * 某一天**按小时**的用量（`/api/stats/hourly`）。
+ *
+ * 「今日」趋势图用：范围只有一天时按天聚合只会得到一根柱子（那正是用户反馈的
+ * 「今日还是柱状图，不太对劲」）。与 `UsagePoint` **同源同口径** —— 小时表与
+ * 按天表由同一处写入累计，所以图与页头卡片永远一致，清日志也不会打架。
+ */
+export interface UsageHourPoint {
+  /** `YYYY-MM-DD` */
+  day: string;
+  /** 0-23（本地时区） */
+  hour: number;
+  requests: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  credit: number;
+  /** 该小时的失败请求数（来自请求日志，与 `UsagePoint.failed` 同一口径） */
+  failed: number;
+}
+
 export interface UsageBreakdown {
   name: string;
   requests: number;
@@ -1120,4 +1140,64 @@ export interface CreatedRedPacket {
   created_at: number;
   expires_at: number;
   keys: ApiKey[];
+}
+
+/* ── PostgreSQL 异地备份（设置 → 数据备份）────────────── */
+
+/**
+ * 连接配置。密码在读取时恒为掩码（`********`），保存时原样回传表示「不改动」——
+ * 见 `server/services/pgsync.py` 的 merge_form。
+ */
+export interface PgSyncConfig {
+  /** 是否开启定时自动备份 */
+  enabled: boolean;
+  host: string;
+  port: number;
+  dbname: string;
+  user: string;
+  password: string;
+  /** libpq 的 sslmode；prefer 是默认值，不写进连接串 */
+  sslmode: string;
+  /** 自动备份间隔（分钟）；0 = 只手动 */
+  interval_minutes: number;
+  /** 恢复前是否自动备份本地库 */
+  keep_local_backup: boolean;
+  /** 上次导出完成的时刻（0 = 从未） */
+  last_export_at: number;
+  /** 上次恢复完成的时刻（0 = 从未） */
+  last_import_at: number;
+}
+
+export interface PgSyncLogLine {
+  ts: number;
+  level: string;
+  text: string;
+}
+
+export interface PgSyncStatus {
+  running: boolean;
+  /** 空串 = 从未跑过 */
+  kind: '' | 'export' | 'import';
+  /** null = 未运行过 */
+  ok: boolean | null;
+  step: string;
+  /** 0-100 */
+  percent: number;
+  tables_total: number;
+  tables_done: number;
+  rows: number;
+  logs: PgSyncLogLine[];
+  started_at: number;
+  finished_at: number;
+}
+
+export interface PgSyncConfigResponse {
+  config: PgSyncConfig;
+  status: PgSyncStatus;
+}
+
+export interface PgSyncTestResult {
+  ok: boolean;
+  message: string;
+  server_version?: string;
 }

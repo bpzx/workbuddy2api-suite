@@ -77,10 +77,9 @@ git push --delete origin v0.2.5 && git tag -d v0.2.5
 之间的必然取舍。
 
 > ⚠️ **wb2api 的上游已删除**（`Sliverkiss/workbuddy2api` 现为 404，账号仍在）。
-> 它**没有可同步的目标了**：`--only wb2api` 会 fetch 失败，每日漂移检测对它只记
-> 一行"查询失败"（fail-soft，不开 issue 也不失败）。**该部分自此由本项目自行维护**
-> —— 改它走 `docker/patches/apply.py`（见 [UPSTREAMS.md](UPSTREAMS.md) 的
-> 「构建期补丁登记」，补丁 5~7 就是上游没有、我们自己加的风控加固）。
+> 它**没有可同步的目标了**：`--only wb2api` 会 fetch 失败。**该部分自此由本项目
+> 自行维护** —— 改它走 `docker/patches/apply.py`（见 [UPSTREAMS.md](UPSTREAMS.md)
+> 的「构建期补丁登记」，补丁 5~7 就是上游没有、我们自己加的风控加固）。
 > 本地镜像缓存 `.upstream-cache/wb2api.git` 保留到 `f2ccc7b` 的历史可备查阅。
 
 **manager 仍有上游可同步**，流程如下：
@@ -92,8 +91,9 @@ git pull
 ```
 
 脚本会：fetch 上游 → 打印新旧 commit 之间的提交与 diff → 导出快照到
-`vendor/<name>/`（自动移除上游 `.gitignore`）→ 回写 `upstreams.json` → 校验快照
-是否已全部纳入 git。
+`vendor/<name>/`（保留 `.github` / `.gitignore`，只移除**实测会吞掉快照文件**的
+那一份 `.gitignore`，见 UPSTREAMS.md 的「嵌套 .gitignore 陷阱」）→ 回写
+`upstreams.json` → 校验快照是否已全部纳入 git（不通过会报错退出）。
 
 ### 同步后的核对清单
 
@@ -109,8 +109,11 @@ git pull
 3. **对比配置模板**：`tests/test_config_template.py` 按递归键路径比对模板与上游
    `config.example.json`，上游增删配置项时它变红 —— 那时更新模板。
 
-漂移检测：`.github/workflows/upstream-check.yml` 每日比对 `upstreams.json` 与
-上游 HEAD，发现新提交会开/更新 issue（不需要就直接删掉那个 workflow）。
+**什么时候该同步**：面板「系统更新」页第 2 块显示「有更新」就是信号；想主动核对
+用 `./scripts/sync-upstreams.sh --dry-run --only manager`（只打印差异，不落盘）。
+它只回答"差多少"，**该不该同步由人判断** —— 纯治理类提交不值得为它跑一次全量重测。
+（曾经有一个每日比对并在漂移时开 issue 的工作流，已删除：它与面板信息重复，
+且一半的比对对象 wb2api 已不存在 —— 理由记在 UPSTREAMS.md 的「漂移检测」。）
 
 ---
 

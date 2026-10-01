@@ -56,6 +56,7 @@ import {
   type SortKey,
 } from '@/lib/account-list';
 import {PageHeader} from '@/components/common/layout/PageHeader';
+import {PageSectionTabs} from '@/components/common/layout/PageSectionTabs';
 import {EmptyState} from '@/components/common/layout/EmptyState';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
 import {LoadError} from '@/components/common/states/LoadError';
@@ -835,7 +836,17 @@ export default function AccountsPage() {
     // 测试 / 刷新 Token 这些操作仍然可用、也必须仍然可见——否则用户会以为
     // 「停用把签到也停了」，正好把这条路与改名那条的区别抹掉了。
     const viaBit = a.manual_disabled === true;
+    // 上游**系统自动禁用**（12153 连败 / 11140 被封）：也不在选号池里
+    // （`healthy()` 直接 false），但 `manual_disabled` 是 false。
+    const autoDisabled = a.disabled === true;
+    // `off` = **完全退出账号池**：隐藏签到 / 测试 / 刷新这些操作（对这个号已无意义）。
+    // 注意自动禁用**不算**——它的账号文件仍被上游加载、凭证仍然有效，测试/刷新
+    // 恰恰是排查它为什么坏的手段（用户就是靠「连通性测试通过」确认凭证没问题的）。
     const off = paused || viaBit;
+    // 「停用 / 启用」开关显示哪一面：三种「不在池里」都算。此前漏了自动禁用，
+    // 于是被禁用的号按钮显示成「停用」，点一下反而给**已被禁用**的号再加一层
+    // manual_disabled（越弄越糟），而真正需要的「启用」根本没有入口。
+    const stopped = paused || viaBit || autoDisabled;
     const hasClearableState = a.cooling === true || rateLimitedModels(a).length > 0;
     return (
       <div className="flex justify-end gap-1">
@@ -954,19 +965,21 @@ export default function AccountsPage() {
           size="icon"
           className={
             'h-7 w-7 rounded-md ' +
-            (off ? 'text-emerald-600 hover:text-emerald-600' : 'text-amber-600 hover:text-amber-600')
+            (stopped ? 'text-emerald-600 hover:text-emerald-600' : 'text-amber-600 hover:text-amber-600')
           }
-          title={off ? t('accounts.enableTitle') : t('accounts.disableTitle')}
+          title={stopped ? t('accounts.enableTitle') : t('accounts.disableTitle')}
           disabled={busy}
           onClick={() => run(
             a.file,
-            () => accountApi.setDisabled(a.file, !off, groupId),
+            // 传 `stopped` 的反面：自动禁用的号点这里会走「启用」，后端在启用路径上
+            // 会一并解除系统禁用位（调上游的 revive）——这正是它此前缺的入口。
+            () => accountApi.setDisabled(a.file, !stopped, groupId),
             // 文案如实反映用的是哪种机制：状态位停用后任务照常，改名停用则全停。
-            off ? t('accounts.enabled')
-                : (viaBit ? t('accounts.manualDisabled') : t('accounts.disabled')),
+            stopped ? t('accounts.enabled')
+                    : (viaBit ? t('accounts.manualDisabled') : t('accounts.disabled')),
           )}
         >
-          {off ? <Play className="h-3.5 w-3.5" /> : <Pause className="h-3.5 w-3.5" />}
+          {stopped ? <Play className="h-3.5 w-3.5" /> : <Pause className="h-3.5 w-3.5" />}
         </Button>
         <ConfirmDialog
           title={t('accounts.deleteTitle', {name: a.nickname || a.uid})}
@@ -1081,6 +1094,12 @@ export default function AccountsPage() {
           </>
         }
       />
+
+      {/* 二级导航（批次 4 ②：本页吸收了「任务记录」——账号是「主体」，
+          任务记录是「这个主体干了什么」，用户在两分钟内必然要一起看）。
+          本页没有早返回的整页守卫（取不到账号时只在下面给错误态），
+          所以放在这里一处即可。 */}
+      <PageSectionTabs />
 
       {/* 账号分组（多账号池）：默认分组 = 升级前那套（环境变量 / 上游
           config.json）；「添加分组」只填名称即可（地址默认沿用默认分组的、

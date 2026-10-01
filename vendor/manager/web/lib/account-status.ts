@@ -289,6 +289,11 @@ export function availabilityTitleKey(tier: AvailabilityTier): string | null {
       return 'accounts.badgeDisabledByPanelTitle';
     case 'manualDisabled':
       return 'accounts.badgeManualDisabledTitle';
+    // 系统自动禁用（12153 连败 / 11140 被封）必须给出**下一步**：只说「已禁用」
+    // 用户不知道能做什么。点「启用」现在会连同系统禁用位一起解除（面板会调上游
+    // 的 revive 端点）——这一点以前不成立，所以老提示只能写「重新登录」。
+    case 'disabled':
+      return 'accounts.badgeDisabledTitle';
     default:
       return null;
   }

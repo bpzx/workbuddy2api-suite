@@ -3,8 +3,10 @@
 import {useCallback, useState} from 'react';
 import {Activity, TrendingUp, KeyRound, Cpu, Wrench, RotateCcw, Coins, AlertTriangle, Server} from 'lucide-react';
 import {
+  Area,
   Bar,
   CartesianGrid,
+  Cell,
   ComposedChart,
   Line,
   ResponsiveContainer,
@@ -15,7 +17,20 @@ import {
 import {useHeartbeat} from '@/lib/use-heartbeat';
 import {useAsyncAll} from '@/lib/use-async-data';
 import {statsApi, errText} from '@/lib/api';
-import type {StatsSummary, UpstreamStats, UsageBreakdown, UsagePoint} from '@/lib/types';
+import type {
+  StatsSummary,
+  UpstreamStats,
+  UsageBreakdown,
+  UsagePoint,
+  UsageHourPoint,
+} from '@/lib/types';
+import {
+  chartSpecFor,
+  dailySeries,
+  hourlySeries,
+  todayKeyLocal,
+  type ChartPoint,
+} from '@/lib/usage-chart';
 import {fmtCompact, fmtNumber, fmtCredit} from '@/lib/format';
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {StatCard} from '@/components/common/layout/StatCard';
@@ -60,6 +75,7 @@ const CHART_COLORS = [
  * （这里就有：`chartData` 与两张分解表的 `max` 都从它们派生）。
  */
 const EMPTY_POINTS: UsagePoint[] = [];
+const EMPTY_HOURS: UsageHourPoint[] = [];
 const EMPTY_BREAKDOWN: UsageBreakdown[] = [];
 
 /**
@@ -124,6 +140,10 @@ export default function StatsPage() {
     {
       summary: () => statsApi.summary(realm),
       daily: () => statsApi.daily(d, realm),
+      // 「今日」的图按小时画（见 lib/usage-chart.ts 的说明）：只有这个范围需要
+      // 小时数据，其它范围直接给空数组，省一次请求。
+      hourly: () => (days === '1' ? statsApi.hourly(undefined, realm)
+                                  : Promise.resolve([] as UsageHourPoint[])),
       byModel: () => statsApi.byModel(d, realm),
       byKey: () => statsApi.byKey(d, realm),
     },
@@ -176,13 +196,16 @@ export default function StatsPage() {
   // 用量随调用持续累计，心跳刷新让页面保持接近实时
   useHeartbeat(retry, 60000);
 
-  const chartData = daily.map((d) => ({
-    day: d.day.slice(5),
-    tokens: d.prompt_tokens + d.completion_tokens,
-    requests: d.requests,
-    // 失败曲线来自另一份数据源（请求日志），与用量汇总不构成堆叠关系
-    failed: d.failed ?? 0,
-  }));
+  const spec = chartSpecFor(d);
+  const hourly: UsageHourPoint[] = values.hourly ?? EMPTY_HOURS;
+  /**
+   * 趋势图的点。**粒度跟着范围走**（粒度/形态的判据在 lib/usage-chart.ts）：
+   *  · 今日 → 24 个小时桶（后端已补零；这里只做标签与「当前小时」标记）；
+   *  · 多日 → 按天并补齐到窗口长度（缺的那天不再是「凭空消失」而是画成 0）。
+   */
+  const chartData: ChartPoint[] = spec.granularity === 'hour'
+    ? hourlySeries(hourly, new Date().getHours())
+    : dailySeries(daily, d, todayKeyLocal());
 
   /** 今日失败总数（4xx + 5xx）。单独来自请求日志——用量汇总只含成功请求。 */
   const todayFailed =
@@ -379,11 +402,10 @@ export default function StatsPage() {
       <section className="rounded-[20px] bg-muted p-4">
         <div className="mb-3 flex items-center justify-between">
           <div className="text-sm font-medium">{t('stats.tokenTrend')}</div>
-          {/* 窗口只有一天时「按天聚合」是废话（就一根柱子），换成「当日汇总」；
-              多天窗口保持原文案。两者都随选择器走，不会出现「选择器是今日、
-              副标题还写着按天聚合」的错配。 */}
+          {/* 副标题必须与**实际粒度**一致：今日是按小时画的，写「按天聚合」就是
+              在骗人（这也是最早那版的表现：选择器说今日、图是一根柱子）。 */}
           <div className="text-[11px] text-muted-foreground">
-            {days === '1' ? t('stats.dailyAggToday') : t('stats.dailyAgg')}
+            {spec.granularity === 'hour' ? t('stats.hourlyAgg') : t('stats.dailyAgg')}
           </div>
         </div>
         <div className="h-[260px] w-full">
@@ -393,7 +415,15 @@ export default function StatsPage() {
                   失败曲线（Line）根本不会被渲染 —— 实测踩过，图上一条线都没有。 */}
               <ComposedChart data={chartData} margin={{top: 4, right: 8, bottom: 0, left: -8}} barCategoryGap="20%">
                 <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
-                <XAxis dataKey="day" tickLine={false} axisLine={false} fontSize={11} stroke="var(--muted-foreground)" />
+                <XAxis
+                  dataKey="label"
+                  tickLine={false}
+                  axisLine={false}
+                  fontSize={11}
+                  stroke="var(--muted-foreground)"
+                  /* 24 个小时（或 90 天）标签全画出来会糊成一片，按 spec 抽稀。 */
+                  interval={Math.max(0, spec.tickEvery - 1)}
+                />
                 <YAxis tickLine={false} axisLine={false} fontSize={11} stroke="var(--muted-foreground)" tickFormatter={(v) => fmtCompact(Number(v))} />
                 <Tooltip
                   cursor={{fill: 'var(--accent)'}}
@@ -412,14 +442,37 @@ export default function StatsPage() {
                     return [fmtNumber(Number(value)), t('metric.requests')];
                   }}
                 />
-                <Bar
-                  dataKey="tokens"
-                  name="tokens"
-                  fill="var(--chart-1)"
-                  radius={[4, 4, 0, 0]}
-                  /* 限制柱宽：只有一两天数据时，柱子不会被拉伸占满整个图表 */
-                  maxBarSize={48}
-                />
+                {spec.shape === 'bar' ? (
+                  <Bar
+                    dataKey="tokens"
+                    name="tokens"
+                    fill="var(--chart-1)"
+                    radius={[4, 4, 0, 0]}
+                    /* 限制柱宽：只有一两天数据时，柱子不会被拉伸占满整个图表 */
+                    maxBarSize={48}
+                  >
+                    {/* 当前小时单独上色：一眼看出「现在走到哪一格」，
+                        右边的空档也就自然读成「今天还没到那些时候」。 */}
+                    {chartData.map((p) => (
+                      <Cell
+                        key={p.full}
+                        fill={p.isNow ? 'var(--chart-2)' : 'var(--chart-1)'}
+                      />
+                    ))}
+                  </Bar>
+                ) : (
+                  /* 30 / 90 天用面积：柱子细得看不清起伏，而面积图的形状对
+                     「总量趋势」更直观（尖峰一眼可见）。 */
+                  <Area
+                    type="monotone"
+                    dataKey="tokens"
+                    name="tokens"
+                    stroke="var(--chart-1)"
+                    fill="var(--chart-1)"
+                    fillOpacity={0.18}
+                    strokeWidth={2}
+                  />
+                )}
                 {/* 失败数用一条线叠在同一张图上：它与 token 柱不同量级，做成柱子
                     会把柱形压扁。线只作「那天出过事」的信号，具体数值看悬停。
                     没有失败时贴着 0，不干扰读数。 */}

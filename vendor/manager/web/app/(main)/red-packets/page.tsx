@@ -11,6 +11,7 @@ import type {
 } from '@/lib/types';
 import {fmtDateTime, fmtNumber} from '@/lib/format';
 import {PageHeader} from '@/components/common/layout/PageHeader';
+import {PageSectionTabs} from '@/components/common/layout/PageSectionTabs';
 import {EmptyState} from '@/components/common/layout/EmptyState';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
 import {LoadError} from '@/components/common/states/LoadError';
@@ -195,18 +196,24 @@ export default function RedPacketsPage() {
   }
 
   const header = (
-    <PageHeader
-      title={t('redPacket.title')}
-      description={t('redPacket.desc')}
-      actions={
-        isAdmin ? (
-          <Button className="rounded-full" onClick={() => setFormOpen((v) => !v)}>
-            <Plus className="mr-1.5 h-4 w-4" />
-            {t('redPacket.new')}
-          </Button>
-        ) : null
-      }
-    />
+    <>
+      <PageHeader
+        title={t('redPacket.title')}
+        description={t('redPacket.desc')}
+        actions={
+          isAdmin ? (
+            <Button className="rounded-full" onClick={() => setFormOpen((v) => !v)}>
+              <Plus className="mr-1.5 h-4 w-4" />
+              {t('redPacket.new')}
+            </Button>
+          ) : null
+        }
+      />
+      {/* 二级导航（批次 4 ②：本页已并入「密钥」——红包产出的就是密钥）。
+          放进 `header` 而不是两个 return 分支里各写一遍：下面的首屏守卫是
+          **早返回**，漏一处就会出现「取不到数据时 Tab 不见了」。 */}
+      <PageSectionTabs />
+    </>
   );
 
   /**

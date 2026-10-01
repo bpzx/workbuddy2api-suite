@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 
 import {PageHeader} from '@/components/common/layout/PageHeader';
+import {PageSectionTabs} from '@/components/common/layout/PageSectionTabs';
 import {LoadError} from '@/components/common/states/LoadError';
 import {Button} from '@/components/ui/button';
 import {Badge} from '@/components/ui/badge';
@@ -244,36 +245,42 @@ export default function PlaygroundPage() {
   const currentModel = useMemo(() => models.find((m) => m.id === model), [models, model]);
 
   const header = (
-    <PageHeader
-      title={t('playground.title')}
-      description={t('playground.description', {realm: realmName})}
-      actions={
-        <>
-          <Button
-            variant="outline"
-            size="sm"
-            className="rounded-full"
-            onClick={() => {
-              reloadModels();
-              notify.info(t('playground.modelsRefreshed'));
-            }}
-          >
-            <RefreshCw />
-            {t('playground.refreshModels')}
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            className="rounded-full"
-            disabled={streaming || msgs.length === 0}
-            onClick={clear}
-          >
-            <Eraser />
-            {t('playground.clearChat')}
-          </Button>
-        </>
-      }
-    />
+    <>
+      <PageHeader
+        title={t('playground.title')}
+        description={t('playground.description', {realm: realmName})}
+        actions={
+          <>
+            <Button
+              variant="outline"
+              size="sm"
+              className="rounded-full"
+              onClick={() => {
+                reloadModels();
+                notify.info(t('playground.modelsRefreshed'));
+              }}
+            >
+              <RefreshCw />
+              {t('playground.refreshModels')}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="rounded-full"
+              disabled={streaming || msgs.length === 0}
+              onClick={clear}
+            >
+              <Eraser />
+              {t('playground.clearChat')}
+            </Button>
+          </>
+        }
+      />
+      {/* 二级导航（批次 4 ②：本页已并入「模型」）。放进 `header` 而不是两个
+          return 分支里各写一遍：下面的首屏守卫是**早返回**，漏一处就会出现
+          「模型列表没取到时 Tab 不见了」。 */}
+      <PageSectionTabs />
+    </>
   );
 
   /**
