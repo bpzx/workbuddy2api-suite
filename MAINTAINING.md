@@ -163,7 +163,7 @@ cd vendor/manager/web && npm ci && npm run build:export
 ```
 
 **本项目自己的测试**（版本语义、更新服务鉴权、状态契约、构建期改动预检、
-配置模板与增量补齐等）：
+配置模板与启动时的键集同步等）：
 
 ```bash
 python -m unittest discover -s tests -t tests
