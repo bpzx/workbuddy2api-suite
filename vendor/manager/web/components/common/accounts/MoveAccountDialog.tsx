@@ -92,28 +92,32 @@ export function MoveAccountDialog({
           <DialogTitle>{t('accounts.moveTitle', {name: accountName})}</DialogTitle>
           <DialogDescription>{t('accounts.moveDesc')}</DialogDescription>
         </DialogHeader>
-        <DialogBody className="space-y-3">
-          <div className="space-y-1.5">
-            <Label className="text-[11px] text-muted-foreground">
-              {t('accounts.moveTargetLabel')}
-            </Label>
-            <Select value={target} onValueChange={setTarget}>
-              <SelectTrigger>
-                <SelectValue placeholder={t('accounts.movePick')} />
-              </SelectTrigger>
-              <SelectContent>
-                {candidates.map((g) => {
-                  const canMove = !!g.auth_dir;
-                  const value = g.is_default ? DEFAULT_VALUE : String(g.id);
-                  return (
-                    <SelectItem key={value} value={value} disabled={!canMove}>
-                      {(g.is_default ? t('accounts.groupDefault') : g.name)
-                        + (canMove ? '' : t('accounts.moveNoDirSuffix'))}
-                    </SelectItem>
-                  );
-                })}
-              </SelectContent>
-            </Select>
+        {/* 布局类写在 Body **里面**这层：DialogBody 的 className 落在 ScrollArea
+            的 Root 上，写在那儿内层字段拿不到（见 DialogBody 的注释）。 */}
+        <DialogBody className="max-h-[min(640px,calc(100dvh-12rem))]">
+          <div className="px-6 pb-2">
+            <div className="space-y-1.5">
+              <Label className="text-[11px] text-muted-foreground">
+                {t('accounts.moveTargetLabel')}
+              </Label>
+              <Select value={target} onValueChange={setTarget}>
+                <SelectTrigger>
+                  <SelectValue placeholder={t('accounts.movePick')} />
+                </SelectTrigger>
+                <SelectContent>
+                  {candidates.map((g) => {
+                    const canMove = !!g.auth_dir;
+                    const value = g.is_default ? DEFAULT_VALUE : String(g.id);
+                    return (
+                      <SelectItem key={value} value={value} disabled={!canMove}>
+                        {(g.is_default ? t('accounts.groupDefault') : g.name)
+                          + (canMove ? '' : t('accounts.moveNoDirSuffix'))}
+                      </SelectItem>
+                    );
+                  })}
+                </SelectContent>
+              </Select>
+            </div>
           </div>
         </DialogBody>
         <DialogFooter>

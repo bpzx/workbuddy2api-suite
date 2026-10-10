@@ -167,92 +167,97 @@ export function UpstreamFormDialog({
           <DialogTitle>{editing ? t('upstreams.editTitle') : t('upstreams.addTitle')}</DialogTitle>
           {!simple && <DialogDescription>{t('upstreams.formGroupHint')}</DialogDescription>}
         </DialogHeader>
-        <DialogBody className="space-y-3">
-          <div className="space-y-1.5">
-            <Label className="text-[11px] text-muted-foreground">{t('upstreams.fieldName')}</Label>
-            <Input
-              value={form.name}
-              onChange={(e) => {
-                const name = e.target.value;
-                setForm((f) => ({
-                  ...f,
-                  name,
-                  // 名称变了、目录没被手动改过：建议路径跟着刷新
-                  auth_dir: dirTouched ? f.auth_dir : suggestAuthDir(defaultDir, name),
-                }));
-              }}
-              placeholder={t('upstreams.fieldNamePlaceholder')}
-              maxLength={64}
-            />
+        {/* 布局类（space-y-4 / px-6）必须写在 Body **里面**这层：DialogBody 的
+            className 落在 ScrollArea 的 Root 上，写在那儿字段之间会没有间距
+            （见 DialogBody 的注释）。 */}
+        <DialogBody className="max-h-[min(640px,calc(100dvh-12rem))]">
+          <div className="space-y-4 px-6 pb-2">
+            <div className="space-y-1.5">
+              <Label className="text-[11px] text-muted-foreground">{t('upstreams.fieldName')}</Label>
+              <Input
+                value={form.name}
+                onChange={(e) => {
+                  const name = e.target.value;
+                  setForm((f) => ({
+                    ...f,
+                    name,
+                    // 名称变了、目录没被手动改过：建议路径跟着刷新
+                    auth_dir: dirTouched ? f.auth_dir : suggestAuthDir(defaultDir, name),
+                  }));
+                }}
+                placeholder={t('upstreams.fieldNamePlaceholder')}
+                maxLength={64}
+              />
+            </div>
+            {!simple && (
+              <>
+                <div className="space-y-1.5">
+                  <Label className="text-[11px] text-muted-foreground">{t('upstreams.fieldUrl')}</Label>
+                  <Input
+                    value={form.base_url}
+                    onChange={(e) => setForm({...form, base_url: e.target.value})}
+                    placeholder="http://127.0.0.1:7863"
+                    maxLength={500}
+                  />
+                  <p className="text-[10px] leading-4 text-muted-foreground">
+                    {t('upstreams.fieldUrlHint')}
+                  </p>
+                </div>
+                <div className="space-y-1.5">
+                  <Label className="text-[11px] text-muted-foreground">{t('upstreams.fieldKey')}</Label>
+                  <Input
+                    value={form.api_key}
+                    onChange={(e) => setForm({...form, api_key: e.target.value})}
+                    // 编辑时不回填明文（接口只回脱敏值），当前值显示在占位里，「留空 = 不修改」
+                    placeholder={editing && editing.has_key
+                      ? t('upstreams.fieldKeyKeep', {masked: editing.api_key_masked})
+                      : t('upstreams.fieldKeyPlaceholder')}
+                    maxLength={500}
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <Label className="text-[11px] text-muted-foreground">{t('upstreams.fieldDir')}</Label>
+                  <Input
+                    value={form.auth_dir}
+                    onChange={(e) => {
+                      setForm({...form, auth_dir: e.target.value});
+                      setDirTouched(true);
+                    }}
+                    placeholder={t('upstreams.fieldDirPlaceholder')}
+                    maxLength={500}
+                  />
+                  <p className="text-[10px] leading-4 text-muted-foreground">
+                    {t('upstreams.fieldDirHint')}
+                  </p>
+                </div>
+                <div className="space-y-1.5">
+                  <Label className="text-[11px] text-muted-foreground">{t('upstreams.fieldContainer')}</Label>
+                  <Input
+                    value={form.container}
+                    onChange={(e) => setForm({...form, container: e.target.value})}
+                    placeholder={t('upstreams.fieldContainerPlaceholder')}
+                    maxLength={64}
+                  />
+                  <p className="text-[10px] leading-4 text-muted-foreground">
+                    {t('upstreams.fieldContainerHint')}
+                  </p>
+                </div>
+                <div className="space-y-1.5">
+                  <Label className="text-[11px] text-muted-foreground">{t('upstreams.fieldNote')}</Label>
+                  <Textarea
+                    value={form.note}
+                    onChange={(e) => setForm({...form, note: e.target.value})}
+                    maxLength={200}
+                    rows={2}
+                  />
+                </div>
+                <div className="flex items-center justify-between">
+                  <Label className="text-[11px] text-muted-foreground">{t('upstreams.fieldEnabled')}</Label>
+                  <Switch checked={form.enabled} onCheckedChange={(v) => setForm({...form, enabled: v})} />
+                </div>
+              </>
+            )}
           </div>
-          {!simple && (
-            <>
-          <div className="space-y-1.5">
-            <Label className="text-[11px] text-muted-foreground">{t('upstreams.fieldUrl')}</Label>
-            <Input
-              value={form.base_url}
-              onChange={(e) => setForm({...form, base_url: e.target.value})}
-              placeholder="http://127.0.0.1:7863"
-              maxLength={500}
-            />
-            <p className="text-[10px] leading-4 text-muted-foreground">
-              {t('upstreams.fieldUrlHint')}
-            </p>
-          </div>
-          <div className="space-y-1.5">
-            <Label className="text-[11px] text-muted-foreground">{t('upstreams.fieldKey')}</Label>
-            <Input
-              value={form.api_key}
-              onChange={(e) => setForm({...form, api_key: e.target.value})}
-              // 编辑时不回填明文（接口只回脱敏值），当前值显示在占位里，「留空 = 不修改」
-              placeholder={editing && editing.has_key
-                ? t('upstreams.fieldKeyKeep', {masked: editing.api_key_masked})
-                : t('upstreams.fieldKeyPlaceholder')}
-              maxLength={500}
-            />
-          </div>
-          <div className="space-y-1.5">
-            <Label className="text-[11px] text-muted-foreground">{t('upstreams.fieldDir')}</Label>
-            <Input
-              value={form.auth_dir}
-              onChange={(e) => {
-                setForm({...form, auth_dir: e.target.value});
-                setDirTouched(true);
-              }}
-              placeholder={t('upstreams.fieldDirPlaceholder')}
-              maxLength={500}
-            />
-            <p className="text-[10px] leading-4 text-muted-foreground">
-              {t('upstreams.fieldDirHint')}
-            </p>
-          </div>
-          <div className="space-y-1.5">
-            <Label className="text-[11px] text-muted-foreground">{t('upstreams.fieldContainer')}</Label>
-            <Input
-              value={form.container}
-              onChange={(e) => setForm({...form, container: e.target.value})}
-              placeholder={t('upstreams.fieldContainerPlaceholder')}
-              maxLength={64}
-            />
-            <p className="text-[10px] leading-4 text-muted-foreground">
-              {t('upstreams.fieldContainerHint')}
-            </p>
-          </div>
-          <div className="space-y-1.5">
-            <Label className="text-[11px] text-muted-foreground">{t('upstreams.fieldNote')}</Label>
-            <Textarea
-              value={form.note}
-              onChange={(e) => setForm({...form, note: e.target.value})}
-              maxLength={200}
-              rows={2}
-            />
-          </div>
-          <div className="flex items-center justify-between">
-            <Label className="text-[11px] text-muted-foreground">{t('upstreams.fieldEnabled')}</Label>
-            <Switch checked={form.enabled} onCheckedChange={(v) => setForm({...form, enabled: v})} />
-          </div>
-            </>
-          )}
         </DialogBody>
         <DialogFooter>
           <Button variant="outline" className="rounded-full" onClick={() => onOpenChange(false)}>

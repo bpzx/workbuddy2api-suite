@@ -5,14 +5,18 @@
 """
 from __future__ import annotations
 
+import re
 import sqlite3
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from server import config
 from server.services import pgsync
 
 from .test_pgsync import _Case  # 复用同一套临时 HOME/DB 装置
+
+_ROOT = Path(__file__).resolve().parents[2]
 
 
 class _StubPg:
@@ -209,6 +213,62 @@ class ConnectTimeoutTest(_Case):
         self.assertTrue(calls, '导出没有调用 psycopg.connect')
         self.assertEqual(calls[-1].get('connect_timeout'), pgsync.CONNECT_TIMEOUT,
                          f'导出连接没带超时：{calls[-1]}')
+
+class PgSyncPanelPollingTest(unittest.TestCase):
+    """issue #122：备份页的轮询不得覆盖正在填的表单。
+
+    报障：填 PG 同步配置时输入框每约 15 秒被服务端旧值打回去 —— 空闲轮询走的是
+    **完整重载**，顺带把表单 state 整体重置。这里钉住两件事，都是「只有真人填一遍
+    才会发现」的类型：
+
+      ① 轮询（空闲 15 秒 / 运行中 1.5 秒）只拉进度，一次都不碰表单；
+      ② 服务端配置回填表单时必须过脏检查（有未保存输入就不覆盖），保存成功后把
+         脏标记清掉。
+
+    行为验收在 `dev/verify_pgsync_form_ui.py`（真浏览器里打字等两个轮询周期），
+    这里钉结构：改回「空闲也全量重载」会立刻被拦下。
+    """
+
+    PANEL = (_ROOT / 'web' / 'components' / 'common' / 'settings'
+             / 'PgSyncPanel.tsx')
+
+    def setUp(self) -> None:
+        self.src = self.PANEL.read_text(encoding='utf-8')
+
+    def test_轮询回调只拉进度(self) -> None:
+        block = re.search(r'window\.setInterval\(\(\) => \{([\s\S]*?)\}, interval\)', self.src)
+        self.assertIsNotNone(block, '找不到轮询回调')
+        body = block.group(1)
+        self.assertIn('pollStatus', body, '轮询居然不拉进度了')
+        self.assertNotIn('load(', body,
+                         '轮询回调里又出现了完整重载 —— 那就是 issue #122 复发：'
+                         '空闲时用服务端配置整体覆盖表单')
+
+    def test_回填表单要过脏检查(self) -> None:
+        loader = re.search(
+            r'const load = useCallback\(async \(\) => \{([\s\S]*?)\}, \[\]\)', self.src)
+        self.assertIsNotNone(loader, '找不到配置加载函数')
+        body = loader.group(1)
+        self.assertIn('dirtyRef.current', body,
+                      '回填表单没有脏检查：用户没保存的输入会被旧值打回去')
+        self.assertIn('setForm((f) =>', body,
+                      '回填要走函数式更新（基于当前表单判断，而不是闭包里的旧值）')
+
+    def test_脏标记的置位与清零(self) -> None:
+        self.assertRegex(self.src, r'const patch = \(next[\s\S]{0,160}?dirtyRef\.current = true',
+                         'patch() 没置脏标记 —— 之后任何回填都会覆盖用户输入')
+        self.assertRegex(self.src, r'setForm\(r\.config\);\n\s*dirtyRef\.current = false',
+                         '保存成功后没清脏标记 —— 之后服务端值再也回填不进表单')
+
+    def test_守卫不是空转(self) -> None:
+        """把轮询回调换回修前的写法，第一条必须能看出来。"""
+        broken = self.src.replace(
+            '      void pollStatus();\n',
+            '      if (running) { void pollStatus(); } else { void load(); }\n', 1)
+        self.assertNotEqual(broken, self.src, '替换没生效，这条反证没有意义')
+        block = re.search(r'window\.setInterval\(\(\) => \{([\s\S]*?)\}, interval\)', broken)
+        self.assertIn('load(', block.group(1),
+                      '换回修前的写法后守卫仍看不出来 —— 这条守卫是空转的')
 
 
 if __name__ == '__main__':

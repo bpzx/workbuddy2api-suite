@@ -13,12 +13,14 @@ import {
   AlertDialogTrigger,
 } from '@/components/ui/alert-dialog';
 import {useT} from '@/lib/i18n/provider';
+import {cn} from '@/lib/utils';
 
 export function ConfirmDialog({
   trigger,
   title,
   description,
   content,
+  contentClassName,
   confirmText,
   destructive = false,
   confirmDisabled = false,
@@ -37,6 +39,8 @@ export function ConfirmDialog({
    * 组件，下次再要别的输入就得再加一组 props。
    */
   content?: ReactNode;
+  /** 覆盖弹窗内容区域样式，供特定确认场景匹配对应业务弹窗尺寸。 */
+  contentClassName?: string;
   confirmText?: string;
   destructive?: boolean;
   /** 条件不满足时锁住确认键（例如密码不足 8 位），比点完再报错少一次往返 */
@@ -61,12 +65,12 @@ export function ConfirmDialog({
       }}
     >
       <AlertDialogTrigger asChild>{trigger}</AlertDialogTrigger>
-      <AlertDialogContent>
+      <AlertDialogContent className={cn(contentClassName)}>
         <AlertDialogHeader>
           <AlertDialogTitle>{title}</AlertDialogTitle>
           {description && <AlertDialogDescription>{description}</AlertDialogDescription>}
         </AlertDialogHeader>
-        {content}
+        {content && <div className="px-6">{content}</div>}
         <AlertDialogFooter>
           <AlertDialogCancel disabled={busy}>{t('common.cancel')}</AlertDialogCancel>
           <AlertDialogAction

@@ -2,7 +2,8 @@
 
 import {useEffect, useMemo, useState} from 'react';
 import type {ReactNode} from 'react';
-import {Users, CircleCheck, TriangleAlert, Activity, Server, Coins} from 'lucide-react';
+import Link from 'next/link';
+import {Users, CircleCheck, TriangleAlert, Activity, Server, Coins, ChevronRight} from 'lucide-react';
 import {
   Area,
   AreaChart,
@@ -54,6 +55,7 @@ import {EmptyState} from '@/components/common/layout/EmptyState';
 import {LoadError} from '@/components/common/states/LoadError';
 import {SkeletonBar} from '@/components/common/states/SkeletonBar';
 import {Badge} from '@/components/ui/badge';
+import {Button} from '@/components/ui/button';
 import {useT} from '@/lib/i18n/provider';
 
 /**
@@ -634,6 +636,14 @@ export default function DashboardPage() {
                 {availability[tier]}
               </span>
             ))}
+          {scoped.length > 9 && (
+            <Button asChild variant="ghost" size="sm" className="ml-auto rounded-full">
+              <Link href="/accounts">
+                {t('dashboard.viewAllAccounts')}
+                <ChevronRight />
+              </Link>
+            </Button>
+          )}
         </div>
         {snapshot.length ? (
           <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">

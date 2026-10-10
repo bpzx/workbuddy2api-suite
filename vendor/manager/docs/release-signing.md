@@ -65,10 +65,10 @@ cat ~/.ssh/workbuddy-release.pub
 
 ---
 
-## 二、每次发版（三步）
+## 二、每次发版（四步）
 
 ```bash
-# 1) 推送 tag，让 CI 构建并创建 Release（CI 不签名）
+# 1) 推送 tag，让 CI 构建并创建**草稿** Release（CI 不签名、也不发布）
 git tag v1.0.24 && git push origin v1.0.24
 
 # 2) 等 CI 跑完后，在本机下载**最终产物**并签名
@@ -78,10 +78,18 @@ ssh-keygen -Y sign -f ~/.ssh/workbuddy-release -n file workbuddy-manager-v1.0.24
 
 # 3) 上传签名
 gh release upload v1.0.24 workbuddy-manager-v1.0.24.tar.gz.sig
+
+# 4) 重新下载核对（sha256 + 验签 + 解开看版本号）之后，发布草稿
+gh release edit v1.0.24 --draft=false
 ```
 
 **顺序很重要**：必须先有 CI 产出的 tar.gz，再对它签名。若签名后才重新打包，
 字节流一变签名就失效，用户侧会全部拒绝安装。
+
+**草稿与发布**：CI 建的 Release 是草稿，`releases/latest` 会跳过它 —— 于是
+「构建完、还没签名」的这段时间用户看不到这个版本，不会出现「点了更新却被
+拒绝：没有可用的签名文件」（issue #127/#129）。签名核对无误后再执行上面第 4
+步；忘了发布，用户就永远看不到这个版本。
 
 工作流已针对这点加了保护：**一旦 Release 上出现 `.sig`，就不再覆盖 tar.gz**。
 

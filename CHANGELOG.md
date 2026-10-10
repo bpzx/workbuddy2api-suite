@@ -19,6 +19,50 @@
 
 ## [未发布]
 
+### 同步上游：manager v1.0.76 → v1.0.80（跨 4 个发版）
+
+`8c92da9` → `86f2dc1`（126 文件 / +5317 −504）。wb2api 侧无可同步目标。
+
+用户可见的主要变化（全部来自上游）：
+
+- **按账号绑定命名出口代理线路**（issue #119）：线路在面板「设置 → 出口线路」
+  维护（存于共享 `config.json` 的 `proxies` 段），账号逐个改绑；新增环境变量
+  `WB_DEFAULT_ACCOUNT_PROXY` 可让扫码登录的**新账号**默认绑定某条线路
+  （compose 与 `.env.example` 已透传，留空 = 不自动绑定）。
+- **账号导入/导出**：面板批量导出为 JSON、再导入恢复（审计留痕、禁止缓存、
+  导出前二次确认）。依赖面：`server/requirements.txt` 新增 `python-multipart`
+  （随 vendor 清单自动装入镜像，无需改 Dockerfile）。
+- **一键更新 GitHub API 限流回退**（修 403 中断）：`_gh_get` 认 `WB_GITHUB_TOKEN`
+  / `GITHUB_TOKEN`（本套件 compose 早已透传，开箱生效）；「签名未就绪」的版本
+  用 5 分钟短缓存，签名上传后界面及时恢复。
+- **出站客户端池化复用**（issue #144）：同一事件循环 + 同组超时/代理只建一次
+  httpx 客户端（Windows 上每次新建 ~1 秒，正是面板切换页面的耗时）；借出的
+  客户端退出时只归还、不被 `aclose()` 真关（并发隐患自查）。
+- 其他：Redis「测试连接」按 RESP 真 PING（issue #125）；昵称带 emoji 不再让
+  成长任务全挂（Windows，issue #147）；失败提示不再断在冒号上（issue #132）；
+  仪表盘健康快照超 9 个账号提供「查看全部账号」入口；账号来源回填支持原生部署、
+  时长格式收紧。
+
+**集成层核对**：
+
+- **补丁 1 锚点第四次失效，且这次是结构性重构** —— 上游把 `http_client()`
+  重构成**客户端池**，构造收口到 `_build_client()`。补丁随之从 `http_client()`
+  移到 `_build_client()`：事件循环内外的两条路径（池未命中 / 循环外即用即弃）
+  都经过它，还顺带覆盖上游同轮新增的**按账号代理** —— 只要配了代理
+  （`WB_HTTP_PROXY` 或账号绑定线路），内网（`wb2api:7863`、`dockerproxy`）
+  就直连。预检测试在同步后立刻变红、改锚点后 13 项全绿。
+- `UpdatePanel.tsx`（覆写目标）上游新增「签名未就绪」提示 + 按钮禁用
+  （`sig_ready`，issue #127/#129）。**没有搬**，判定依据仍是"对应物不存在"：
+  我们面板的 manager 区块只报告、无更新按钮。已登记进 UPSTREAMS.md「覆写登记」。
+- `server/services/updater.py` 新增 `sig_ready` 字段属**读取端**（上游自己的
+  check-update 端点），**状态 JSON 口径未变**，`docker/stub/update.py` 无需调整。
+- `config.example.json` 未变动；**新增环境变量**仅 `WB_DEFAULT_ACCOUNT_PROXY`。
+
+**验证**：上游 Python 全套 **2091** 项（4 个错误仍是那批 Windows 专有的迁移用例
+`tearDown` 清理临时目录报 `NotADirectoryError`，断言本身通过，与上一轮完全同型）；
+前端静态导出编译通过；本项目 **131** 项 + 预检 **13** 项全绿（本项目测试按
+MAINTAINING.md 的完整跑法在**打过补丁的副本**上执行，`apply.py` 22 处改动全部落位）。
+
 ### 变更：启动时同步 config.json 的**键集**（不再只补不删）
 
 `config_merge.py`（入口脚本每次启动跑）此前只做一件事：把模板里**缺失**的键补进

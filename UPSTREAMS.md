@@ -23,54 +23,49 @@
 | 上游 | 仓库 | 分支 | Commit | 提交时间 | 快照位置 |
 |---|---|---|---|---|---|
 | wb2api | `Sliverkiss/workbuddy2api` ⚠️ **已删除** | `master` | `d1023f3` | 2026-09-21 09:52 | `vendor/wb2api` |
-| manager | [ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) | `main` | [`8c92da9`](https://github.com/ithtelab/workbuddy-manager/commit/8c92da9b) | 2026-09-30 19:33 | `vendor/manager` |
+| manager | [ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) | `main` | [`86f2dc1`](https://github.com/ithtelab/workbuddy-manager/commit/86f2dc1) | 2026-10-08 12:51 | `vendor/manager` |
 
 > wb2api 那一行**不再有可点的链接**：仓库已 404（见下节）。
 > 它是**我们开始自行维护时的起点**，不是"待同步的目标"。
 
 - wb2api：`Merge pull request #184 from .../fix/image-url-`（+764/−21，15 个文件）
   含图片 URL 修复、积分口径、成长任务链、WAF 403 处理等
-- manager：`chore(release): v1.0.76`（166 文件 / +13800 −2487）
-  **面板显示版本 v1.0.76**；期间跨 **2 个发版**（v1.0.75~v1.0.76）：设置页 7 个
-  Tab 改成可寻址子路由（外壳搬到 `settings/layout.tsx`）、命令面板（⌘K）、底栏入口
-  11→8 且被吸收的三页改为页内二级导航、**PostgreSQL 异地备份**（默认关闭）、
-  账号被上游「系统自动禁用」后可补调 revive 并随重新登录恢复、今日趋势图按小时、
-  Windows 本机原生运维脚本增强（验签 / 环境自愈）、更新记录可清除等。
+- manager：`fix(http): 借来的客户端不许被 aclose 真关（#144 自查发现的并发隐患）`
+  （126 文件 / +5317 −504）
+  **面板显示版本 v1.0.80**；期间跨 **4 个发版**（v1.0.77~v1.0.80）：**按账号绑定
+  命名出口代理线路**（新增 `WB_DEFAULT_ACCOUNT_PROXY`：新账号默认绑定的线路名）、
+  **账号导入/导出**（审计留痕、禁止缓存、导出前二次确认）、**出站客户端池化复用**
+  （issue #144，Windows 上每次新建 httpx 客户端 ~1 秒正是页面切换的耗时）、
+  **一键更新 GitHub API 限流回退**（`WB_GITHUB_TOKEN`/`GITHUB_TOKEN` 认证 +
+  「签名未就绪」短缓存，修 403 中断）、Redis 测试连接按 RESP 真 PING、
+  昵称带 emoji 不再让成长任务全挂（Windows）、失败提示不再断在冒号上。
 
-> **本次同步（v1.0.74 → v1.0.76）有三件事值得记住**：
+> **本次同步（v1.0.76 → v1.0.80）值得记住的**：
 >
-> 1. **导入块锚点第三次失效**（v1.0.70 加 redpackets/tokens → v1.0.71~74 加
->    upstreams → v1.0.75 加 pgsync）。它已是本项目**最高频失效**的锚点；
->    `apply.py` 里已标注"不要凭记忆手写，照抄新收尾两行"—— 上游这次还把
->    `pgsync as pgsync_router` 插到行首、把 `settings` 挤到第二行，凭记忆必错。
-> 2. **"一律删除 vendor 下的 .gitignore"这条策略被收窄**（上游 v1.0.75 新增了会
->    读 `.gitignore` 的测试，一律删会让它在**所有平台**假失败、CI 必红）。
->    这是本次唯一的**策略级改动**，判断过程与教训写在「嵌套 .gitignore 陷阱」。
-> 3. **`UpdatePanel.tsx` 这个覆写目标，上游这次自己也改了**（新增"清除更新记录"，
->    issue #105）—— 按覆写的既定代价放弃。判定依据：我们的面板不渲染上游的
->    更新状态与日志（它读的是套件侧车的状态），所以那个能力在这里没有对应物。
->    这次是"覆写代价"的第一次真实发生，登记在「覆写登记」。
+> 1. **补丁 1 的锚点第四次失效，且这次是结构性重构**：上游把 `http_client()`
+>    重构成**客户端池**（`_CLIENTS` / `_BorrowedClient` / `_build_client()`，
+>    issue #144），构造收口到 `_build_client()`。补丁随之从 `http_client()` 移到
+>    `_build_client()` —— 好处是事件循环内外的**两条路径**（池未命中 / 循环外
+>    即用即弃）都经过它，还顺带覆盖了上游同轮新增的**按账号代理**
+>    （`proxy_routes` / `http_client(proxy=)`）：只要配了代理（`WB_HTTP_PROXY`
+>    或账号绑定线路），内网就直连。
+> 2. `UpdatePanel.tsx`（覆写目标）上游这次又改了：新增「签名未就绪」提示 +
+>    按钮禁用（`sig_ready === false`，issue #127/#129）。**没有搬**，判定依据
+>    仍是"对应物不存在"：我们面板的 manager 区块**只报告、无更新按钮**，
+>    "签名未就绪时收起按钮"在我们这里没有可作用的对象。
+> 3. `server/services/updater.py` 新增 `sig_ready` 字段并给 `_gh_get` 加了 token
+>    认证 —— 这是**读取端**（上游自己的 `/api/system/check-update`，本套件面板
+>    已不调用）；**状态 JSON 的读取口径未变**，`docker/stub/update.py` 无需调整。
+> 4. **新增环境变量** `WB_DEFAULT_ACCOUNT_PROXY`（新账号默认绑定的代理**线路名**，
+>    线路在面板「设置 → 出口线路」维护）。compose 与 `.env.example` 已透传。
+>    依赖面：`server/requirements.txt` 新增 `python-multipart>=0.0.9`
+>    （账号导入解析上传体用，随 vendor 清单自动装入镜像）。
+>    `config.example.json` 未变动（模板防漂移测试盯着）。
 >
-> 依赖面：`server/requirements.txt` 新增 `psycopg[binary]>=3.1`（PostgreSQL 异地
-> 备份的驱动，按需导入、功能默认关闭；`[binary]` 自带预编译 libpq，不需要系统包，
-> 镜像会照装）。**没有新增环境变量**。`server/services/updater.py` 只多了
-> `clear_status()`，**状态 JSON 口径未变**，`docker/stub/update.py` 无需调整。
-
-> 上次同步（v1.0.70 → v1.0.74）的要点：上游把「加账号落盘后立即重启上游」改成
-> **「先等最多 8 秒热加载、超时才重启」** —— 在我们这里体现为更快、更少打扰。
-> 别把这条**误读**成"我们的部署里重启本来就失败"：manager 经 `dockerproxy`
-> （`POST=1` + `CONTAINERS=1`）**是能**成功执行 `docker restart` 的。
-> 那次也更新过一次导入块锚点，并确认读取端（`updater.py`）改了 91 行但字段口径未变。
-
-> 上次同步（v1.0.60 → v1.0.70）顺带修掉一处**配置模板漂移**（此前一直存在，非那次
-> 引入）：上游已 BREAKING 移除 `server.max_body_mb`（请求体改为无上限），而我们的
-> `docker/wb2api.config.template.json` 仍留着它 —— 生成的 `config.json` 会
-> **声称一个不存在的 8MB 限制**（上游容忍旧键，所以不报错、只是说错话）。
-> 现已改为**从上游 example 重新生成**模板，并新增
-> `tests/test_config_template.py` 按**递归键路径**比对，防止再次漂移。
-> 同时补上了模板里缺的 `admin` 段与 `pool` 的 5 个新字段
-> （后者因上游对缺字段套默认值而未造成行为问题，但漏着是隐患）。
-> 本轮 `config.example.json` **未变动**，模板无需再动（防漂移测试会自己盯着）。
+> 上次同步（v1.0.74 → v1.0.76）的要点：设置页 7 个 Tab 改成可寻址子路由、
+> PostgreSQL 异地备份（默认关闭，新增 `psycopg[binary]`）、导入块锚点第三次失效
+> （`pgsync` 路由插入位移）、「一律删 vendor 的 .gitignore」收窄为「只删实测有害的」
+> —— 判断过程见「嵌套 .gitignore 陷阱」。
 
 > 记录的是**分支 + commit**，不是 Release tag：上游的 CHANGELOG 常滞后于
 > 代码（manager 打完 v1.0.25 后仍有未发版提交），按 tag 记录会失真。
@@ -180,7 +175,7 @@ internal/prompt/prompt.go:17:12: pattern defaultprompt.md: no matching files fou
 
 | # | 目标 | 上游位置 | 补丁内容 | 为什么需要 |
 |---|---|---|---|---|
-| 1 | manager | `server/config.py` · `http_client()` | 给内部服务（`WB2API_BASE`、`dockerproxy`）挂直连 transport（`mounts`） | httpx 的 `proxy=` 作用于所有请求；配了 SOCKS 后连内网上游 `wb2api:7863` 也会走代理，管理端连不上自己的上游。`no_proxy` 环境变量在显式 `proxy=` 下**不生效**（已实测） |
+| 1 | manager | `server/config.py` · `_build_client()`（v1.0.80 起；此前是 `http_client()`，上游客户端池化后构造收口到这里） | 给代理客户端挂内网直连 transport（`mounts`） | httpx 的 `proxy=` 作用于所有请求；配了 SOCKS 后连内网上游 `wb2api:7863` 也会走代理，管理端连不上自己的上游。`no_proxy` 环境变量在显式 `proxy=` 下**不生效**（已实测）。挂在 `_build_client()` 可覆盖事件循环内外的两条构造路径与按账号代理 |
 | 2 | wb2api | `internal/upstream/transport.go` · `newTransport()` | 给 `http.Transport` 设 `Proxy: http.ProxyFromEnvironment` | 上游未设该字段，Go 零值 = **恒不使用代理**且不读环境变量，网关出站无法走代理 |
 | 3 | manager | `server/main.py` | 加两行：导入并 `include_router(suite_router)` | 注册本项目新增的 `/api/system/suite-*`（套件自更新）路由。**上游路由实现一行未改** —— 见下面的覆写登记 |
 | 4 | manager | `web/components/common/layout/ManagementBar.tsx` | 移除"发现新版本"会话弹窗（整块 `useEffect`） | 那条提示在本发行版**两处都不成立**：① 它显示的版本号是**上游 manager** 的，不是本套件的；② 文案指向「设置 → 系统更新 一键升级」，而该页并不提供升级上游的按钮。留着只会让人误以为点一下就能升级 |
@@ -234,6 +229,12 @@ internal/prompt/prompt.go:17:12: pattern defaultprompt.md: no matching files fou
 > 本面板不渲染上游的更新状态与日志（它读的是套件侧车的状态），所以"清除上游
 > 更新记录"在这个面板里没有可清除的对象。**以后照这个标准判断** —— 先问"上游
 > 这次的改动在我们的面板里有没有对应物"，再决定搬不搬；有对应物就别偷懒。
+>
+> **同一标准第二次套用**（v1.0.79，2026-10-05 前后）：上游又给该文件加了
+> 「签名未就绪」提示 + 按钮禁用（`sig_ready === false`，issue #127/#129）。
+> 仍**没有搬**：我们面板的 manager 区块**只报告、无更新按钮**，"签名未就绪时
+> 把按钮收起来"在我们这里没有可作用的对象。（读取端 `updater.py` 的 `sig_ready`
+> 字段照旧流入上游自己的 check-update 端点，本套件面板不消费它。）
 
 同时 `docker/overlay/` 还含两处**新增**文件（上游没有，不冲突）：
 `server/services/suite.py`（版本比对与更新触发）与 `server/routers/suite.py`（三个端点）。

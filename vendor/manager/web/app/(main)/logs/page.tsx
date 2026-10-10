@@ -535,7 +535,9 @@ export default function LogsPage() {
               {([
                 ['ip', t('logs.rowIp'), detail.ip],
                 ['key', t('logs.rowKey'), detail.key_name || '—'],
-                ['account', t('logs.rowAccount'), detail.account || t('logs.notCollected')],
+                // 账号来自上游日志回填，可能比请求本身晚几秒；这里只能说
+                // “尚未采集”，不能写成“非流式请求”——那是在猜原因。
+                ['account', t('logs.rowAccount'), detail.account || t('logs.accountPending')],
                 ['model', t('logs.rowModel'), detail.model || '—'],
                 ['mapped', t('logs.rowMappedModel'), detail.mapped_model || '—'],
                 ['status', t('logs.rowStatus'), String(detail.status)],

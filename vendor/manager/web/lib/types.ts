@@ -6,6 +6,7 @@ export interface Me {
 }
 
 export interface Account {
+  proxy?: string;
   /** 该令牌签发的总时长（秒）；后端从 JWT 解出，解不出为 null */
   ttl_seconds?: number | null;
   /** 令牌签发时间（秒）≈ 最近一次刷新时间；后端从 JWT iat 解出，解不出为 null */
@@ -870,6 +871,13 @@ export interface VersionSide {
 export interface ManagerVersion extends VersionSide {
   /** Release 页面地址 */
   url: string;
+  /**
+   * 该 Release 是否已附带签名文件。
+   *
+   * `false` = 新版本已发布但维护者还没签名（发布后有个窗口期）：这时更新会被
+   * 拒绝，界面要**先说清楚**，别让人点下去才失败。`null` = 未知（旧缓存）。
+   */
+  sig_ready: boolean | null;
   repo: string;
 }
 

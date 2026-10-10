@@ -99,6 +99,14 @@ dev/.account-note
 dev/.shots-account-note
 # 账号分组验收（verify_account_groups_ui.py）的临时数据（截图随 PR 提交，不忽略）
 dev/.account-groups
+# 出口线路验收（verify_account_proxy_ui.py）的临时数据（截图随 PR 提交，不忽略）
+dev/.account-proxy
+# 备份页表单轮询验收（verify_pgsync_form_ui.py）的临时数据（截图随 PR 提交，不忽略）
+dev/.pg-form
+# 自建 Redis 探测验收（verify_redis_probe_e2e.py）的临时数据
+dev/.redis-probe
+# 给贡献者/用户的回复草稿（发出去就不必留在仓库里）
+dev/.replies
 # 提示词缓存标记验收（verify_cache_log_ui.py）的临时数据与截图
 dev/.cache-log
 dev/.shots-cache-log

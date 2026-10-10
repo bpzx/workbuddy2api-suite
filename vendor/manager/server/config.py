@@ -1,10 +1,12 @@
 """运行期配置：全部通过环境变量覆盖，默认值适配 1Panel 单机部署。"""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import secrets
 from pathlib import Path
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent.parent  # 仓库根目录
 
@@ -109,6 +111,7 @@ AUDIT_ALL_ACCESS = _env('WB_AUDIT_ALL_ACCESS', '0') == '1'
 # 留空时所有请求都不使用任何代理：httpx 默认 trust_env=True 会读取系统/环境代理，
 # 会把内网请求（如 127.0.0.1:7863）也交给系统代理，导致连接被劫持或长时间超时。
 HTTP_PROXY = _env('WB_HTTP_PROXY', '')
+DEFAULT_ACCOUNT_PROXY = _env('WB_DEFAULT_ACCOUNT_PROXY', '')
 
 # 本机一键导入：允许把新密钥直接写进**本机的** cc-switch / ZCode 配置。
 #
@@ -180,11 +183,129 @@ def upstream_api_key() -> str:
         return ''
 
 
+def proxy_routes() -> dict[str, str]:
+    """读取共享命名线路。客户端只能取得线路名，不能取得代理凭据。"""
+    try:
+        routes = json.loads(UPSTREAM_CONFIG.read_text(encoding='utf-8')).get('proxies') or {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+    if not isinstance(routes, dict):
+        return {}
+    return {k: v for k, v in routes.items()
+            if isinstance(k, str) and k.strip() and isinstance(v, str)}
+
+
+def account_proxy(auth: dict) -> str | None:
+    """无绑定时沿用既有出口；绑定无效时拒绝发出请求。"""
+    name = str(auth.get('proxy') or '').strip()
+    if not name:
+        return None
+    url = proxy_routes().get(name)
+    if not url:
+        raise ValueError(f'账号绑定的代理线路 {name!r} 不存在')
+    try:
+        parsed = urlsplit(url)
+        valid = parsed.scheme in ('http', 'https') and bool(parsed.hostname) and parsed.port != 0
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError(f'代理线路 {name!r} 配置无效（需要 HTTP/HTTPS 代理）')
+    return url
+
+
 def new_secret() -> str:
     return secrets.token_urlsafe(48)
 
 
-def http_client(timeout, *, connect: float | None = None):
+# ── 出站客户端池（issue #144）────────────────────────────────
+#
+# 为什么不再每次新建：Windows 上构造 httpx.AsyncClient 会去加载系统证书库建 SSL
+# 上下文，实测 **~1 秒**（Linux 上没这么夸张，所以这个问题只在原生 Windows 部署
+# 上暴露）。面板的每个页面切换都要问上游几次（账号/状态/模型），于是「每次出站
+# 新建客户端」直接表现成「切页面慢 1~3 秒」。共享之后同一套配置只建一次。
+#
+# 键里带**事件循环**：httpx 的客户端（连接池）绑在创建它的那个循环上，跨循环
+# 复用会炸（同步路由里 `asyncio.run` 另起循环那条路就是例子，见
+# `modelcatalog.fetch_ids_blocking`）。不同循环各建一个，互不干扰。
+_CLIENTS: dict[tuple, tuple] = {}
+_CLIENTS_MAX = 24
+
+
+class _BorrowedClient:
+    """借出去用的客户端：退出 `async with` 时**不关闭**（归还给池）。
+
+    调用点大多是 `async with config.http_client(...) as client:` 的写法，所以这里
+    只把「上下文管理」这层语义接过来，避免改十几个调用点。关闭由
+    `close_clients()`（应用退出）或池满淘汰时统一做。
+
+    另外**代理属性访问**（`__getattr__`）并让 `aclose()` 变成「归还」而不是真关：
+    有几处调用点是不用 `async with`、自己 `client = http_client(...)` 然后
+    `finally: await client.aclose()` 的写法（网关、Anthropic 兼容、测试台、Responses
+    各一处）。共享之后，那些 `aclose()` 一旦真关，就会把别人正在用的连接池一起关掉
+    ——并发下表现为「偶发请求失败」。所以借来的客户端只支持「还」，真关只发生在池
+    淘汰与退出清理里。
+    """
+
+    __slots__ = ('_client',)
+
+    def __init__(self, client) -> None:  # noqa: ANN001
+        self._client = client
+
+    def __getattr__(self, name: str):  # noqa: ANN201
+        # 借用包装要能当客户端用（post/stream/headers/... 一律转发）
+        return getattr(self._client, name)
+
+    async def __aenter__(self):  # noqa: ANN201
+        return self._client
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+    async def aclose(self) -> None:
+        """借用语义：只归还，不真关（共享客户端由池统一管理）。"""
+        return None
+
+
+def _timeout_key(tmo) -> tuple:  # noqa: ANN001
+    return (tmo.connect, tmo.read, tmo.write, tmo.pool)
+
+
+def _build_client(tmo, proxy: str | None):  # noqa: ANN001, ANN202
+    import httpx
+
+    kwargs: dict = {'timeout': tmo, 'trust_env': False}
+    if proxy:
+        kwargs['proxy'] = proxy
+    return httpx.AsyncClient(**kwargs)
+
+
+async def close_clients() -> None:
+    """关掉池里所有客户端（应用退出时调用；幂等）。"""
+    clients = [entry[1] for entry in _CLIENTS.values()]
+    _CLIENTS.clear()
+    for client in clients:
+        try:
+            await client.aclose()
+        except Exception:  # noqa: BLE001 —— 退出路径上的清理失败不该再抛
+            continue
+
+
+def _evict(loop) -> None:  # noqa: ANN001
+    """池满了淘汰最早的一个（按插入顺序）。"""
+    while len(_CLIENTS) > _CLIENTS_MAX:
+        key = next(iter(_CLIENTS))
+        entry = _CLIENTS.pop(key, None)
+        if not entry or entry[1].is_closed:
+            continue
+        old_loop, client = entry
+        try:
+            if old_loop is loop:
+                loop.create_task(client.aclose())      # 同一循环才能安全关闭
+        except Exception:  # noqa: BLE001
+            continue
+
+
+def http_client(timeout, *, connect: float | None = None, proxy: str | None = None):
     """统一的 httpx 客户端：默认忽略系统/环境代理，避免内网请求被代理劫持。
 
     需要走代理时显式设置 WB_HTTP_PROXY。
@@ -192,6 +313,10 @@ def http_client(timeout, *, connect: float | None = None):
     timeout 可以传数字，也可以传已构造好的 httpx.Timeout。
     注意：httpx 不允许「Timeout 实例 + connect 关键字」同时传，
     因此传入实例时忽略 connect，避免 AssertionError。
+
+    **返回的是借用语义的上下文管理器**（退出时不关客户端，见 `_BorrowedClient`）：
+    同一事件循环 + 同一组超时/代理只建一次，连接池复用（issue #144：Windows 上
+    每次新建要 ~1 秒，正好是页面切换的耗时）。
     """
     import httpx
 
@@ -201,7 +326,20 @@ def http_client(timeout, *, connect: float | None = None):
         tmo = httpx.Timeout(timeout, connect=connect)
     else:
         tmo = httpx.Timeout(timeout)
-    kwargs = {'timeout': tmo, 'trust_env': False}
-    if HTTP_PROXY:
-        kwargs['proxy'] = HTTP_PROXY
-    return httpx.AsyncClient(**kwargs)
+    selected_proxy = HTTP_PROXY if proxy is None else proxy
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # 事件循环外（同步夹具/脚本场景）：不缓存，按老样子建一个即用即弃的，
+        # 免得把一个绑在未知循环上的客户端留在池里。
+        return _build_client(tmo, selected_proxy)
+
+    key = (*_timeout_key(tmo), selected_proxy or '')
+    entry = _CLIENTS.get(key)
+    if entry is not None and entry[0] is loop and not entry[1].is_closed:
+        return _BorrowedClient(entry[1])
+    client = _build_client(tmo, selected_proxy)
+    _CLIENTS[key] = (loop, client)
+    _evict(loop)
+    return _BorrowedClient(client)

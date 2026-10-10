@@ -278,7 +278,9 @@ export default function ClaimPage() {
           </DialogHeader>
 
           {got && (
-            <div className="space-y-3">
+            /* px-6 pb-6：与 DialogHeader 的 px-6 对齐。原来只有 space-y-3，
+               卡片与「已复制」那行提示会直接顶到弹窗边缘（圆角处被裁掉）。 */
+            <div className="space-y-3 px-6 pb-6">
               {/* 额度：最显眼的位置 */}
               <div className="animate-in zoom-in-95 rounded-2xl bg-muted px-4 py-5 text-center duration-500">
                 <div className="text-3xl font-semibold tabular-nums text-amber-600 dark:text-amber-400">

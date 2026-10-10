@@ -171,12 +171,19 @@ class HourlyEndpointTest(_Case):
                          sum(d['prompt_tokens'] + d['completion_tokens'] for d in daily))
 
     def test_failures_come_from_request_logs_per_hour(self) -> None:
-        """失败数按小时来自请求日志：用量表里根本没有被拒绝的调用。"""
-        now = int(time.time())
-        self._log(now - 60, status=429, pt=0, ct=0)
-        self._log(now - 50, status=500, pt=0, ct=0)
-        data = self.client.get('/api/stats/hourly').json()
+        """失败数按小时来自请求日志：用量表里根本没有被拒绝的调用。
+
+        时间戳钉在**当前小时的开头 + 1/2 秒**，而不是「现在减一分钟」：整套
+        测试跑到这里时若恰逢整点前后一分钟，`now - 60` 会落进**上一个小时**，
+        而断言找的是「当前小时」的桶 —— 每小时边界上都可能偶发失败一次。
+        钉进当前小时后，无论什么时候跑都落在同一个桶里。
+        """
+        day = time.strftime('%Y-%m-%d')
         hour = self.db.hour_of()
+        start = self.db.hour_start_ts(day=day, hour=hour)
+        self._log(start + 1, status=429, pt=0, ct=0)
+        self._log(start + 2, status=500, pt=0, ct=0)
+        data = self.client.get('/api/stats/hourly', params={'day': day}).json()
         bucket = next(d for d in data if d['hour'] == hour)
         self.assertEqual(bucket['failed'], 2, '失败数没有从请求日志按小时统计')
         self.assertEqual(bucket['requests'], 0, '失败的调用不该进用量表')

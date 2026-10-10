@@ -123,6 +123,10 @@ services:
       #     docker/patches/apply.py 注入 mounts 保证），否则内网绕代理必失败；
       #   * 留空 = 全部直连。
       WB_HTTP_PROXY: ${WB_HTTP_PROXY:-}
+      # 可选：新账号扫码登录后**默认绑定**的代理线路名（上游 v1.0.77+ 新增，
+      # WB_DEFAULT_ACCOUNT_PROXY）。线路在面板「设置 → 出口线路」维护（存于共享
+      # config.json 的 proxies 段）；留空 = 新账号不自动绑定，沿用既有行为。
+      WB_DEFAULT_ACCOUNT_PROXY: ${WB_DEFAULT_ACCOUNT_PROXY:-}
     volumes:
       # 与 wb2api 共用同一份数据目录（宿主机可见）
       - ${WB_DATA_PATH:-./data}:/data

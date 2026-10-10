@@ -1,11 +1,11 @@
-# 打 tag 时自动构建前端、打包产物并创建 GitHub Release。
+# 打 tag 时自动构建前端、打包产物并创建一个**草稿** Release。
 #
 # 用法：推送形如 v1.0.0 的 tag 即可
 #   git tag v1.0.0 && git push origin v1.0.0
 #
 # 产物为可直接部署的压缩包（含 server/ 与已构建的 web/out/）。
 #
-# ── 关于签名（重要）──────────────────────────────────────────
+# ── 关于签名与发布（重要）────────────────────────────────────
 # 本工作流**不持有签名私钥**，也不代替维护者签名：
 #   * 私钥绝不进 CI —— 恶意 PR 合并后能改 workflow 里的任意步骤，
 #     把密钥放在这里等于直接交给攻击者。
@@ -13,6 +13,10 @@
 #     docs/release-signing.md），.sig 作为 Release 资产上传。
 #   * 用户侧 deploy/update.py 强制验签，未签名的 Release 会被拒绝安装；
 #     本 workflow 在检测到已签名后也**不再覆盖 tar.gz**，避免使签名失效。
+#   * Release 先建为**草稿**：`releases/latest` 跳过草稿，所以「构建完、
+#     还没签名」这段时间用户看不到这个版本（面板的更新按钮也不会出现），
+#     避免了「点了更新被拒：没有可用的签名文件」的窗口期（issue #127/#129）。
+#     维护者签名并核对后执行 `gh release edit <tag> --draft=false` 发布。
 name: Release
 
 on:
@@ -196,15 +200,22 @@ jobs:
             echo "Release $TAG 已存在（未签名），改为上传/覆盖产物"
             gh release upload "$TAG" "${STAGE}.tar.gz" "${STAGE}.zip" --clobber
           else
+            # **草稿**（issue #127/#129）：没有签名的 Release 不能让用户看到。
+            # `releases/latest`（面板与更新器的版本检查都是它）会跳过草稿，
+            # 所以「CI 先建、维护者后签名」这段窗口里，用户侧只会看到上一个
+            # 已发布的版本 —— 不会出现「点了更新却被拒绝：没有可用的签名文件」。
+            # 签名上传并核对无误后，由维护者发布（见下方提示与发版手册）。
             gh release create "$TAG" \
+              --draft \
               --title "$TAG" \
               --notes-file RELEASE_NOTES.md \
               "${STAGE}.tar.gz" "${STAGE}.zip"
           fi
           echo ""
-          echo "== 发版必做：本机签名并上传 =="
-          echo "  正常流程：先让 CI 建好 Release，再由你在本机对下载下来的产物签名上传。"
-          echo "  命令见下方 step summary 与 docs/release-signing.md。"
+          echo "== 发版必做（两步：先签名，再发布）=="
+          echo "  1) 本机对下载下来的产物签名并上传 .sig（命令见 step summary / docs/release-signing.md）"
+          echo "  2) 核对无误后把草稿发布出去：gh release edit $TAG --draft=false"
+          echo "  在此之前 ${TAG} 对用户不可见（版本检查走 releases/latest，跳过草稿）。"
 
       - name: 校验签名（已上传 .sig 时）
         if: steps.sigcheck.outputs.has_sig == '1'
@@ -307,28 +318,37 @@ jobs:
       - name: 部署说明
         run: |
           cat <<'EOF' >> $GITHUB_STEP_SUMMARY
-          ## 发布完成
+          ## 发布完成（**草稿**，尚未对用户可见）
 
           资产：
           - `${{ steps.pack.outputs.stage }}.tar.gz`
           - `${{ steps.pack.outputs.stage }}.zip`
 
+          > 这次创建的是**草稿** Release：`releases/latest`（面板与更新器的版本
+          > 检查都走它）会跳过草稿，所以在签名并发布之前，用户侧只会看到上一个
+          > 已发布的版本 —— 不会再出现「点了更新却被拒绝：没有可用的签名文件」
+          > 那种窗口期（issue #127/#129）。
+
           > ⚠️ **本工作流不签名**。私钥不允许进 CI —— 恶意 PR 合并后可以改
           > workflow 里的任意步骤，密钥放这里等于直接交给攻击者。
-          > 因此签名由维护者在**本机**对最终产物执行：
+          > 因此签名由维护者在**本机**对最终产物执行，然后再把草稿发布出去：
 
           ```bash
-          # 在本机（私钥所在机器）：
+          # 1) 在本机（私钥所在机器）签名并上传：
           gh release download ${{ steps.vars.outputs.tag }} \
             --pattern '${{ steps.pack.outputs.stage }}.tar.gz'
           ssh-keygen -Y sign -f ~/.ssh/workbuddy-release -n file \
             '${{ steps.pack.outputs.stage }}.tar.gz'
           gh release upload ${{ steps.vars.outputs.tag }} \
             '${{ steps.pack.outputs.stage }}.tar.gz.sig'
+
+          # 2) 重新下载核对（sha256 + 验签）后，发布：
+          gh release edit ${{ steps.vars.outputs.tag }} --draft=false
           ```
 
           > 一键更新（deploy/update.py）会校验该签名，**没有 .sig 的 Release
-          > 会被所有用户拒绝安装**。所以这一步不是可选的。
+          > 会被所有用户拒绝安装**。所以签名这一步不是可选的；而**发布**是让它
+          > 对用户生效的那一步，漏了它用户永远看不到这个版本。
 
           部署方式（解压后）：
           ```bash

@@ -213,6 +213,23 @@ function DialogFooter({className, ...props}: DialogFooterProps) {
 
 type DialogBodyProps = React.ComponentProps<typeof ScrollArea>;
 
+/**
+ * 弹窗主体（可滚动）。
+ *
+ * ⚠️ `className` 落在 Radix ScrollArea 的 **Root** 上，而 children 被塞进内层的
+ * Viewport —— 所以这里**只能写结构性类**（限高 `max-h-[…]` 之类）。布局类
+ * （`space-y-*` / `px-*` / `py-*`）必须再套一层 div：
+ *
+ *   <DialogBody className="max-h-[min(640px,calc(100dvh-12rem))]">
+ *     <div className="space-y-4 px-6 pb-2">…字段…</div>
+ *   </DialogBody>
+ *
+ * 写成 `<DialogBody className="space-y-3 px-6">` 不会报错，但 space-y-3 会作用到
+ * Root 的 Viewport / ScrollBar / Corner 三个兄弟节点上，字段之间**一个间距都没有**
+ * —— 表现为「所有字段挤成一坨」（上游表单与移动分组弹窗都踩过这个坑）。
+ * 横向的 px-* 则"碰巧"有效：Root 的内边距会把 Viewport 挤窄，看起来像是生效了，
+ * 更容易骗过肉眼。
+ */
 function DialogBody({className, children, ...props}: DialogBodyProps) {
   return (
     <ScrollArea

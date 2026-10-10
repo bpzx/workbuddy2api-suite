@@ -164,8 +164,8 @@ type Field =
   | SelectField
   | TextField;
 
-/** 时长格式校验：数字 + 单位（s/m/h/d） */
-const DURATION_RE = /^\d+\s*(s|m|h|d)$/i;
+/** 时长格式校验：数字 + 单位（s/m/h，不含 d —— Go time.ParseDuration 不认 d） */
+const DURATION_RE = /^\d+\s*(s|m|h)$/i;
 
 /**
  * 一个时长字段的取值是否合法。

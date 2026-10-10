@@ -52,11 +52,25 @@ export function PgSyncPanel() {
   const [testing, setTesting] = useState(false);
   const [busy, setBusy] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
+  /**
+   * 表单里有未保存的改动。
+   *
+   * 轮询回来的服务端值**不能**盖掉正在填的表单：空闲时每 15 秒走一次完整重载，
+   * 刚敲进去的字会被保存过的旧值打回去，页面看着像在不停刷新（issue #122）。
+   * 由 `patch()` 置位、保存成功时清零，`load()` 据此决定要不要回填。
+   */
+  const dirtyRef = useRef(false);
 
   const load = useCallback(async () => {
     try {
       const r = await pgSyncApi.config();
-      setForm(r.config);
+      // 有未保存输入时只刷新「上次导出 / 上次导入」这类**只读**展示，
+      // 其余字段保持用户正在填的内容。
+      setForm((f) => (dirtyRef.current
+        ? {...f,
+           last_export_at: r.config.last_export_at,
+           last_import_at: r.config.last_import_at}
+        : r.config));
       setStatus(r.status);
       setLoadError(false);
     } catch {
@@ -83,16 +97,14 @@ export function PgSyncPanel() {
 
   const running = !!status?.running;
   useEffect(() => {
+    // 空闲 15 秒、任务进行中 1.5 秒；两条路径都**只拉 /status**，一次都不碰表单
+    // ——空闲时那份完整重载正是把输入打回去的元凶（issue #122）。
     const interval = running ? 1500 : 15000;
     const timer = window.setInterval(() => {
-      if (running) {
-        void pollStatus();
-      } else {
-        void load();
-      }
+      void pollStatus();
     }, interval);
     return () => window.clearInterval(timer);
-  }, [running, pollStatus, load]);
+  }, [running, pollStatus]);
 
   // 任务跑完的那一刻把配置也刷一遍（last_export_at 变了）
   const wasRunning = useRef(false);
@@ -105,7 +117,10 @@ export function PgSyncPanel() {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [status?.logs]);
 
-  const patch = (next: Partial<PgSyncConfig>) => setForm((f) => ({...f, ...next}));
+  const patch = (next: Partial<PgSyncConfig>) => {
+    dirtyRef.current = true;
+    setForm((f) => ({...f, ...next}));
+  };
 
   async function save() {
     setSaving(true);
@@ -122,6 +137,7 @@ export function PgSyncPanel() {
         keep_local_backup: form.keep_local_backup,
       });
       setForm(r.config);
+      dirtyRef.current = false; // 已经落库：此后的服务端值可以再回填表单
       notify.ok(t('pgSync.saved'));
     } catch (e) {
       notify.err(errText(e));

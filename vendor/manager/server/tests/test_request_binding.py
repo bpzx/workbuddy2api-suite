@@ -142,7 +142,7 @@ class FrontendPostShapeTest(unittest.TestCase):
         self.assertGreater(idx, 0, '找不到 auth/start 的前端调用')
         snippet = api[max(0, idx - 200):idx + 80]
         self.assertIn("post<", snippet, 'auth/start 应通过 post() 调用')
-        self.assertRegex(snippet, r'\{\s*realm\s*,\s*region\s*\}',
+        self.assertRegex(snippet, r'\{\s*realm\s*,\s*region\s*(?:,|\})',
                          'realm 与 region 都应以对象形式作为 body 传入 —— '
                          '后端已按 body 解析（写成 query 会静默失效）')
 
@@ -170,8 +170,11 @@ class PostParamLocationAuditTest(unittest.TestCase):
         '/api/accounts/{filename}/refresh': {'upstream_id'},
         '/api/accounts/{filename}/clear-cooling': {'upstream_id'},
         '/api/accounts/{filename}/note': {'upstream_id'},
+        '/api/accounts/{filename}/proxy': {'upstream_id'},
         '/api/accounts/{filename}/disabled': {'upstream_id'},
         '/api/accounts/{filename}/move': {'upstream_id'},
+        # 账号导入（PR #145）：前端把分组与「是否覆盖同 uid」都按 query 传
+        '/api/accounts/upload': {'upstream_id', 'overwrite'},
         '/api/restart': {'upstream_id'},
     }
 

@@ -714,9 +714,12 @@ export default function KeysPage() {
                             </Button>
                           }
                         />
+                        {/* 与账号页删除弹窗同一处理：密钥名可能很长，放 18px 标题里一折行就挤乱，
+                            改放说明里，标题固定一行。窄屏用 min() 保住两侧 1rem 留白。 */}
                         <ConfirmDialog
-                          title={t('keys.deleteTitle', {name: k.name})}
-                          description={t('keys.deleteDesc')}
+                          title={t('keys.deleteTitle')}
+                          description={t('keys.deleteDesc', {name: k.name})}
+                          contentClassName="max-w-[min(380px,calc(100%-2rem))] sm:max-w-[380px]"
                           confirmText={t('keys.delete')}
                           destructive
                           onConfirm={async () => {

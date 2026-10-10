@@ -54,6 +54,8 @@ from pathlib import Path
 
 from .. import config, db, upstreamsvc
 from . import tencent, wb2api
+from .errtext import err_text
+
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +93,7 @@ def _account_payload(raw: dict) -> dict:
         'domain': auth.get('domain', ''),
         'realm': auth.get('realm'),
         'device_token': str(raw.get('device_token') or ''),
+        'proxy': str(raw.get('proxy') or ''),
     }
 
 
@@ -138,7 +141,7 @@ async def renew_once(now: int | None = None) -> dict:
         try:
             raw = wb2api.read_account_file_any(name, base_dir)
         except Exception as exc:  # noqa: BLE001
-            _note_failure(label, f'读取失败: {exc}')
+            _note_failure(label, f'读取失败: {err_text(exc)}')
             stats['failed'] += 1
             continue
         payload = _account_payload(raw)
@@ -156,7 +159,7 @@ async def renew_once(now: int | None = None) -> dict:
         try:
             tencent.update_auth_tokens(name, fields, base_dir)
         except Exception as exc:  # noqa: BLE001
-            _note_failure(label, f'刷新成功但写入失败: {exc}')
+            _note_failure(label, f'刷新成功但写入失败: {err_text(exc)}')
             stats['failed'] += 1
             continue
         stats['renewed'] += 1

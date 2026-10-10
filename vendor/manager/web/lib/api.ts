@@ -143,6 +143,10 @@ const groupQs = (upstreamId?: number | null): string =>
   upstreamId == null ? '' : `?upstream_id=${encodeURIComponent(String(upstreamId))}`;
 
 export const accountApi = {
+  proxies: () => get<{routes: string[]; default: string}>('/api/proxies'),
+  setProxy: (filename: string, proxy: string, upstreamId?: number | null) =>
+    put<{ok: boolean; proxy: string; reload_triggered: boolean}>(
+      `/api/accounts/${encodeURIComponent(filename)}/proxy` + groupQs(upstreamId), {proxy}),
   /**
    * 某分组的账号列表。upstreamId 省略 / null = 默认分组。
    *
@@ -152,6 +156,27 @@ export const accountApi = {
   list: (upstreamId?: number | null) =>
     get<AccountsResponse>('/api/accounts',
                           upstreamId == null ? undefined : {upstream_id: upstreamId}),
+  exportZip: async (upstreamId?: number | null) => {
+    const response = await http.get<Blob>('/api/accounts/export' + groupQs(upstreamId), {
+      responseType: 'blob',
+    });
+    return response.data;
+  },
+  upload: (files: File[], upstreamId?: number | null, overwrite = false) => {
+    const body = new FormData();
+    files.forEach((file) => body.append('files', file, file.name));
+    const group = groupQs(upstreamId);
+    const separator = group ? '&' : '?';
+    return http.post<{
+      ok: boolean;
+      uploaded: Array<{file: string; uid: string; updated: boolean}>;
+      added: Array<{file: string; uid: string; updated: boolean}>;
+      overwritten: Array<{file: string; uid: string; updated: boolean}>;
+      rejected: Array<{file: string; uid?: string; message: string}>;
+      failed: Array<{file: string; message: string}>;
+    }>('/api/accounts/upload' + group + separator + `overwrite=${overwrite ? 'true' : 'false'}`, body)
+      .then((r) => r.data);
+  },
   /**
    * 发起扫码登录；realm 决定国内版 / 国际版端点。
    *
@@ -160,9 +185,9 @@ export const accountApi = {
    * （国际版新号聊天报 14017）。用户在弹窗里改地区会重新发码，所以这里带的
    * 总是当前这张码对应的地区。
    */
-  start: (realm: Realm = 'cn', upstreamId?: number | null, region?: string) =>
+  start: (realm: Realm = 'cn', upstreamId?: number | null, region?: string, proxy?: string) =>
     post<{state: string; authUrl: string; realm: Realm}>(
-      '/api/auth/start' + groupQs(upstreamId), {realm, region}),
+      '/api/auth/start' + groupQs(upstreamId), {realm, region, proxy}),
   /** 轮询扫码结果。region 仅国际版需要（新号必须先做地区注册） */
   poll: (state: string, realm?: Realm, region?: string, upstreamId?: number | null) =>
     get<{

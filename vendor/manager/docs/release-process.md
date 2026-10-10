@@ -159,7 +159,7 @@ python -m unittest discover -s server/tests -t .   # 全绿才继续
 git add -A && git commit -m "chore(release): vX.Y.Z"
 git push origin main
 
-# 3) 打 tag（CI 会构建并创建 Release，**CI 不签名**）
+# 3) 打 tag（CI 会构建并创建一个**草稿** Release，**CI 不签名、也不发布**）
 git tag vX.Y.Z && git push origin vX.Y.Z
 
 # 4) 等 CI 完成后，在本机对**最终产物**签名并上传
@@ -170,15 +170,27 @@ gh release upload vX.Y.Z workbuddy-manager-vX.Y.Z.tar.gz.sig \
 
 # 5) 重新下载验证（不要用刚签名的那份，要重新拉）
 #    比对 sha256 → 用 deploy/update.py 的 check_signature 验签 → 解开核对版本号
+
+# 6) 核对无误后**发布**（草稿对用户不可见，这一步才让版本生效）
+gh release edit vX.Y.Z --repo ithtelab/workbuddy-manager --draft=false
 ```
 
-**没有 `.sig` 的 Release 会被所有用户的一键更新拒绝**——这一步不是可选的。
+两条都不能漏：
+
+* **没有 `.sig` 的 Release 会被所有用户的一键更新拒绝**（签名是信任链）；
+* **草稿不发布，用户永远看不到这个版本** —— 面板与更新器的版本检查都读
+  `releases/latest`，而它会跳过草稿。
+
+草稿这一步是 issue #127/#129 之后加的：以前 CI 直接把 Release 公开发布，
+维护者签名要几分钟到几十分钟，这期间任何人点「一键更新」都会被「没有可用的
+签名文件」拒绝 —— 提示还像是在说发布流程坏了。现在「构建完、没签名」的产物
+只躺在草稿里，用户侧看到的一直是上一个**已签名且已发布**的版本。
 
 ## 多人协作时的分工
 
-仓库有 write 权限的协作者**可以直接推 tag**，推了就触发 CI 建 Release——但
-他们**签不了名**（私钥只在维护者本机，这是设计如此）。所以协作发版的分工是
-「**协作者准备，维护者签字**」：
+仓库有 write 权限的协作者**可以直接推 tag**，推了就触发 CI 建**草稿** Release
+——但他们**签不了名、也发布不了**（私钥与「发布」这一步都只在维护者手上，
+这是设计如此）。所以协作发版的分工是「**协作者准备，维护者签字并发布**」：
 
 **协作者可以独立完成的部分**
 
@@ -189,20 +201,24 @@ python -m unittest discover -s server/tests -t .   # 全绿
 git tag vX.Y.Z && git push origin vX.Y.Z
 ```
 
-**维护者收尾（只有这三步）**
+**维护者收尾（签名 + 发布）**
 
 ```bash
 gh release download vX.Y.Z --repo ithtelab/workbuddy-manager --pattern '*.tar.gz'
 ssh-keygen -Y sign -f ~/.ssh/workbuddy-release -n file workbuddy-manager-vX.Y.Z.tar.gz
 gh release upload vX.Y.Z workbuddy-manager-vX.Y.Z.tar.gz.sig \
   --repo ithtelab/workbuddy-manager
+# 核对（重新下载 + 验签 + 解开看版本号）之后发布：
+gh release edit vX.Y.Z --repo ithtelab/workbuddy-manager --draft=false
 ```
 
 签名前核对密钥没拿错：`ssh-keygen -lf ~/.ssh/workbuddy-release.pub` 应输出
 `SHA256:xmHLJDKH/vYtAp59XwXPVE4A/CwXAOpxTlYh7KC677Y`。
 
-**协作者发完版、维护者没签之前，用户的一键更新会全部被拒绝**——这不是故障，
-是防线在工作。发现 Release 缺 `.sig` 时，按上面三步补签即可，不必重跑 CI。
+**协作者推完 tag、维护者还没签之前，用户侧什么都看不到**：CI 建的是草稿，而版本
+检查读的 `releases/latest` 会跳过草稿 —— 不会出现「点了更新却被拒绝」的窗口期。
+维护者签名并发布之后版本才对用户生效；发现草稿里缺 `.sig` 时按上面步骤补签即可，
+不必重跑 CI。
 
 > tag 与 main 分支都有保护规则（见下节）：协作者不能创建/删除 `v*` tag，
 > 也不能直接往 main 推。这不是不信任，而是让「能改代码」与「能发布可信产物」

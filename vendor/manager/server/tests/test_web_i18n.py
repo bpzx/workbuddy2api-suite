@@ -198,6 +198,13 @@ class WebLocaleTest(unittest.TestCase):
         ]
         self.assertEqual(offenders, [], f'en 里有 {len(offenders)} 处未翻译的中文：{offenders[:10]}')
 
+    def test_account_pending_copy_is_translated(self) -> None:
+        """日志详情的「账号尚未回填」不能复用「非流式请求」文案。"""
+        for locale in _LOCALES:
+            text = self.flat[locale].get('logs.accountPending')
+            self.assertIsInstance(text, str, f'{locale} 缺少 logs.accountPending')
+            self.assertNotIn('非流式', str(text), f'{locale} 又把它说成非流式请求了')
+
     def test_no_duplicate_keys(self) -> None:
         """同一个段里**不能出现重复键**——JSON 会静默取最后一条，界面于是显示错的那句。
 

@@ -296,6 +296,10 @@ class WriteEndpointScopeMatrixTest(unittest.TestCase):
         # 账号分组互转：把账号文件在分组的目录之间移动——等于改「这个号属于哪个
         # 池」，与删账号同级（都会改变池的构成），只对会话开放。
         'POST /api/accounts/{filename}/move',
+        # 账号导入（PR #145）：把外部凭据写进号池并触发上游重载 —— 该是「人坐在
+        # 面板前做」的动作，令牌（哪怕是管理员令牌）不行。导出虽然也是只对会话
+        # 开放，但它是**读**接口，本清扫只看写接口，另见 ExportRequiresSessionTest。
+        'POST /api/accounts/upload',
         # PostgreSQL 异地备份：配置里带着能写整库的数据库凭据；导出会把全部数据
         # （含密钥哈希、请求日志）复制出去，恢复会**覆盖本地库**。三条都远超
         # 只读令牌该有的权限，与 /api/system/update 同级，只对会话开放。
@@ -382,6 +386,58 @@ class WriteEndpointScopeMatrixTest(unittest.TestCase):
                          '有写接口只要求「已登录」——只读令牌也能调它。'
                          f'\n新增了：{sorted(got - self.ANY_LOGGED_IN)}'
                          f'\n消失了：{sorted(self.ANY_LOGGED_IN - got)}')
+
+
+
+
+class ExportRequiresSessionTest(unittest.TestCase):
+    """账号导出是**读**接口，但读出来的是凭据 —— 同样只对会话开放。
+
+    上面那份清单只扫写接口（`WriteEndpointScopeMatrixTest` 的定位：POST/PUT/PATCH/
+    DELETE），GET 导出落不进那个闸门，所以这里单独钉一条。放宽它之前先想清楚：
+    导出包里是 access / refresh token，能拷走就等于能接管账号。
+    """
+
+    def _export_routes(self) -> list:
+        from fastapi.routing import APIRoute
+        from server.main import app
+
+        found = []
+        for r in app.routes:
+            inner = getattr(r, 'original_router', None)
+            if inner is not None:
+                candidates = [x for x in inner.routes if isinstance(x, APIRoute)]
+            else:
+                candidates = [r] if isinstance(r, APIRoute) else []
+            found.extend(x for x in candidates if x.path == '/api/accounts/export')
+        return found
+
+    def test_export_is_session_only(self) -> None:
+        routes = self._export_routes()
+        self.assertTrue(routes, '找不到 /api/accounts/export —— 路由改名了？这条守卫会空转')
+
+        def dep_names(route) -> list[str]:  # noqa: ANN001
+            names: list[str] = []
+
+            def walk(dep) -> None:  # noqa: ANN001
+                # 与 WriteEndpointScopeMatrixTest 同一套取法：依赖的可调用挂在
+                # `dep.call` 上（不是 `dep.dependency`——那个只有子依赖才有）。
+                if dep is None:
+                    return
+                call = getattr(dep, 'call', None)
+                if call is not None:
+                    names.append(getattr(call, '__name__', str(call)))
+                for sub in getattr(dep, 'dependencies', []) or []:
+                    walk(sub)
+
+            walk(getattr(route, 'dependant', None))
+            return names
+
+        for route in routes:
+            self.assertIn('GET', route.methods or set())
+            names = dep_names(route)
+            self.assertIn('require_session_admin', names,
+                          '导出接口不再要求会话管理员 —— 它会把账号凭据打包给调用方')
 
 
 if __name__ == '__main__':

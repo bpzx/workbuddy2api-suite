@@ -8,8 +8,10 @@ import type {Account} from '@/lib/types';
 import {Button} from '@/components/ui/button';
 import {
   Dialog,
+  DialogBody,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from '@/components/animate-ui/radix/dialog';
@@ -77,26 +79,28 @@ export function AccountNoteDialog({
             {t('accounts.noteDesc', {name: account?.nickname || account?.uid || ''})}
           </DialogDescription>
         </DialogHeader>
-        <div className="space-y-3">
-          <Input
-            value={note}
-            onChange={(e) => setNote(e.target.value)}
-            placeholder={t('accounts.notePlaceholder')}
-            maxLength={100}
-            autoFocus
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') void save();
-            }}
-          />
-          <div className="flex justify-end gap-2">
-            <Button variant="outline" className="rounded-full" onClick={() => onOpenChange(false)}>
-              {t('common.cancel')}
-            </Button>
-            <Button className="rounded-full" onClick={save} disabled={busy}>
-              {t('common.save')}
-            </Button>
+        <DialogBody className="max-h-[min(640px,calc(100dvh-12rem))]">
+          <div className="px-6 pb-2">
+            <Input
+              value={note}
+              onChange={(e) => setNote(e.target.value)}
+              placeholder={t('accounts.notePlaceholder')}
+              maxLength={100}
+              autoFocus
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') void save();
+              }}
+            />
           </div>
-        </div>
+        </DialogBody>
+        <DialogFooter>
+          <Button variant="outline" className="rounded-full" onClick={() => onOpenChange(false)}>
+            {t('common.cancel')}
+          </Button>
+          <Button className="rounded-full" onClick={save} disabled={busy}>
+            {t('common.save')}
+          </Button>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
   );

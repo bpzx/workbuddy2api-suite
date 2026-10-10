@@ -50,6 +50,8 @@ from typing import Any, Iterator, Protocol
 from urllib.parse import quote
 
 from .. import config, db
+from .errtext import err_text
+
 
 logger = logging.getLogger('workbuddy.pgsync')
 
@@ -755,8 +757,8 @@ def _run_job(kind: str, cfg: dict) -> None:
         logger.info('PG %s 完成', label)
     except Exception as exc:  # noqa: BLE001 —— 任务线程的异常只能记在这里
         logger.exception('PG %s 失败', label)
-        reporter.log(f'{label}失败：{exc}', 'error')
-        reporter.finish(False, f'{label}失败：{exc}')
+        reporter.log(f'{label}失败：{err_text(exc)}', 'error')
+        reporter.finish(False, f'{label}失败：{err_text(exc)}')
     finally:
         _job_lock.release()
 
@@ -790,7 +792,7 @@ def test_connection(cfg: dict) -> dict:
             'server_version': version,
         }
     except Exception as exc:  # noqa: BLE001 —— 驱动异常类型很杂，统一转文案
-        return {'ok': False, 'message': f'连接失败：{exc}'}
+        return {'ok': False, 'message': f'连接失败：{err_text(exc)}'}
 
 
 def start_scheduler() -> None:

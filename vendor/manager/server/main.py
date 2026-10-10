@@ -13,12 +13,18 @@ import logging
 
 from . import config, db, redpacket, security
 from .iputil import client_ip
+from .stdio_utf8 import force_utf8_stdio
 from .routers import (
     accounts, anthropic, auth, gateway, keys, logs, models, playground,
     pgsync as pgsync_router, redpackets, responses, security as security_router,
     settings, stats, system, tokens, upstreams,
 )
 from .services import accountlog, pgsync, renew, tasklog, taskrun
+
+# 最早时刻把标准输出/错误钉成 UTF-8：Windows 中文区域默认按 cp936 编码，日志里
+# 一旦出现 emoji（账号昵称就可能带）就会抛 UnicodeEncodeError —— 与「成长任务」
+# 那次崩溃同源（issue #147），只是触发条件更少。
+force_utf8_stdio()
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +63,9 @@ async def lifespan(app: FastAPI):
         renew.stop_scheduler()
         accountlog.stop_collector()
         pgsync.stop_scheduler()
+        # 出站客户端是共享的（issue #144：Windows 上每次新建要 ~1 秒），
+        # 退出时统一关掉，别把连接池与 SSL 上下文丢在原地。
+        await config.close_clients()
 
 
 def _warn_if_exposed() -> None:
@@ -78,7 +87,7 @@ def _warn_if_exposed() -> None:
 
 app = FastAPI(
     title='WorkBuddy Manager',
-    version='1.0.76',
+    version='1.0.80',
     lifespan=lifespan,
     # 生产环境默认关闭交互式文档与 OpenAPI 描述：
     # 它们会把管理接口全貌（路径、参数、结构）暴露给任何未认证访问者，

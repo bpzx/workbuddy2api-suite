@@ -56,9 +56,10 @@ SUITE_MARKER = '【SUITE-OVERLAY】'
 # ─────────────────────────────────────────────────────────────
 # 文本补丁 1：manager —— 内网请求直连，不走 WB_HTTP_PROXY
 # ─────────────────────────────────────────────────────────────
-# 上游位置：vendor/manager/server/config.py 的 http_client()
+# 上游位置：vendor/manager/server/config.py 的 _build_client()（v1.0.80 起；
+# 此前是 http_client()，上游把它重构成客户端池后构造收口到了 _build_client）
 #
-# 上游把 WB_HTTP_PROXY 直接当作 httpx 的 proxy= 传入，而该参数
+# 代理（WB_HTTP_PROXY 或账号绑定线路）被直接当作 httpx 的 proxy= 传入，而该参数
 # **作用于所有请求**。官方注释只提醒「宿主机有 Clash TUN 时建议留空」，
 # 没覆盖「确实需要代理」的场景：此时连 wb2api:7863 都会被送去代理。
 #
@@ -95,17 +96,22 @@ MANAGER_HELPER = '''def _internal_direct_mounts() -> dict:
 
 '''
 
-MANAGER_ANCHOR = 'def http_client(timeout, *, connect: float | None = None):'
+MANAGER_ANCHOR = 'def _build_client(tmo, proxy: str | None):'
 
-MANAGER_OLD = """    kwargs = {'timeout': tmo, 'trust_env': False}
-    if HTTP_PROXY:
-        kwargs['proxy'] = HTTP_PROXY
+# v1.0.77~80：上游把 http_client() 重构成**客户端池**（issue #144，Windows 上每次
+# 新建 AsyncClient 要 ~1 秒）。构造收口到 _build_client()，事件循环内外的两条路径
+# （池未命中/循环外即用即弃）都经过它 —— 补丁随之移到这里，一处覆盖全部。
+# 顺带覆盖上游同轮新增的按账号代理（proxy_routes / http_client(proxy=)）：
+# 只要配了代理（无论 WB_HTTP_PROXY 还是账号绑定线路），内网就直连。
+MANAGER_OLD = """    kwargs: dict = {'timeout': tmo, 'trust_env': False}
+    if proxy:
+        kwargs['proxy'] = proxy
     return httpx.AsyncClient(**kwargs)"""
 
-MANAGER_NEW = """    kwargs = {'timeout': tmo, 'trust_env': False}
-    if HTTP_PROXY:
-        kwargs['proxy'] = HTTP_PROXY
-        # 【集成补丁】内网服务直连，不经过 WB_HTTP_PROXY。
+MANAGER_NEW = """    kwargs: dict = {'timeout': tmo, 'trust_env': False}
+    if proxy:
+        kwargs['proxy'] = proxy
+        # 【集成补丁】内网服务直连，不经过代理（WB_HTTP_PROXY 或账号绑定线路）。
         # 否则配了 SOCKS 代理后，连 wb2api:7863 也会被送去代理而失败。
         kwargs['mounts'] = _internal_direct_mounts()
     return httpx.AsyncClient(**kwargs)"""

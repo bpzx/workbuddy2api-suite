@@ -91,6 +91,10 @@ export function AddAccountDialog({
   const {realm, label: realmName} = useRealm();
   /** 国际版地区代码（如 HK）。不预选：地区属于账号归属信息，交由用户决定 */
   const [region, setRegion] = useState('');
+  const [proxy, setProxy] = useState<string | undefined>(undefined);
+  const [proxyRoutes, setProxyRoutes] = useState<string[]>([]);
+  const [routesReady, setRoutesReady] = useState(false);
+  const [routeError, setRouteError] = useState('');
   const [authUrl, setAuthUrl] = useState('');
   const [message, setMessage] = useState('');
   const stateRef = useRef('');
@@ -124,6 +128,22 @@ export function AddAccountDialog({
     pollingRef.current = false;
   }, []);
 
+  useEffect(() => {
+    if (!open) { setRoutesReady(false); return; }
+    let active = true;
+    setRoutesReady(false);
+    setRouteError('');
+    accountApi.proxies().then((data) => {
+      if (!active) return;
+      setProxyRoutes(data.routes);
+      setProxy(data.default || '');
+      setRoutesReady(true);
+    }).catch((error) => {
+      if (active) setRouteError(errText(error));
+    });
+    return () => { active = false; };
+  }, [open]);
+
   const start = useCallback(async () => {
     stopPoll();
     failsRef.current = 0;
@@ -133,7 +153,7 @@ export function AddAccountDialog({
     try {
       // region 一起发：服务端要替这张码盯着（前端被节流也不影响），而地区
       // 登记必须在落盘前完成，它那条路径读不到弹窗里的 state，只能在这里给。
-      const data = await accountApi.start(realm, upstreamId, region || undefined);
+      const data = await accountApi.start(realm, upstreamId, region || undefined, proxy);
       stateRef.current = data.state;
       setAuthUrl(data.authUrl);
       setPhase('waiting');
@@ -222,10 +242,10 @@ export function AddAccountDialog({
       setPhase('error');
       setMessage(errText(e));
     }
-  }, [onOpenChange, onSuccess, stopPoll, realm, region, t, upstreamId]);
+  }, [onOpenChange, onSuccess, stopPoll, realm, region, proxy, t, upstreamId]);
 
   useEffect(() => {
-    if (open) {
+    if (open && routesReady) {
       start();
     } else {
       stopPoll();
@@ -233,7 +253,7 @@ export function AddAccountDialog({
     return stopPoll;
     // 版本或地区变化时重新申请：扫码码是绑定端点的，旧码不能跨版本用
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, realm, region]);
+  }, [open, realm, region, upstreamId, proxy, routesReady]);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -248,6 +268,26 @@ export function AddAccountDialog({
         </DialogHeader>
 
         <div className="flex w-full min-w-0 flex-col items-center gap-4 px-6 pb-6">
+          {routeError && <p role="alert" className="text-xs text-destructive">{routeError}</p>}
+          {/* 没有配置任何线路时整个选择器都不出现：那时下拉里只有「直连」一项，
+              摆出来只会让人以为能选却选不动（线路表读自上游配置的 proxies）。 */}
+          {proxyRoutes.length > 0 && (
+            <div className="w-full space-y-1.5">
+              <div className="text-[11px] font-medium">{t('accounts.proxyLine')}</div>
+              <Select value={proxy ? `route:${proxy}` : 'default'} disabled={!routesReady}
+                      onValueChange={(value) => setProxy(value === 'default' ? '' : value.slice(6))}>
+                <SelectTrigger className="h-9 w-full rounded-full text-xs" aria-label={t('accounts.proxyLine')}>
+                <SelectValue />
+              </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="default">{t('accounts.proxyDirect')}</SelectItem>
+                  {proxy && !proxyRoutes.includes(proxy) &&
+                    <SelectItem value={`route:${proxy}`}>{proxy} ({t('accounts.proxyMissing')})</SelectItem>}
+                  {proxyRoutes.map((route) => <SelectItem key={route} value={`route:${route}`}>{route}</SelectItem>)}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
           {/* 国际版必须先完成地区注册，否则聊天报 14017。
               放在二维码之前：地区一变就要重新申请授权码，先选好再扫省得白扫。 */}
           {realm === 'global' && (

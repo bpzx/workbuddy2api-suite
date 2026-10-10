@@ -317,6 +317,15 @@ export function UpdatePanel() {
                     <span className="font-medium text-foreground">{check.manager.latest}</span>
                   </div>
                 )}
+                {/* 签名未就绪：发布后到维护者签名之间有个窗口期，这时更新一定会被
+                    拒绝。先说清楚、并把按钮收起来，比让人点下去看到「已拒绝安装」好
+                    （issue #127/#129）。签名上传后最迟五分钟、或点一次刷新就会恢复。 */}
+                {check.manager.has_update && check.manager.sig_ready === false && (
+                  <div className="flex items-start gap-1.5 text-[11px] text-amber-600 dark:text-amber-400">
+                    <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    <span>{t('updatePanel.sigPending')}</span>
+                  </div>
+                )}
                 {check.upstream.has_update && (
                   <div className="space-y-1 text-[11px] text-muted-foreground">
                     <div>
@@ -398,7 +407,10 @@ export function UpdatePanel() {
                 <Button
                   size="sm"
                   className="rounded-full"
-                  disabled={!isAdmin || busy || running}
+                  // 签名未就绪时不放行：这条路必然以「已拒绝安装」收场，让用户点了
+                  // 再失败只是把同一条信息换个地方说（见上方提示）。
+                  disabled={!isAdmin || busy || running || check.manager.sig_ready === false}
+                  title={check.manager.sig_ready === false ? t('updatePanel.sigPending') : undefined}
                   onClick={async () => {
                     setBusy(true);
                     try {

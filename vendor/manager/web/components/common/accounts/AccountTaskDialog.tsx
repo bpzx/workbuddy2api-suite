@@ -6,8 +6,10 @@ import {Button} from '@/components/ui/button';
 import {Badge} from '@/components/ui/badge';
 import {
   Dialog,
+  DialogBody,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from '@/components/animate-ui/radix/dialog';
@@ -151,27 +153,77 @@ export function AccountTaskDialog({
           </DialogDescription>
         </DialogHeader>
 
-        {/* 账号身份：昵称会重复（同名号更常见），uid 才是唯一标识 */}
-        <div className="rounded-xl bg-muted px-3 py-2 text-[11px] text-muted-foreground">
-          <div className="truncate text-foreground">
-            {account?.nickname || t('accounts.unnamed')}
-          </div>
-          <div className="truncate font-mono">{uid}</div>
-        </div>
-
-        {confirmFull ? (
-          /* 做任务前的二次确认：把「会发生什么」写清楚，再让人点。
-             与 TaskRunnerPanel 用同一套文案（tasks.runFullConfirm*）。 */
-          <div className="space-y-3">
-            <div className="flex items-start gap-2 rounded-xl bg-amber-500/10 px-3 py-2">
-              <TriangleAlert className="mt-0.5 size-3.5 shrink-0 text-amber-500" />
-              <span className="text-[13px] font-medium">{t('tasks.runFullConfirmTitle')}</span>
+        {/* 主体与操作行分家：操作行交给 DialogFooter（它自带 px-6 py-4），
+            否则按钮会直接贴着弹窗底边（24px 圆角下显得很挤）。 */}
+        <DialogBody className="max-h-[min(640px,calc(100dvh-12rem))]">
+          <div className="space-y-3 px-6 pb-2">
+            {/* 账号身份：昵称会重复（同名号更常见），uid 才是唯一标识 */}
+            <div className="rounded-xl bg-muted px-3 py-2 text-[11px] text-muted-foreground">
+              <div className="truncate text-foreground">
+                {account?.nickname || t('accounts.unnamed')}
+              </div>
+              <div className="truncate font-mono">{uid}</div>
             </div>
-            <p className="text-[13px] leading-relaxed text-muted-foreground">
-              {/* 译文里用 ** 标重点（项目约定），由 RichText 渲染成 <b> */}
-              <RichText text={t('tasks.runFullConfirmBody')} />
-            </p>
-            <div className="flex justify-end gap-2">
+
+            {confirmFull ? (
+              /* 做任务前的二次确认：把「会发生什么」写清楚，再让人点。
+                 与 TaskRunnerPanel 用同一套文案（tasks.runFullConfirm*）。 */
+              <>
+                <div className="flex items-start gap-2 rounded-xl bg-amber-500/10 px-3 py-2">
+                  <TriangleAlert className="mt-0.5 size-3.5 shrink-0 text-amber-500" />
+                  <span className="text-[13px] font-medium">{t('tasks.runFullConfirmTitle')}</span>
+                </div>
+                <p className="text-[13px] leading-relaxed text-muted-foreground">
+                  {/* 译文里用 ** 标重点（项目约定），由 RichText 渲染成 <b> */}
+                  <RichText text={t('tasks.runFullConfirmBody')} />
+                </p>
+              </>
+            ) : (
+              <>
+                <p className="text-[11px] leading-relaxed text-muted-foreground">
+                  {t('accounts.taskRunDesc')}
+                </p>
+
+                {/* 跑的是别的任务：说清「谁在跑」，否则用户会以为自己的点击没生效 */}
+                {runningOther && (
+                  <div className="flex items-start gap-2 rounded-xl bg-muted px-3 py-2">
+                    <TriangleAlert className="mt-0.5 size-3.5 shrink-0 text-amber-500" />
+                    <span className="text-[11px] leading-relaxed text-muted-foreground">
+                      {t('accounts.taskRunBusyOther', {target: otherLabel})}
+                    </span>
+                  </div>
+                )}
+
+                {/* 脚本不可用时说清原因与做法（而不是给一堆点了没反应的按钮） */}
+                {unavailable && (
+                  <div className="flex items-start gap-2 rounded-xl bg-muted px-3 py-2">
+                    <TriangleAlert className="mt-0.5 size-3.5 shrink-0 text-amber-500" />
+                    {/* whitespace-pre-line：这段说明是分条的（两种部署形态各一条修法） */}
+                    <span className="text-[11px] leading-relaxed whitespace-pre-line text-muted-foreground">
+                      {status?.unavailable_reason}
+                    </span>
+                  </div>
+                )}
+
+                {/* 输出回显：脚本按行打印进度，单账号也要能看到「跑到哪了」 */}
+                {status && status.lines.length > 0 && (
+                  <div className="max-h-[220px] overflow-auto rounded-xl bg-muted/60 p-3">
+                    <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-foreground/80">
+                      {/* 回显的是上游脚本的原始 stdout（写死中文），译文只在展示层
+                          按模板逐行替换 —— 详见 lib/i18n/taskrun.ts。 */}
+                      {status.lines.map((l) => translateRunLine(l)).join('\n')}
+                    </pre>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        </DialogBody>
+
+        {/* 二次确认时换成「取消 / 继续」；平时是左对齐的操作条（预览 / 领奖 / 做任务） */}
+        <DialogFooter className={confirmFull ? undefined : 'flex-wrap justify-start'}>
+          {confirmFull ? (
+            <>
               <Button variant="ghost" size="sm" className="rounded-full"
                       onClick={() => setConfirmFull(false)}>
                 {t('common.cancel')}
@@ -183,36 +235,9 @@ export function AccountTaskDialog({
                       }}>
                 {t('tasks.runFullConfirmOk')}
               </Button>
-            </div>
-          </div>
-        ) : (
-          <>
-            <p className="text-[11px] leading-relaxed text-muted-foreground">
-              {t('accounts.taskRunDesc')}
-            </p>
-
-            {/* 跑的是别的任务：说清「谁在跑」，否则用户会以为自己的点击没生效 */}
-            {runningOther && (
-              <div className="flex items-start gap-2 rounded-xl bg-muted px-3 py-2">
-                <TriangleAlert className="mt-0.5 size-3.5 shrink-0 text-amber-500" />
-                <span className="text-[11px] leading-relaxed text-muted-foreground">
-                  {t('accounts.taskRunBusyOther', {target: otherLabel})}
-                </span>
-              </div>
-            )}
-
-            {/* 脚本不可用时说清原因与做法（而不是给一堆点了没反应的按钮） */}
-            {unavailable && (
-              <div className="flex items-start gap-2 rounded-xl bg-muted px-3 py-2">
-                <TriangleAlert className="mt-0.5 size-3.5 shrink-0 text-amber-500" />
-                {/* whitespace-pre-line：这段说明是分条的（两种部署形态各一条修法） */}
-                <span className="text-[11px] leading-relaxed whitespace-pre-line text-muted-foreground">
-                  {status?.unavailable_reason}
-                </span>
-              </div>
-            )}
-
-            <div className="flex flex-wrap items-center gap-2">
+            </>
+          ) : (
+            <>
               {/* 预览：只读，无风险 */}
               <Button variant="ghost" size="sm" className="h-8 rounded-full"
                       disabled={busy || running || !!unavailable}
@@ -245,20 +270,9 @@ export function AccountTaskDialog({
                   {t('tasks.runStop')}
                 </Button>
               )}
-            </div>
-
-            {/* 输出回显：脚本按行打印进度，单账号也要能看到「跑到哪了」 */}
-            {status && status.lines.length > 0 && (
-              <div className="max-h-[220px] overflow-auto rounded-xl bg-muted/60 p-3">
-                <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-foreground/80">
-                  {/* 回显的是上游脚本的原始 stdout（写死中文），译文只在展示层
-                      按模板逐行替换 —— 详见 lib/i18n/taskrun.ts。 */}
-                  {status.lines.map((l) => translateRunLine(l)).join('\n')}
-                </pre>
-              </div>
-            )}
-          </>
-        )}
+            </>
+          )}
+        </DialogFooter>
       </DialogContent>
     </Dialog>
   );

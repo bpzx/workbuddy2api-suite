@@ -152,12 +152,18 @@ def main() -> int:
     group_auths.mkdir(parents=True)
     write_auth(default_auths, UID_A1, '默认一号', 1000)
     write_auth(default_auths, UID_A2, '默认二号', 2000)
+    # 健康快照只画前 9 条：这里多铺 6 个号（合计 11），用来验「查看全部账号」入口
+    for i in range(3, 9):
+        write_auth(default_auths, f'dg000000-0000-0000-0000-0000000000a{i}', f'默认{i}号', 1000)
     write_auth(group_auths, UID_B1, '乙组一号', 3000)
     write_auth(group_auths, UID_B2, '乙组二号', 4000)
     write_auth(group_auths, UID_B3, '乙组三号', 5000)
 
+    default_uids = [UID_A1, UID_A2] + [f'dg000000-0000-0000-0000-0000000000a{i}' for i in range(3, 9)]
     up1 = ThreadingHTTPServer(('127.0.0.1', DEFAULT_UP_PORT),
-                              make_upstream([UID_A1, UID_A2], ['默认一号', '默认二号'], 1000))
+                              make_upstream(default_uids,
+                                            ['默认一号', '默认二号'] + [f'默认{i}号' for i in range(3, 9)],
+                                            1000))
     up2 = ThreadingHTTPServer(('127.0.0.1', GROUP_UP_PORT),
                               make_upstream([UID_B1, UID_B2, UID_B3],
                                             ['乙组一号', '乙组二号', '乙组三号'], 3000))
@@ -187,7 +193,7 @@ def main() -> int:
          f'uvicorn.run(server.main.app, host="127.0.0.1", port={MANAGER_PORT}, log_level="warning")'],
         cwd=str(REPO), env=env)
     base = f'http://127.0.0.1:{MANAGER_PORT}'
-    print(f'管理端: {base}（静态产物：{static_dir.name}/，默认分组 2 个号 + 乙组 3 个号）')
+    print(f'管理端: {base}（静态产物：{static_dir.name}/，默认分组 8 个号 + 乙组 3 个号）')
     try:
         for _ in range(60):
             try:
