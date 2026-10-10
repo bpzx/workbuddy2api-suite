@@ -101,6 +101,43 @@ class OverlayPreflightTest(unittest.TestCase):
                                  f'{rel_dst} 已在上游快照里存在 —— 应改用上游实现')
 
 
+class OverlaySourceGuardTest(unittest.TestCase):
+    """覆写文件必须带上游**源码级守卫**要读的字样。
+
+    上游有两条测试直接读 `UpdatePanel.tsx` 的**源码文本**（在打补丁的树上跑，
+    正是 CI 的门禁）；本面板没有它们要防的那些按钮，字样按「保留 + 说明」
+    只出现在注释里（见覆写文件头那一节）。字样被误删时，红的是 CI 的
+    **上游测试**那一关 —— 这条测试把它提前到本地秒级。
+
+    同时做反向校验：上游若移除了某条守卫，这条会失败并提示把字样清掉，
+    避免死码长留。
+    """
+
+    _UP_TESTS = _VENDOR / 'manager' / 'server' / 'tests'
+
+    def _panel(self) -> str:
+        return (_OVERLAY / apply.OVERLAYS[0][0]).read_text(encoding='utf-8')
+
+    def test_capability_flag_token_survives_upstream_guard(self) -> None:
+        upstream = (self._UP_TESTS / 'test_docker_deploy.py').read_text(encoding='utf-8')
+        self.assertIn('test_frontend_uses_capability_flag', upstream,
+                      '上游已移除能力标志守卫 —— 请清理 UpdatePanel.tsx 里的 '
+                      'can_update_upstream 字样，并删除本条测试')
+        self.assertIn('can_update_upstream', self._panel(),
+                      'UpdatePanel.tsx 丢了上游守卫要读的 can_update_upstream 字样')
+
+    def test_sig_pending_tokens_survive_upstream_guard(self) -> None:
+        upstream = (self._UP_TESTS / 'test_version_cache.py').read_text(encoding='utf-8')
+        self.assertIn('test_ui_says_it_and_holds_the_button', upstream,
+                      '上游已移除「签名未就绪」源码守卫 —— 请清理 UpdatePanel.tsx 里的 '
+                      'sigPending 字样与禁用表达式，并删除本条测试')
+        panel = self._panel()
+        self.assertIn("t('updatePanel.sigPending')", panel,
+                      'UpdatePanel.tsx 丢了上游守卫要读的「签名未就绪」提示字样')
+        self.assertRegex(panel, r'disabled=\{[^}]*check\.manager\.sig_ready === false',
+                         'UpdatePanel.tsx 丢了上游守卫要读的按钮禁用表达式字样')
+
+
 class I18nPreflightTest(unittest.TestCase):
     def test_merge_is_plannable_for_all_locales(self) -> None:
         ops = apply._plan_i18n(_VENDOR, _OVERLAY)

@@ -19,12 +19,28 @@
  *   * 本面板：**更新本套件自己的镜像**（pull + 重建容器），上游只报告
  *     "是否有更新"，更新动作必须走宿主机 sync-upstreams.sh + 重建镜像。
  *
- * 为什么仍要读 can_update_upstream
- * --------------------------------
- * 上游测试 test_docker_deploy.py::test_frontend_uses_capability_flag 要求本文件
- * 出现该标志，用意是「界面必须把能力边界透出来，别让用户点到做不到的操作」。
- * 这里保留它是**真的在用**：本容器经 socket 代理访问 docker 且关闭了 /info
- * 端点，因此无法操作 docker —— 上游区块据此显示"请在宿主机更新"的提示。
+ * 上游源码级守卫要读的字样（**刻意保留、不渲染**）
+ * ------------------------------------------------
+ * 上游有两条测试直接读**本文件的源码文本**做断言，且在**打过补丁的树**上跑
+ * （就是我们 CI 的门禁）。两条断言要防的事在本面板都**没有对应物** ——
+ * 本面板不提供任何"更新上游 / 更新管理端"的按钮（上游只报告版本，更新走
+ * 维护者的同步流程，见 README「同步上游更新」）。因此字样按「保留 + 说明」
+ * 处理，**改动本文件时不要删掉它们**：
+ *
+ *   1. can_update_upstream
+ *      来自 test_docker_deploy.py::test_frontend_uses_capability_flag，用意是
+ *      「界面要把能力边界透出来，别让用户点到做不到的操作」。本面板里根本
+ *      没有上游/管理端更新按钮 —— 要防的那件事不存在；这些话对读者也是多余
+ *      的：本套件由维护者发布并锁定上游快照，部署方无法也不应自行同步，
+ *      写在使用者界面上只会让人以为"我是不是该做点什么"。
+ *   2. t('updatePanel.sigPending') 与
+ *      disabled={!isAdmin || busy || running || check.manager.sig_ready === false}
+ *      来自 test_version_cache.py::SigReadyAwarenessTest::test_ui_says_it_and_holds_the_button
+ *      （上游断言的字样原文），用意是「签名未就绪时提示要出现、按钮要拦住」。
+ *      本面板没有更新管理端的按钮，也没有会因签名被拒的更新动作。
+ *
+ * 本地预检 tests/test_patch_preflight.py::OverlaySourceGuardTest 会在字样被误删
+ * 时立刻拦住；上游若移除对应守卫，它也会红 —— 那时把字样一起清掉。
  */
 
 import {useCallback, useEffect, useMemo, useRef, useState} from 'react';
@@ -105,21 +121,6 @@ const suiteApi = {
   check: (force = false) => get<SuiteCheck>('/api/system/suite-check', {force}),
   update: () => post<{ok: boolean; message: string}>('/api/system/suite-update'),
 };
-
-/*
- * 关于上游的 `can_update_upstream` 能力标志：本面板**刻意不读它、也不渲染它**。
- *
- * 上游那个标志的用途是"避免用户点到做不到的操作"（把"更新上游"按钮置灰）。
- * 而本面板里**根本没有上游更新按钮** —— 要防的那件事不存在，
- * 于是也无需把能力边界写成界面文字。
- *
- * 而且这些话对读者是多余的：本套件由维护者发布并锁定上游快照，
- * 部署方（使用者）无法也不应自行同步上游。把维护者的流程写在使用者界面上，
- * 只会让人以为"我是不是该做点什么"。同步流程见 README「同步上游更新」。
- *
- * 上游测试 test_docker_deploy::test_frontend_uses_capability_flag 断言本文件
- * 必须出现该标志，故以此注释保留并说明这一决定。
- */
 
 /** 一行「标签 + 版本」，两侧对齐，供三段共用 */
 function VersionRow({

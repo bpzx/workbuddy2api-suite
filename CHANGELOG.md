@@ -50,18 +50,26 @@
   移到 `_build_client()`：事件循环内外的两条路径（池未命中 / 循环外即用即弃）
   都经过它，还顺带覆盖上游同轮新增的**按账号代理** —— 只要配了代理
   （`WB_HTTP_PROXY` 或账号绑定线路），内网（`wb2api:7863`、`dockerproxy`）
-  就直连。预检测试在同步后立刻变红、改锚点后 13 项全绿。
+  就直连。预检测试在同步后立刻变红、改锚点后预检全绿。
 - `UpdatePanel.tsx`（覆写目标）上游新增「签名未就绪」提示 + 按钮禁用
   （`sig_ready`，issue #127/#129）。**没有搬**，判定依据仍是"对应物不存在"：
-  我们面板的 manager 区块只报告、无更新按钮。已登记进 UPSTREAMS.md「覆写登记」。
+  我们面板的 manager 区块只报告、无更新按钮。**但上游同轮给它加了一条源码级
+  守卫**（`test_version_cache.py::SigReadyAwarenessTest` 直接读该文件文本，要求
+  出现提示与禁用表达式两处字样）—— 在打补丁的树上必红，首次推送的 CI 就红在
+  这里。处理：按 `can_update_upstream` 先例在覆写文件里保留字样并注明原因；
+  新增 `tests/test_patch_preflight.py::OverlaySourceGuardTest` 把这类"上游守卫
+  要读的字样"提前到本地预检（含反向校验：上游移除守卫时会提示清理），
+  `build.yml` 补了两条对应的落位断言。已登记进 UPSTREAMS.md「覆写登记」。
 - `server/services/updater.py` 新增 `sig_ready` 字段属**读取端**（上游自己的
   check-update 端点），**状态 JSON 口径未变**，`docker/stub/update.py` 无需调整。
 - `config.example.json` 未变动；**新增环境变量**仅 `WB_DEFAULT_ACCOUNT_PROXY`。
 
-**验证**：上游 Python 全套 **2091** 项（4 个错误仍是那批 Windows 专有的迁移用例
-`tearDown` 清理临时目录报 `NotADirectoryError`，断言本身通过，与上一轮完全同型）；
-前端静态导出编译通过；本项目 **131** 项 + 预检 **13** 项全绿（本项目测试按
-MAINTAINING.md 的完整跑法在**打过补丁的副本**上执行，`apply.py` 22 处改动全部落位）。
+**验证**：上游 Python 全套 **2091** 项在**打过补丁的副本**上 0 失败（4 个错误仍是
+那批 Windows 专有的迁移用例 `tearDown` 清理临时目录报 `NotADirectoryError`，
+断言本身通过，与上一轮完全同型）；前端静态导出编译通过；本项目 **133** 项全绿
+（含预检 **15** 项；`apply.py` 的全部改动落位）。教训一条：本轮最初把上游全套跑在
+**未打补丁**的 vendor 上，恰好漏掉上面那条源码级守卫 —— MAINTAINING.md 的自检
+命令已改为与 CI 一致的"打补丁副本"跑法。
 
 ### 变更：启动时同步 config.json 的**键集**（不再只补不删）
 

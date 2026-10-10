@@ -149,38 +149,43 @@ git pull
 镜像由 GitHub Actions 构建并推送到 ghcr.io（`.github/workflows/build.yml`），
 本地开发机**不需要** Go / Node 工具链来部署。
 
-CI 的 `verify` 作业在构建前跑三道测试 + 补丁落位断言：
+CI 的 `verify` 作业在构建前跑补丁落位断言（`grep` 那批）+ 三道测试，
+**全部在打过补丁的副本上** —— 镜像里跑的就是这份代码；在 `vendor/` 原树上
+跑这些测试等于跳过了补丁 / 覆写本身带来的问题。
+
+**⚠️ 为什么必须用打补丁的副本**：上游有若干**源码级守卫**直接读打补丁后的文件
+（如 `test_version_cache.py::SigReadyAwarenessTest` 读整文件覆写的
+`UpdatePanel.tsx` 源码文本，`test_docker_deploy.py::test_frontend_uses_capability_flag`
+读其中的能力标志）。在原树上跑，这些守卫看不见覆写文件的结果，**红会在 CI 才
+出现** —— 本项目真实踩过一次，见 CHANGELOG「同步上游：manager v1.0.76 → v1.0.80」。
 
 ```bash
+# 先备好打补丁的副本
+rm -rf /tmp/patched && mkdir -p /tmp/patched
+cp -r vendor/wb2api vendor/manager /tmp/patched/
+python docker/patches/apply.py /tmp/patched
+
 # Go（注意固定 TZ：上游 cmd/stats 的测试把期望值硬编码成了 UTC+8）
-cd vendor/wb2api && TZ=Asia/Shanghai go build ./... && TZ=Asia/Shanghai go vet ./... && TZ=Asia/Shanghai go test ./...
+cd /tmp/patched/wb2api && TZ=Asia/Shanghai go build ./... && TZ=Asia/Shanghai go vet ./... && TZ=Asia/Shanghai go test ./...
 
 # Python（上游全套；data/ 是某个测试预设的"已安装"布局，需先建好）
-cd vendor/manager && mkdir -p data && python -m unittest discover -s server/tests -t .
+cd /tmp/patched/manager && mkdir -p data && python -m unittest discover -s server/tests -t .
 
-# 前端静态导出
-cd vendor/manager/web && npm ci && npm run build:export
+# 前端静态导出（必须构建补丁后的树：覆写面板与新 i18n 文案都在里面）
+cd /tmp/patched/manager/web && npm ci && npm run build:export
 ```
 
 **本项目自己的测试**（版本语义、更新服务鉴权、状态契约、构建期改动预检、
 配置模板与启动时的键集同步等）：
 
 ```bash
-python -m unittest discover -s tests -t tests
+PYTHONPATH=/tmp/patched/manager python -m unittest discover -s tests -t tests
 ```
 
-> 其中 `test_suite_service.py` 与 `test_suite_updater.py` 里的 `server.*`、
-> `docker/overlay/*` 导入的是**打过补丁的树**，因此完整跑法要先把补丁应用到一份
-> 副本再设 `PYTHONPATH`：
->
-> ```bash
-> cp -r vendor/wb2api vendor/manager /tmp/patched/
-> python docker/patches/apply.py /tmp/patched
-> PYTHONPATH=/tmp/patched/manager python -m unittest discover -s tests -t tests
-> ```
->
-> 只读原始 vendor 的那部分（`test_patch_preflight.py`、`test_config_template.py`）
-> 不受影响，可直接在仓库根跑。
+> `test_suite_service.py` 与 `test_suite_updater.py` 里的 `server.*`、
+> `docker/overlay/*` 导入的是**打过补丁的树**，所以统一带 `PYTHONPATH`
+> （与 CI 的跑法一致）；只读原始 vendor 的 `test_patch_preflight.py`、
+> `test_config_template.py` 不需要它，带着也无害。
 
 CI 里 `test_docker_deploy::test_missing_compose_raises_actionable_error` 需要
 先 `mkdir -p data`，原因是它预设了"已安装"的目录布局而上游仓库并不跟踪 `data/`

@@ -53,6 +53,12 @@
 >    按钮禁用（`sig_ready === false`，issue #127/#129）。**没有搬**，判定依据
 >    仍是"对应物不存在"：我们面板的 manager 区块**只报告、无更新按钮**，
 >    "签名未就绪时收起按钮"在我们这里没有可作用的对象。
+>    **但上游同轮给它加了源码级守卫**（`test_version_cache.py::SigReadyAwarenessTest`
+>    直接读该文件的**文本**，要求出现提示与禁用表达式两处字样）—— 这在打补丁的
+>    树上是必红的（首次 CI 就红在这里）。处理：按 `can_update_upstream` 的先例
+>    **在覆写文件里保留字样**（只在注释里，并注明不渲染的原因），新增
+>    `tests/test_patch_preflight.py::OverlaySourceGuardTest` 把这类"上游守卫要读的
+>    字样"提前到本地预检，`build.yml` 补了对应的落位断言。
 > 3. `server/services/updater.py` 新增 `sig_ready` 字段并给 `_gh_get` 加了 token
 >    认证 —— 这是**读取端**（上游自己的 `/api/system/check-update`，本套件面板
 >    已不调用）；**状态 JSON 的读取口径未变**，`docker/stub/update.py` 无需调整。
@@ -235,6 +241,12 @@ internal/prompt/prompt.go:17:12: pattern defaultprompt.md: no matching files fou
 > 仍**没有搬**：我们面板的 manager 区块**只报告、无更新按钮**，"签名未就绪时
 > 把按钮收起来"在我们这里没有可作用的对象。（读取端 `updater.py` 的 `sig_ready`
 > 字段照旧流入上游自己的 check-update 端点，本套件面板不消费它。）
+>
+> 这一轮还多了个新情况：上游同时加了**源码级守卫**直接读覆写文件的文本，
+> 所以"不搬行为"之外还得**保留字样**（与 `can_update_upstream` 同一处理）。
+> 由此登记一条新的代价形态：**上游给覆写文件加源码级守卫时，红只在打补丁的
+> 树上出现（本地跑未打补丁的 vendor 看不见），必须在字样层回应。**守卫要读的
+> 字样清单登记在面板文件头，`OverlaySourceGuardTest` 本地把关。
 
 同时 `docker/overlay/` 还含两处**新增**文件（上游没有，不冲突）：
 `server/services/suite.py`（版本比对与更新触发）与 `server/routers/suite.py`（三个端点）。
@@ -244,9 +256,19 @@ CI 会用**正向断言**检查它们确实落位（`build.yml`）。
 `config_merge.py`、`check_device_token.py` —— 它们不落进 manager 包，由 Dockerfile
 拷进 `/opt/suite/`，与上游代码不构成覆盖关系。）
 
-> 覆写 `UpdatePanel.tsx` 时必须保留 `can_update_upstream` 字样：上游
-> `test_docker_deploy.py::test_frontend_uses_capability_flag` 断言本文件要透出
-> 该能力标志。新版面板确实在用它（上游区块据此显示"请在宿主机更新"）。
+> **覆写文件里有两处「上游源码级守卫要读的字样」，改面板时不要删**（都只在
+> 注释里保留、本面板不渲染，原因见面板文件头与各自说明）：
+>
+> 1. `can_update_upstream` —— 上游 `test_docker_deploy.py::test_frontend_uses_capability_flag`
+>    断言本文件要透出该能力标志（用意"别让用户点到做不到的操作"；本面板里
+>    那类按钮不存在，字样只作登记）。
+> 2. `t('updatePanel.sigPending')` 与 `disabled={… check.manager.sig_ready === false …}`
+>    —— 上游 `test_version_cache.py::SigReadyAwarenessTest::test_ui_says_it_and_holds_the_button`
+>    断言（用意"签名未就绪时提示要出现、按钮要拦住"；本面板没有更新管理端的按钮）。
+>
+> 两条都由 `tests/test_patch_preflight.py::OverlaySourceGuardTest` 在本地把关
+> （含反向校验：上游移除守卫时会红，提示把字样一起清掉），`build.yml` 里也有
+> 对应的落位断言。
 
 ### 曾经打过、现已删除的补丁（重要教训）
 
@@ -266,8 +288,8 @@ CI 会用**正向断言**检查它们确实落位（`build.yml`）。
 > **后续变化（勿与上面的历史混淆）**：本发行版后来**整文件覆写**了更新面板，
 > 换成「本套件 + 两个上游」三段式，并新增了套件一键更新。因此上面"界面会自动
 > 禁用更新按钮"描述的是**当时**的行为 —— 现在上游那套「3 个更新目标」的按钮
-> 已经不在我们的面板里了，但 `can_update_upstream` 判定仍被读来显示能力边界
-> （上游测试也要求该标志存在）。见上面的「覆写登记」。
+> 已经不在我们的面板里了：`can_update_upstream` 只按"上游源码级守卫"的要求
+> 在注释里保留字样（本面板不读、不渲染）。见上面的「覆写登记」。
 
 > **教训：不要为"文案更准确"维护构建期补丁。**
 > 上游一旦重构就会失效，而构建失败比文案不准更烦人。
@@ -351,7 +373,9 @@ if !strings.Contains(frame[0], "自 09-14 20:43")   // 期望：UTC+8 渲染
 - **覆写过的文件要人工复核**：`UpdatePanel.tsx` 我们已经整文件替换，
   上游对这个文件的改进**不会自动流进来**。同步上游后建议看一眼
   `git log -p <old>..<new> -- web/components/common/settings/UpdatePanel.tsx`，
-  判断有没有值得搬过来的改动。
+  判断有没有值得搬过来的改动；**并留意上游是否新增/改了读这个文件的源码级
+  守卫**（`grep -rn UpdatePanel server/tests/` —— 那类红只在打补丁的树上出现，
+  `OverlaySourceGuardTest` 会提示字样清单）。
   （`deploy/update.py` 也是覆写，但那里的复核只关心**读取端契约**，见「覆写登记」。）
 - **上游新增依赖 docker 的能力时，先分清是哪一类**：本套件的 manager **不挂
   socket**，而是走 `dockerproxy`（`DOCKER_HOST=tcp://dockerproxy:2375`，

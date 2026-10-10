@@ -87,6 +87,13 @@ jobs:
           # 必须出现该标志（用意：界面要把能力边界透出来）。覆写时丢掉它会让 CI 红。
           grep -q "can_update_upstream" "$PANEL" \
             || { echo "::error::更新面板丢了 can_update_upstream 能力标志"; exit 1; }
+          # 上游 test_version_cache::SigReadyAwarenessTest 同理直接读本文件：
+          # 要求出现「签名未就绪」提示与按钮禁用表达式两处字样（本面板无对应
+          # 按钮，字样只在注释里保留 —— 见文件头「上游源码级守卫」一节）。
+          grep -q "updatePanel.sigPending" "$PANEL" \
+            || { echo "::error::更新面板丢了 sigPending 提示字样"; exit 1; }
+          grep -q "check.manager.sig_ready === false" "$PANEL" \
+            || { echo "::error::更新面板丢了 sig_ready 禁用表达式字样"; exit 1; }
           for f in server/services/suite.py server/routers/suite.py; do
             test -f "/tmp/patched/manager/$f" \
               || { echo "::error::套件更新后端缺失：$f"; exit 1; }
