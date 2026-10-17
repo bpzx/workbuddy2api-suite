@@ -19,6 +19,17 @@
 
 ## [未发布]
 
+### 修复：tag 构建因 Google Fonts 拉取偶发抖动而假红
+
+v0.2.12 首次 tag 构建红在 `build` 作业的 `npm run build:export`（Dockerfile
+web 阶段）—— `next/font/google`（Inter + Noto Sans SC）在构建期要拉
+Google Fonts，GitHub runner 偶发连不上 `fonts.gstatic.com`；rerun 即过，
+属网络抖动而非代码问题（本地复验也撞到过一次同型失败）。
+
+处理：Dockerfile web 阶段与 CI verify 的前端步骤都改为**自动重试 3 次**
+（间隔 2 秒，失败大多第二次就过），不再依赖人工 rerun。3 次都失败仍如实
+报错退出。重试循环的 shell 逻辑已用假命令与真构建分别验证。
+
 ### 同步上游：manager v1.0.91 → v1.0.97（单提交，风控修复）
 
 `a2c78f9` → `9cb188f`（10 文件 / +773 −25）。wb2api 侧无可同步目标。

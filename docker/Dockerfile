@@ -47,8 +47,17 @@ RUN npm ci
 # 在 vpatch 阶段落位，从构建上下文拷会丢掉它们 —— 界面会退回上游的
 # 「3 个更新目标」旧面板，且缺少本套件区块的文案。
 COPY --from=vpatch /src/vendor/manager/web/ ./
-RUN npm run build:export \
- && test -f out/index.html
+# ⚠️ 构建期联网点：next/font/google 要拉 Google Fonts（Inter + Noto Sans SC），
+# GitHub runner 偶发连不上 fonts.gstatic.com 导致**整个 tag 构建红一次**
+# （v0.2.12 首次构建实测，rerun 即过）。与其人工 rerun，这里自动重试 3 次：
+# 失败大多是瞬时网络抖动，第二次几乎总能过；3 次都挂才算真失败。
+RUN set -e; \
+    for i in 1 2 3; do \
+      if npm run build:export && test -f out/index.html; then exit 0; fi; \
+      echo "前端构建失败（第 ${i}/3 次）—— Google Fonts 拉取偶发抖动，2 秒后重试"; \
+      sleep 2; \
+    done; \
+    echo "前端构建连续 3 次失败" >&2; exit 1
 
 # ── 阶段 2：编译 wb2api 全部二进制 ────────────────────────
 FROM golang:1.23-alpine AS gobuild

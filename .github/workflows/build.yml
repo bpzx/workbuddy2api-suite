@@ -189,12 +189,20 @@ jobs:
       # 更新面板（整文件覆写）与新 i18n 文案都在补丁后的树里：构建未打补丁的树
       # 等于没有校验我们的 TSX —— 类型错误会一路漏到 Docker 构建才炸，
       # 而那时报错信息离原因更远。
+      #
+      # npm run build:export 在构建期要拉 Google Fonts（next/font/google，
+      # Inter + Noto Sans SC），偶发连不上 fonts.gstatic.com 会假红 ——
+      # 自动重试 3 次（与 docker/Dockerfile web 阶段同款），别再人工 rerun。
       - name: Frontend static export (patched)
         working-directory: /tmp/patched/manager/web
         run: |
-          npm ci
-          npm run build:export
-          test -f out/index.html
+          set -e
+          for i in 1 2 3; do
+            if npm run build:export && test -f out/index.html; then exit 0; fi
+            echo "前端构建失败（第 ${i}/3 次）—— Google Fonts 拉取偶发抖动，2 秒后重试"
+            sleep 2
+          done
+          echo "前端构建连续 3 次失败" >&2; exit 1
 
   # ── 构建并推送镜像 ────────────────────────────────────────
   build:
