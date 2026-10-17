@@ -10,6 +10,7 @@ import {intlLocale, t} from '@/lib/i18n';
 /** 秒级时长格式化：已过期 / 分钟 / 小时 / 天 */
 export function fmtRemain(seconds: number): string {
   if (seconds <= 0) return t('format.expired');
+  if (seconds >= 365 * 86400 * 5) return t('format.permanent');
   if (seconds < 3600) {
     const minutes = Math.floor(seconds / 60);
     return t('format.minutes', {count: minutes, n: minutes});

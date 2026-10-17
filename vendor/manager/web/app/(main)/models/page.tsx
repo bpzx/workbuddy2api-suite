@@ -189,11 +189,18 @@ export default function ModelsPage() {
     setQ('');
   }, [realm]);
 
-  /** 强制刷新：绕过服务端缓存重新拉一次（与首屏那次区分开，只有它才绕缓存） */
-  const refetch = useCallback(async () => {
+  /**
+   * 强制刷新：绕过服务端缓存重新拉一次（与首屏那次区分开，只有它才绕缓存）。
+   *
+   * **返回本次是否取到**，调用方据此提示成功还是失败。只能看返回值，不能写
+   * `.catch()`：`reload()` 内部已经把异常收进 `errors` 并返回布尔值，返回的
+   * Promise 永不 reject，靠 catch 判断失败的分支根本进不去——用户会永远看到
+   * 「正在拉取」，无论取到没取到。（同「密钥」页建完密钥后刷新的写法。）
+   */
+  const refetch = useCallback(async (): Promise<boolean> => {
     forceNext.current = true;
     try {
-      await reload();
+      return await reload();
     } finally {
       forceNext.current = false;
     }
@@ -249,9 +256,18 @@ export default function ModelsPage() {
             className="rounded-full"
             disabled={isRefreshing}
             title={t('models.refetchTitle')}
-            onClick={() => {
-              void refetch();
-              notify.info(t('models.refetching'));
+            onClick={async () => {
+              // 「进行中」那条提示在拿到结果后**换掉**，而不是留在屏幕上：原先只弹
+              // 这条、不看结果，无论成功失败都停在「正在重新拉取模型列表…」，用户
+              // 分不清是还在拉、拉到了、还是根本没拉到。
+              const pending = notify.info(t('models.refetching'));
+              const done = await refetch();
+              notify.dismiss(pending);
+              if (done) {
+                notify.ok(t('models.refetchDone'), t('models.refetchDoneHint'));
+              } else {
+                notify.err(t('models.refetchFailed'), t('models.refetchFailedHint'));
+              }
             }}
           >
             {isRefreshing ? <Loader2 className="animate-spin" /> : <RefreshCw />}

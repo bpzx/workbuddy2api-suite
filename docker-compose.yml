@@ -118,15 +118,23 @@ services:
       # ── 出口代理 ──
       # 用于 manager **直连腾讯**的那批请求（扫码登录、签到、查积分、
       # 国际版注册/trial）。支持 http:// 与 socks5://。
-      #   * socks5:// 需要 socksio —— 镜像已装 httpx[socks]，可直接用；
-      #   * 调自己上游 wb2api:7863 的请求**不会**走代理（由
-      #     docker/patches/apply.py 注入 mounts 保证），否则内网绕代理必失败；
+      #   * socks5:// 需要 socksio —— 上游 v1.0.91 起 requirements 已含
+      #     （httpx 的 socks extra），随 vendor 清单装入镜像；
+      #   * 调内网目标（wb2api:7863、dockerproxy）的请求**不会**走代理 ——
+      #     上游 v1.0.91 已内置该判定（_proxy_transport：内网/本机直连、
+      #     其余走代理，无需本套件补丁；见 UPSTREAMS.md 的登记）；
       #   * 留空 = 全部直连。
       WB_HTTP_PROXY: ${WB_HTTP_PROXY:-}
       # 可选：新账号扫码登录后**默认绑定**的代理线路名（上游 v1.0.77+ 新增，
       # WB_DEFAULT_ACCOUNT_PROXY）。线路在面板「设置 → 出口线路」维护（存于共享
       # config.json 的 proxies 段）；留空 = 新账号不自动绑定，沿用既有行为。
       WB_DEFAULT_ACCOUNT_PROXY: ${WB_DEFAULT_ACCOUNT_PROXY:-}
+      # 可选：上游"一键更新管理端"的**下载代理**（v1.0.85+ 新增，只认 http/https）。
+      # 对本套件如实说明：套件的「一键更新」更新的是**本套件镜像**（daemon 拉镜像
+      # 不走这个变量）；上游那条更新路径在本容器里本就不可用（无 docker 能力），
+      # 面板「设置 → 出口线路」里配的"更新代理"才是运行时等价物。透传它是为了
+      # 不出现"写进 .env、面板设置页却不显示"的静默断线（该页会展示此变量）。
+      WB_UPDATE_PROXY: ${WB_UPDATE_PROXY:-}
     volumes:
       # 与 wb2api 共用同一份数据目录（宿主机可见）
       - ${WB_DATA_PATH:-./data}:/data

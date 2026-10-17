@@ -56,10 +56,10 @@ jobs:
           # 补丁必须真的落到文件里，不能只"没报错"
           grep -q "Proxy: http.ProxyFromEnvironment" \
             /tmp/patched/wb2api/internal/upstream/transport.go \
-            || { echo "::error::补丁 2 未生效（transport.go 缺少 Proxy 字段）"; exit 1; }
-          grep -q "_internal_direct_mounts" \
-            /tmp/patched/manager/server/config.py \
-            || { echo "::error::补丁 1 未生效（config.py 缺少 mounts 逻辑）"; exit 1; }
+            || { echo "::error::补丁 1 未生效（transport.go 缺少 Proxy 字段）"; exit 1; }
+          # （原「补丁 2：manager 内网直连」的断言已随补丁一起删除 ——
+          #  上游 v1.0.91 用 _proxy_transport 自行实现了更完备的版本，
+          #  上游自己的测试盯着它；登记见 UPSTREAMS.md。）
 
           # 反向断言：更新器**不得**被补丁改动。
           # 上游已用 can_update_upstream 做能力驱动判定，我们改用上游的能力，
@@ -88,12 +88,13 @@ jobs:
           grep -q "can_update_upstream" "$PANEL" \
             || { echo "::error::更新面板丢了 can_update_upstream 能力标志"; exit 1; }
           # 上游 test_version_cache::SigReadyAwarenessTest 同理直接读本文件：
-          # 要求出现「签名未就绪」提示与按钮禁用表达式两处字样（本面板无对应
-          # 按钮，字样只在注释里保留 —— 见文件头「上游源码级守卫」一节）。
-          grep -q "updatePanel.sigPending" "$PANEL" \
-            || { echo "::error::更新面板丢了 sigPending 提示字样"; exit 1; }
-          grep -q "check.manager.sig_ready === false" "$PANEL" \
-            || { echo "::error::更新面板丢了 sig_ready 禁用表达式字样"; exit 1; }
+          # 要求出现「产物未就位」提示与按钮禁用表达式两处字样（本面板无对应
+          # 按钮，字样只在注释里保留 —— 见文件头「上游源码级守卫」一节。
+          # 注：v1.0.81~91 间字段由 sig_ready 更名 assets_ready）。
+          grep -q "updatePanel.assetsPending" "$PANEL" \
+            || { echo "::error::更新面板丢了 assetsPending 提示字样"; exit 1; }
+          grep -q "check.manager.assets_ready === false" "$PANEL" \
+            || { echo "::error::更新面板丢了 assets_ready 禁用表达式字样"; exit 1; }
           for f in server/services/suite.py server/routers/suite.py; do
             test -f "/tmp/patched/manager/$f" \
               || { echo "::error::套件更新后端缺失：$f"; exit 1; }

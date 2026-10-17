@@ -23,22 +23,55 @@
 | 上游 | 仓库 | 分支 | Commit | 提交时间 | 快照位置 |
 |---|---|---|---|---|---|
 | wb2api | `Sliverkiss/workbuddy2api` ⚠️ **已删除** | `master` | `d1023f3` | 2026-09-21 09:52 | `vendor/wb2api` |
-| manager | [ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) | `main` | [`86f2dc1`](https://github.com/ithtelab/workbuddy-manager/commit/86f2dc1) | 2026-10-08 12:51 | `vendor/manager` |
+| manager | [ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) | `main` | [`a2c78f9`](https://github.com/ithtelab/workbuddy-manager/commit/a2c78f9) | 2026-10-16 23:35 | `vendor/manager` |
 
 > wb2api 那一行**不再有可点的链接**：仓库已 404（见下节）。
 > 它是**我们开始自行维护时的起点**，不是"待同步的目标"。
 
 - wb2api：`Merge pull request #184 from .../fix/image-url-`（+764/−21，15 个文件）
   含图片 URL 修复、积分口径、成长任务链、WAF 403 处理等
-- manager：`fix(http): 借来的客户端不许被 aclose 真关（#144 自查发现的并发隐患）`
-  （126 文件 / +5317 −504）
-  **面板显示版本 v1.0.80**；期间跨 **4 个发版**（v1.0.77~v1.0.80）：**按账号绑定
-  命名出口代理线路**（新增 `WB_DEFAULT_ACCOUNT_PROXY`：新账号默认绑定的线路名）、
-  **账号导入/导出**（审计留痕、禁止缓存、导出前二次确认）、**出站客户端池化复用**
-  （issue #144，Windows 上每次新建 httpx 客户端 ~1 秒正是页面切换的耗时）、
-  **一键更新 GitHub API 限流回退**（`WB_GITHUB_TOKEN`/`GITHUB_TOKEN` 认证 +
-  「签名未就绪」短缓存，修 403 中断）、Redis 测试连接按 RESP 真 PING、
-  昵称带 emoji 不再让成长任务全挂（Windows）、失败提示不再断在冒号上。
+- manager：`fix: 随包上游源码行尾归一（CRLF → LF），修「更新后脚本类功能失效」(#202)`
+  （204 文件 / +25330 −3923）
+  **面板显示版本 v1.0.91**；期间跨 **11 个发版**（v1.0.81~v1.0.91）：**代理改为
+  「代理池」方案**（池开关、优先级/轮询/随机/最少调用策略、线路权重与启用开关、
+  一个账号最多绑一条线路、`{account}` 线路继续有效、SOCKS5 支持 —— `socksio`
+  随 vendor requirements 装入）、**内网/本机自动直连**（`_proxy_transport` +
+  `_is_internal_host`，见下面补丁 1 的结局）、**账号页强制冷却**（可选时长含
+  永久档）、积分红包限定模型、密钥自查用量、已登记积分只读查询、白名单从清单
+  选择、活动补偿自动领取（默认不自动跑，主打「立即执行」）、网关钳制越界
+  `max_tokens`（修被上游包成 503）、413/502 报错说清「上限由谁定」「打的是哪个
+  地址是否走代理」、首次登录初始密码不再找不到、每日任务随机延后与账号错峰、
+  Codex 工具发现/进度顺序/流末尾用量补齐、导入提示说人话+覆盖导入保留线路绑定+
+  导出包去重、出站补齐会话头族（修「部分账号经面板必失败」）、扫码登录失败给
+  可执行原因、新增 Windows 安装器（C# launcher）、README 精简成落地页、
+  随包上游源码行尾归一（修 #202）。
+
+> **本次同步（v1.0.80 → v1.0.91）值得记住的**：
+>
+> 1. **补丁 1 走完了它的生命周期：上游实现得更好，整组删除**。上游
+>    `_build_client()` 把 `kwargs['proxy']` 换成了
+>    `kwargs['transport'] = _proxy_transport(proxy)` —— 一个
+>    `_DirectForInternalTransport`：`_is_internal_host()` 判定**内网/本机目标
+>    （容器单标签、host.docker.*、私网/回环/链路本地/保留段）直连、其余走代理**。
+>    覆盖面比我们的 URL 前缀 `mounts` 更广（它认私网段，我们只认写死的前缀），
+>    且天然覆盖按账号线路。**这是本项目第一次因"上游做得更好"而删补丁**
+>    （此前 4 次都是锚点失效后搬家）。预检里保留
+>    `test_manager_internal_direct_is_upstream_now`：上游若回退该实现会立刻红。
+> 2. **源码级守卫的字样跟着上游改了名**：`sig_ready` → `assets_ready`、
+>    `sigPending` → `assetsPending`（守卫类名未变，仍是
+>    `SigReadyAwarenessTest::test_ui_says_it_and_holds_the_button`）。
+>    覆写面板头注释、`OverlaySourceGuardTest`、`build.yml` 的落位断言三处
+>    同步改名 —— 上次同步新加的这套机制正好在本轮派上了用场（本地预检秒级
+>    发现，而不是等 CI）。
+> 3. **补丁 3（注册套件路由）的导入块锚点第六次搬家**：上游新增 `proxies` 路由
+>    且插在第三行行首。老规矩：锚点照抄新的收尾两行，不凭记忆手写。
+> 4. **新增环境变量 `WB_UPDATE_PROXY`**（上游"更新管理端"的下载代理，只认
+>    http/https）。对本套件如实说明：套件的「一键更新」更新的是**套件镜像**
+>    （daemon 拉镜像不走它），上游那条更新路径在本容器里本就不可用；透传它是
+>    为了面板设置页（`proxies.py` 会展示它）不出现"写进 .env 却不显示"的静默断线。
+> 5. `updater.py` 状态 JSON 字段口径**未变**（新增的只有 `PACKAGE_FILE.unlink`），
+>    `docker/stub/update.py` 无需调整；`config.example.json` 未变动。
+>    `server/requirements.txt` 新增 `socksio>=1.0.0`（随 vendor 清单装入镜像）。
 
 > **本次同步（v1.0.76 → v1.0.80）值得记住的**：
 >
@@ -96,8 +129,8 @@
 
 **因此这条界线变了**：以前"`vendor/` 一字不改 + 构建期补丁"是为了保持可同步；
 现在上游没了，补丁实际上是**永久本地改动**。当前仍走补丁机制（改动集中、
-可在 `apply.py` 一处审计），其中已有 4 组补丁属于**上游从未有过的本地风控加固**
-（见「构建期补丁登记」的补丁 5~7）。若将来本地改动继续增多，可考虑把 wb2api
+可在 `apply.py` 一处审计），其中已有 3 组补丁属于**上游从未有过的本地风控加固**
+（见「构建期补丁登记」的补丁 4~6）。若将来本地改动继续增多，可考虑把 wb2api
 正式"收养"为一等源码目录 —— 那时「快照 == 上游 commit」只剩历史意义。
 
 **仍可参考的公开派生**：搜索可见若干与本项目同构的公开仓库（例如
@@ -172,34 +205,35 @@ internal/prompt/prompt.go:17:12: pattern defaultprompt.md: no matching files fou
 
 ## 构建期补丁登记
 
-上游代码保持原样入库，但集成需要**七组**上游没有的行为，因此在**构建期**
+上游代码保持原样入库，但集成需要**六组**上游没有的行为，因此在**构建期**
 打补丁（`docker/patches/apply.py`，Dockerfile 的 `vpatch` 阶段）。
-（七组共 14 处文本替换：补丁 1、3、5、7 各含 2 处。）
+（六组共 12 处文本替换：补丁 5、6 各含 2 处，抖动组含 4 处。）
 
-**补丁 1~4 是"容器化/发行"所需；补丁 5~7 是 wb2api 上游删除后，本项目自行加的
+**补丁 1~3 是"容器化/发行"所需；补丁 4~6 是 wb2api 上游删除后，本项目自行加的
 风控加固**（上游从未有过这些能力，见前面「wb2api 上游已删除」）。
+（原「补丁 1：manager 内网直连」已被上游 v1.0.91 的 `_proxy_transport` 取代并
+**整组删除** —— 这是第一次因"上游做得更好"删补丁，见本轮同步要点。）
 
 | # | 目标 | 上游位置 | 补丁内容 | 为什么需要 |
 |---|---|---|---|---|
-| 1 | manager | `server/config.py` · `_build_client()`（v1.0.80 起；此前是 `http_client()`，上游客户端池化后构造收口到这里） | 给代理客户端挂内网直连 transport（`mounts`） | httpx 的 `proxy=` 作用于所有请求；配了 SOCKS 后连内网上游 `wb2api:7863` 也会走代理，管理端连不上自己的上游。`no_proxy` 环境变量在显式 `proxy=` 下**不生效**（已实测）。挂在 `_build_client()` 可覆盖事件循环内外的两条构造路径与按账号代理 |
-| 2 | wb2api | `internal/upstream/transport.go` · `newTransport()` | 给 `http.Transport` 设 `Proxy: http.ProxyFromEnvironment` | 上游未设该字段，Go 零值 = **恒不使用代理**且不读环境变量，网关出站无法走代理 |
-| 3 | manager | `server/main.py` | 加两行：导入并 `include_router(suite_router)` | 注册本项目新增的 `/api/system/suite-*`（套件自更新）路由。**上游路由实现一行未改** —— 见下面的覆写登记 |
-| 4 | manager | `web/components/common/layout/ManagementBar.tsx` | 移除"发现新版本"会话弹窗（整块 `useEffect`） | 那条提示在本发行版**两处都不成立**：① 它显示的版本号是**上游 manager** 的，不是本套件的；② 文案指向「设置 → 系统更新 一键升级」，而该页并不提供升级上游的按钮。留着只会让人误以为点一下就能升级 |
-| 5 | wb2api | `internal/upstream/headers.go` · `deriveAccountStableID()` | 派生盐支持 `WB2A_DEVICE_ID_SALT` 覆盖（**默认仍是 `wb2a:`，行为不变**） | `X-Machine-ID`/`X-Session-ID` 一旦被上游打标，重新登录也换不掉（同 uid 恒同值），上游没留任何轮换手段。这是"确有需要时"的后手，见 README「账号风控相关」 |
-| 6 | wb2api | `cmd/server/main.go` · 池初始化 | `pool.max_in_flight == 0` 时启动告警 | 0 = 单账号在途**不限**；该值只能写在 config.json 里，误设无任何报错，而并发无上限会显著提高账号风控风险 |
-| 7 | wb2api | `internal/scheduler/travel.go` + `scheduler.go` | 上报间隔（0.8s / 1.5s）加 0..+50% 抖动（新增 `jitteredDelay`） | 精确等距的节奏是"机器特征"，真人不会这么匀；抖动让时间密度不再落在固定周期上。`base<=0` 原样返回，测试靠置 0 跳过等待 |
+| 1 | wb2api | `internal/upstream/transport.go` · `newTransport()` | 给 `http.Transport` 设 `Proxy: http.ProxyFromEnvironment` | 上游未设该字段，Go 零值 = **恒不使用代理**且不读环境变量，网关出站无法走代理 |
+| 2 | manager | `server/main.py` | 加两行：导入并 `include_router(suite_router)` | 注册本项目新增的 `/api/system/suite-*`（套件自更新）路由。**上游路由实现一行未改** —— 见下面的覆写登记。锚点取导入块**收尾两行**，上游每加一个路由模块就失效一次（已 6 次），照抄新收尾更新 |
+| 3 | manager | `web/components/common/layout/ManagementBar.tsx` | 移除"发现新版本"会话弹窗（整块 `useEffect`） | 那条提示在本发行版**两处都不成立**：① 它显示的版本号是**上游 manager** 的，不是本套件的；② 文案指向「设置 → 系统更新 一键升级」，而该页并不提供升级上游的按钮。留着只会让人以为点一下就能升级 |
+| 4 | wb2api | `internal/upstream/headers.go` · `deriveAccountStableID()` | 派生盐支持 `WB2A_DEVICE_ID_SALT` 覆盖（**默认仍是 `wb2a:`，行为不变**） | `X-Machine-ID`/`X-Session-ID` 一旦被上游打标，重新登录也换不掉（同 uid 恒同值），上游没留任何轮换手段。这是"确有需要时"的后手，见 README「账号风控相关」 |
+| 5 | wb2api | `cmd/server/main.go` · 池初始化 | `pool.max_in_flight == 0` 时启动告警 | 0 = 单账号在途**不限**；该值只能写在 config.json 里，误设无任何报错，而并发无上限会显著提高账号风控风险 |
+| 6 | wb2api | `internal/scheduler/travel.go` + `scheduler.go` | 上报间隔（0.8s / 1.5s）加 0..+50% 抖动（新增 `jitteredDelay`） | 精确等距的节奏是"机器特征"，真人不会这么匀；抖动让时间密度不再落在固定周期上。`base<=0` 原样返回，测试靠置 0 跳过等待 |
 
-补丁 1、2 都与**出口代理**有关；补丁 3 是"挂载我们自己的路由"的接线；
-补丁 4 是"去掉不该出现的行为"；补丁 5~7 是**风控加固**（本项目独有的增量）。
+补丁 1 与**出口代理**有关；补丁 2 是"挂载我们自己的路由"的接线；
+补丁 3 是"去掉不该出现的行为"；补丁 4~6 是**风控加固**（本项目独有的增量）。
 
 > **注意区分「改措辞」与「去行为」**：本项目**不做**前者（见下面的教训），
-> 但做后者。补丁 4 移除的是一个**实际会弹出来的提示**，不是把某句话换个说法 ——
+> 但做后者。补丁 3 移除的是一个**实际会弹出来的提示**，不是把某句话换个说法 ——
 > 判据是"它是否在误导用户去做一个做不到的操作"。
 
-> **补丁 5~7 的验证方式**（因为它们触及对上游的网络行为，不能只靠"测试全绿"）：
-> 补丁 5 用「与 `sha256("wb2a:machine:u1")[:36]` 手算值逐字节比对」证明默认不变、
-> 换盐生效；补丁 6 真启动服务确认 `0` 告警而 `3` 不告警；补丁 7 用 300 次采样
-> 确认抖动有 300 个不同值。**其中补丁 7 的初版正是被这个采样测试否掉的**：
+> **补丁 4~6 的验证方式**（因为它们触及对上游的网络行为，不能只靠"测试全绿"）：
+> 补丁 4 用「与 `sha256("wb2a:machine:u1")[:36]` 手算值逐字节比对」证明默认不变、
+> 换盐生效；补丁 5 真启动服务确认 `0` 告警而 `3` 不告警；补丁 6 用 300 次采样
+> 确认抖动有 300 个不同值。**其中补丁 6 的初版正是被这个采样测试否掉的**：
 > 初版用 `time.Now().UnixNano()` 取熵，在时钟粒度粗的平台上同一值重复 300 次，
 > 已改为 `math/rand`。
 
@@ -262,15 +296,24 @@ CI 会用**正向断言**检查它们确实落位（`build.yml`）。
 > 1. `can_update_upstream` —— 上游 `test_docker_deploy.py::test_frontend_uses_capability_flag`
 >    断言本文件要透出该能力标志（用意"别让用户点到做不到的操作"；本面板里
 >    那类按钮不存在，字样只作登记）。
-> 2. `t('updatePanel.sigPending')` 与 `disabled={… check.manager.sig_ready === false …}`
+> 2. `t('updatePanel.assetsPending')` 与 `disabled={… check.manager.assets_ready === false …}`
 >    —— 上游 `test_version_cache.py::SigReadyAwarenessTest::test_ui_says_it_and_holds_the_button`
->    断言（用意"签名未就绪时提示要出现、按钮要拦住"；本面板没有更新管理端的按钮）。
+>    断言（用意"产物未就位时提示要出现、按钮要拦住"；本面板没有更新管理端的
+>    按钮。**字样随上游改名**：v1.0.80 时是 sigPending/sig_ready，v1.0.81~91
+>    间更名，改名当晚本地预检就抓到了 —— 机制生效的实证）。
 >
 > 两条都由 `tests/test_patch_preflight.py::OverlaySourceGuardTest` 在本地把关
 > （含反向校验：上游移除守卫时会红，提示把字样一起清掉），`build.yml` 里也有
 > 对应的落位断言。
 
 ### 曾经打过、现已删除的补丁（重要教训）
+
+**补丁「manager 内网直连」也在这里**（2026-10-16 删除，上面本轮同步要点第 1 条
+有全过程）：它是本仓库存活最久的补丁之一（v1.0.72 起历经 4 次锚点搬家），
+最终因上游 v1.0.91 用 `_proxy_transport` 实现了更完备的「内网/本机直连、
+其余走代理」而删除。删除的判据与本节标题一致：**上游做得更好**。
+apply.py 文件头保留了它的墓碑小节；预检 `test_manager_internal_direct_is_upstream_now`
+守着"上游没有回退"（若回退会红，届时按墓碑恢复）。
 
 早期版本还打了三处补丁去修正「更新」面板的文案与按钮（改文案、删按钮、
 改后端提示语），理由是"本发行版是容器部署、更新在宿主机执行"。
@@ -295,7 +338,7 @@ CI 会用**正向断言**检查它们确实落位（`build.yml`）。
 > 上游一旦重构就会失效，而构建失败比文案不准更烦人。
 > 真正值得打补丁的是**功能缺失**（如本项目的代理支持），不是**措辞差异**。
 
-### 补丁 2 的一个技术细节：Proxy 与自定义 DialContext 可共存
+### 补丁 1 的一个技术细节：Proxy 与自定义 DialContext 可共存
 
 上游的 `newTransport()` 设了自定义 `DialContext`（连接超时加固）。直觉上
 `Transport.Proxy` 可能被 dialer 绕过，但**实测证明可以共存**：

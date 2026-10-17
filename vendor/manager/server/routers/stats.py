@@ -1,6 +1,7 @@
 """用量统计聚合。"""
 from __future__ import annotations
 
+import datetime
 import time
 
 from fastapi import APIRouter, Depends
@@ -372,6 +373,115 @@ def _hourly_failures(day: str, realm: str | None = None) -> dict[int, int]:
         return out
     except Exception:  # noqa: BLE001
         return {}
+
+
+# ── 积分收支（收入 / 支出）───────────────────────────────
+#
+# 两个数字来自**两套不同口径**：
+#   · 收入 = task_logs 里 kind='credit' 的余额增加流水；
+#   · 支出 = usage_daily.credit（每次调用的真实扣费合计）。
+#
+# 为什么收入不把 task_logs 的全部 kind 加起来：那条流里混着「令牌保活成功」
+# 这类把 credits 当布尔标记写的行（renew.py 的 `_record(acct, 1, ...)`），
+# 直接求和会把续期次数当成积分收入。只用 kind='credit' 才是真正的余额增加。
+
+
+def _realm_uids(realm: str | None) -> set[str] | None:
+    """该版本（cn/global）的完整 uid 集合；realm 非法返回 None（= 不过滤）。
+
+    task_logs 没有 realm 列，收入要按版本筛只能把 uid 映射过去。`kind='credit'`
+    的 uid 由 credits.record_balance 写入，是**完整 uid**，所以可以精确匹配，
+    不需要像上游日志那样兼容 8 位前缀。
+    """
+    if realm not in ('cn', 'global'):
+        return None
+    try:
+        accounts = wb2api.list_auth_accounts()
+    except Exception:  # noqa: BLE001
+        return set()
+    return {str(a.get('uid')) for a in accounts
+            if a.get('uid') and (a.get('realm') or 'cn') == realm}
+
+
+def _credit_income_by_day(since: str, realm: str | None) -> dict[str, float]:
+    """收入：`kind='credit'` 流水按本地日聚合（见本段顶部说明）。"""
+    uids = _realm_uids(realm)
+    if uids is not None and not uids:
+        return {}
+    sql = (f"SELECT {db.day_sql('ts')} AS day, COALESCE(SUM(credits),0) AS income "
+           "FROM task_logs WHERE kind = 'credit' AND ts >= ?")
+    args: list = [db.day_start_ts(since)]
+    if uids is not None:
+        sql += f' AND uid IN ({",".join("?" * len(uids))})'
+        args.extend(sorted(uids))
+    sql += ' GROUP BY day'
+    rows = db.query(sql, tuple(args))
+    return {str(r['day']): float(r['income'] or 0) for r in rows if r['day']}
+
+
+@router.get('/credits')
+def credits_flow(days: int = 30, realm: str | None = None,
+                 user: dict = Depends(security.current_user)) -> dict:
+    """积分收支：按天给出收入与支出，并给出今日 / 近 7 天 / 区间合计。
+
+    ## 收入口径（近似值，界面须如实说明，不要假装是精确账本）
+
+    收入是 `credits.record_balance` 在**真的向腾讯查了一次余额、且比上次查询
+    增加**时写下的流水。它覆盖签到 / 活跃 / 旅行等所有渠道（这些渠道大多不在
+    上游日志里打数额），但有两个已知近似：
+
+      · 两次查询之间「先增后耗」、净额不为正时，那笔增加不会被记下；
+      · 长时间无人打开面板 / 无人刷新积分时，期间的多次增加会**合并**记到
+        下一次查询那一刻所在的日期。
+
+    ## 支出口径
+
+    `usage_daily.credit` 是每次调用上游返回的真实扣费（`usage.credit`）当日合计，
+    精确到每次请求。两个口径精度不同，所以不把「净额」当作唯一结论，而是收入 /
+    支出 / 净额三项都列。
+    """
+    d = _clamp_days(days, 30)
+    since = _since(d)
+    today = time.strftime('%Y-%m-%d')
+
+    # 支出：usage_daily 带 realm 列，可直接筛
+    rf = ' AND realm = ?' if realm in ('cn', 'global') else ''
+    rargs: tuple = (realm,) if rf else ()
+    expense = {
+        str(r['day']): float(r['credit'] or 0)
+        for r in db.query(
+            'SELECT day, COALESCE(SUM(credit),0) AS credit FROM usage_daily '
+            f'WHERE day >= ?{rf} GROUP BY day',
+            (since,) + rargs,
+        )
+    }
+    income = _credit_income_by_day(since, realm)
+
+    # 补齐每一天（含无数据的日子），折线才不会断成两截
+    start = datetime.date(*time.localtime(db.day_start_ts(since))[:3])
+    daily: list[dict] = []
+    for i in range(d):
+        day = (start + datetime.timedelta(days=i)).isoformat()
+        inc = income.get(day, 0.0)
+        exp = expense.get(day, 0.0)
+        daily.append({'day': day, 'income': inc, 'expense': exp, 'net': inc - exp})
+
+    week_from = _since(7)
+
+    def _sum(rows: list[dict]) -> dict:
+        inc = sum(r['income'] for r in rows)
+        exp = sum(r['expense'] for r in rows)
+        return {'income': inc, 'expense': exp, 'net': inc - exp}
+
+    return {
+        'days': d,
+        'from': daily[0]['day'] if daily else since,
+        'to': today,
+        'today': _sum([r for r in daily if r['day'] == today]),
+        'week': _sum([r for r in daily if r['day'] >= week_from]),
+        'total': _sum(daily),
+        'daily': daily,
+    }
 
 
 @router.get('/by-model')

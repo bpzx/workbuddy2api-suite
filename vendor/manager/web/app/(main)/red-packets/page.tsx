@@ -18,9 +18,9 @@ import {LoadError} from '@/components/common/states/LoadError';
 import {SkeletonBar} from '@/components/common/states/SkeletonBar';
 import {useAuth} from '@/lib/auth-context';
 import {Button} from '@/components/ui/button';
+import {ModelWhitelistInput} from '@/components/common/keys/ModelWhitelistInput';
 import {Input} from '@/components/ui/input';
 import {Label} from '@/components/ui/label';
-import {Textarea} from '@/components/ui/textarea';
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select';
@@ -98,9 +98,8 @@ export default function RedPacketsPage() {
     }
     // token 红包必须限定模型（后端也拦，这里先给个更快的反馈）。
     // 拆法与密钥页同款：逗号或换行都认，去空白去空项。
-    const modelList = kind === 'token'
-      ? models.split(/[\n,]/).map((s) => s.trim()).filter(Boolean)
-      : [];
+    // 两类都接受模型范围（#131）：token 必填、积分可选（不填 = 不限制）。
+    const modelList = models.split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
     if (kind === 'token' && modelList.length === 0) {
       notify.warn(t('redPacket.errModels'));
       return;
@@ -290,23 +289,22 @@ export default function RedPacketsPage() {
                      onChange={(e) => setTitle(e.target.value)} />
             </div>
 
-            {/* 模型范围只在 token 红包下出现 —— 积分红包**不限制模型**
-                （按真实扣费计，任何模型都能用），显示出来反而会让人以为
-                可以限制。两类的规则相反是刻意的，见 redpacket.validate。 */}
-            {kind === 'token' && (
-              <div className="rounded-2xl bg-background/60 px-3 py-2 xl:col-span-2">
-                <Label className="text-xs">{t('redPacket.fieldModels')}</Label>
-                <Textarea
-                  className="mt-1 min-h-16 bg-background text-xs"
+            {/* 模型范围：token 红包必填（量随模型变），积分红包可选（#131）——
+                不填 = 不限制（按真实扣费计，任何模型都能用），填了就把这份额度
+                限定到指定模型上。做成可勾选的清单，省得记模型 ID。 */}
+            <div className="rounded-2xl bg-background/60 px-3 py-2 xl:col-span-2">
+              <Label className="text-xs">{t('redPacket.fieldModels')}</Label>
+              <div className="mt-1">
+                <ModelWhitelistInput
                   value={models}
+                  onChange={setModels}
                   placeholder={t('redPacket.fieldModelsPlaceholder')}
-                  onChange={(e) => setModels(e.target.value)}
                 />
-                <div className="mt-1 text-[10px] leading-3 text-muted-foreground">
-                  {t('redPacket.fieldModelsHint')}
-                </div>
               </div>
-            )}
+              <div className="mt-1 text-[10px] leading-3 text-muted-foreground">
+                {kind === 'token' ? t('redPacket.fieldModelsHint') : t('redPacket.fieldModelsHintOptional')}
+              </div>
+            </div>
           </div>
           <div className="mt-2.5 flex justify-end gap-2">
             <Button variant="ghost" className="rounded-full" disabled={busy}

@@ -52,6 +52,23 @@ EXCLUDE_SUFFIX = {'.pyc', '.pyo'}
 EXCLUDE_NAMES = {'config.json', 'auths', 'data'}
 
 
+def _lf_text(raw: bytes) -> bytes:
+    """文本内容 CRLF → LF；二进制原样返回（issue #202）。
+
+    判据：**不含 NUL 且能按 UTF-8 解码**的当文本，其余（图片、压缩包等）一个字节都
+    不动。猜错方向的代价不对称 —— 把一个二进制改坏比留一处行尾问题严重得多。
+    与 `deploy/update.py::_normalize_eol` 同一口径（那边是同步时的兜底；这边治源头，
+    让下出去的资产本身就是干净的）。
+    """
+    if b'\x00' in raw:
+        return raw
+    try:
+        raw.decode('utf-8')
+    except UnicodeDecodeError:
+        return raw
+    return raw.replace(b'\r\n', b'\n')
+
+
 def _iter_files(root: Path) -> list[Path]:
     out: list[Path] = []
     for p in sorted(root.rglob('*')):
@@ -133,8 +150,15 @@ LICENSE 与版权声明。
                 info.uid = info.gid = 0
                 info.uname = info.gname = ''
                 info.mode = 0o755 if (f.stat().st_mode & 0o111) else 0o644
-                with f.open('rb') as fh:
-                    tf.addfile(info, fh)
+                # 行尾归一（issue #202）：源码目录可能是在 Windows 上检出的（git 的
+                # `core.autocrlf` 会把文本文件写成 CRLF），而打包是字节拷贝 —— 包内
+                # 那份 CRLF 会让容器里的脚本首行变成 `#!/usr/bin/env bash\r`，解释器
+                # 路径对不上，一键登录 / 签到 / 积分这些依赖脚本的功能整体失效。
+                # 归一放在**打包这一步**、而不是指望源码目录干净：谁的工作区干净
+                # 不该决定发出去的资产长什么样。判据见 `_lf_text`。
+                data = _lf_text(f.read_bytes())
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
         size = out_path.stat().st_size
         digest = hashlib.sha256(out_path.read_bytes()).hexdigest()[:16]
         print(f'已打出 {out_path}（{len(files)} 个文件，{size / 1024:.0f} KB，sha256:{digest}…）')

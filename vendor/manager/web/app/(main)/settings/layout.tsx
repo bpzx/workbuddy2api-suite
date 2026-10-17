@@ -20,6 +20,7 @@ import {
   Database,
   FileText,
   KeyRound,
+  Route,
 } from 'lucide-react';
 import {usePathname} from 'next/navigation';
 import {notify} from '@/lib/toast';
@@ -31,6 +32,7 @@ import {settingsApi, upstreamApi, errText} from '@/lib/api';
 import {useAsyncAll} from '@/lib/use-async-data';
 import {UpstreamEndpoints} from '@/components/settings/UpstreamEndpoints';
 import {BASE_PATH} from '@/lib/base-path';
+import {scheduleDelayError} from '@/lib/schedule-validation';
 import {
   DEFAULT_SETTINGS_TAB,
   SETTINGS_TABS,
@@ -50,6 +52,7 @@ import {ResetPasswordDialog} from '@/components/common/settings/ResetPasswordDia
 import {useAuth} from '@/lib/auth-context';
 import {UpdatePanel} from '@/components/common/settings/UpdatePanel';
 import {PgSyncPanel} from '@/components/common/settings/PgSyncPanel';
+import {ProxyPanel} from '@/components/common/settings/ProxyPanel';
 import {TokensPanel} from '@/components/common/settings/TokensPanel';
 import {ChangelogPanel} from '@/components/common/settings/ChangelogPanel';
 import {UpstreamReloadNotice} from '@/components/common/settings/UpstreamReloadNotice';
@@ -131,6 +134,14 @@ interface DurationField {
    * 界面看不出任何异常，用户以为自己关掉了，其实一直开着。
    */
   offWhenZero?: boolean;
+  /**
+   * 允许留空（= 不启用该配置），但**不放行 `0`**。
+   *
+   * 与 `offWhenZero` 的差别就在 0 上：有的上游字段把 0 当「关闭」，有的把 0 当
+   * **非法值**（`credit_exhausted` 就是——补丁里的 normalize 判 `d <= 0` 直接报错）。
+   * 后者若照抄「留空或填 0」的说法，用户会得到「保存成功、上游起不来」。
+   */
+  allowEmpty?: boolean;
 }
 
 interface SelectField {
@@ -176,6 +187,8 @@ const DURATION_RE = /^\d+\s*(s|m|h)$/i;
 function durationOk(f: DurationField, raw: unknown): boolean {
   const text = String(raw ?? '').trim();
   if (f.offWhenZero && (text === '' || text === '0')) return true;
+  // allowEmpty 只额外放行空串：`0` 仍走 DURATION_RE → 判非法（上游对它是报错）。
+  if (f.allowEmpty && text === '') return true;
   return DURATION_RE.test(text);
 }
 
@@ -206,6 +219,36 @@ function parseHours(text: string): {ok: boolean; hours: number[]; error?: string
 }
 
 const SCHEDULE_FIELDS: Field[] = [
+  {
+    key: 'account_delay_min_seconds',
+    kind: 'num',
+    label: '账号最短间隔',
+    desc: '自动任务逐个处理账号，完成一个后再随机等待；建议最短 30 秒、最长 120 秒',
+    unit: '秒',
+    min: 0,
+    max: 600,
+    def: 0,
+  },
+  {
+    key: 'account_delay_max_seconds',
+    kind: 'num',
+    label: '账号最长间隔',
+    desc: '自动任务的账号随机间隔上限；两项填 0 保持原有间隔。开启后同一时刻的不同任务也依次运行，手动执行不受影响',
+    unit: '秒',
+    min: 0,
+    max: 600,
+    def: 0,
+  },
+  {
+    key: 'random_delay_minutes',
+    kind: 'num',
+    label: '每日任务随机延迟',
+    desc: '每天各类任务在原定整点后随机延迟 0～N 分钟；0 表示整点执行。同一天重启沿用原时刻，手动执行不受影响',
+    unit: '分钟',
+    min: 0,
+    max: 60,
+    def: 0,
+  },
   {
     key: 'checkin_enabled',
     kind: 'bool',
@@ -316,6 +359,17 @@ const COOLDOWN_FIELDS: Field[] = [
     label: '冷却退避上限',
     desc: '连续触发限流会逐次延长冷却，这是延长后的封顶值（格式如 2h）',
     def: '2h',
+  },
+  {
+    key: 'credit_exhausted',
+    kind: 'duration',
+    // 这里「留空」与「填 0」是两回事：空 = 默认行为，0 = 上游判非法。desc 必须把
+    // 「不能填 0」写出来，否则用户按「留空或 0 关闭」的习惯填 0 会被判格式错误。
+    label: '积分耗尽冷却',
+    desc: '账号积分用完后的冷却时长。留空 = 冷却到次日 4 点、等签到恢复（默认）；'
+      + '填了就只退出这一小段（如 10m / 1h），到期自动回到可用池。不能填 0',
+    def: '',
+    allowEmpty: true,
   },
 ];
 
@@ -629,7 +683,7 @@ const GROUPS: GroupDef[] = [
     id: 'schedule',
     section: 'schedule',
     title: '定时任务',
-    desc: '六类任务各自独立排程：签到 / 猫猫旅行 / 活跃上报 / 保活 / 开学季 / 夜猫。可分别开关并设置执行时刻。签到、旅行、活跃上报、开学季、夜猫**只对国内版账号生效**——国际版没有这些体系，只有保活照常执行',
+    desc: '六类任务各自独立排程：签到 / 猫猫旅行 / 活跃上报 / 保活 / 开学季 / 夜猫。可分别开关并设置执行时刻。签到、旅行、开学季、夜猫**只对国内版账号生效**——国际版没有这些体系；**活跃上报与保活两边都执行**，国际版没有签到，活跃上报是它唯一能刷新活跃状态的动作',
     fields: SCHEDULE_FIELDS,
   },
   {
@@ -854,6 +908,7 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
   // 留在外壳里就得在面板那边再抄一遍，漏抄一处不报错）。
   const TAB_META: Record<SettingsTab, {icon: React.ReactNode}> = {
     upstream: {icon: <Server className="h-3.5 w-3.5" />},
+    proxy: {icon: <Route className="h-3.5 w-3.5" />},
     models: {icon: <Shuffle className="h-3.5 w-3.5" />},
     users: {icon: <Users className="h-3.5 w-3.5" />},
     tokens: {icon: <KeyRound className="h-3.5 w-3.5" />},
@@ -1089,6 +1144,13 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
   /** 只提交改动过的字段，避免覆盖其他未展示的配置项 */
   async function saveGroup(group: Group) {
     const cur = form[group];
+    if (group === 'schedule') {
+      const error = scheduleDelayError(cur);
+      if (error) {
+        notify.err(tp(error));
+        return;
+      }
+    }
     const org = original.current[group];
     const patch: Record<string, boolean | number | number[] | string> = {};
     for (const k of Object.keys(cur)) {
@@ -1895,7 +1957,19 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
               <TableBody>
                 {Object.entries(modelMap).map(([alias, target]) => (
                   <TableRow key={alias} className="border-b border-border/40">
-                    <TableCell className="pl-4 font-mono text-xs">{alias}</TableCell>
+                    <TableCell className="pl-4 font-mono text-xs">
+                      {/* 兜底那条（键为 `*`）直接显示成「兜底模型」，别让用户去记星号 */}
+                      {alias === '*' ? (
+                        <span className="flex items-center gap-1.5">
+                          <span className="font-sans text-[11px] font-medium">
+                            {t('settings.mapFallbackRow')}
+                          </span>
+                          <code className="text-muted-foreground">*</code>
+                        </span>
+                      ) : (
+                        alias
+                      )}
+                    </TableCell>
                     <TableCell className="font-mono text-xs text-muted-foreground">{target}</TableCell>
                     {isAdmin && (
                       <TableCell className="pr-4 text-right">
@@ -2058,6 +2132,10 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
         </TabsContent>
 
         {/* ═══ 访问令牌 ═══ */}
+        <TabsContent value="proxy" className="mt-4 space-y-4">
+          <ProxyPanel />
+        </TabsContent>
+
         <TabsContent value="tokens" className="mt-4 space-y-4">
           <TokensPanel />
         </TabsContent>

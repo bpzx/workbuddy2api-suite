@@ -12,6 +12,7 @@ import os
 import re
 import tempfile
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -68,6 +69,30 @@ STATE_TTL = 900
 # 该端点有 UA 门禁：只有三段式 CLI UA（我们 _ua 的形态）能过，web UA 被 400 拒。
 V3_CONFIG_PATH = '/v3/config'
 
+# 「活动补偿」两个端点（2026-10-16 的 DeepSeek 故障补偿公告，网页入口
+# https://www.workbuddy.cn/profile/plans-usage 的「领取」按钮）。
+#
+# **路径不带 `/v2`**，这与 daily-checkin / get-user-resource 不同 —— 那两个两种
+# 前缀都通，而这两个只有非前缀形式：2026-10-16 实测
+#
+#     POST https://www.codebuddy.cn/billing/meter/compensation-status      → 401（存在，待鉴权）
+#     POST https://www.codebuddy.cn/v2/billing/meter/compensation-status   → 404
+#     POST https://www.codebuddy.cn/billing/meter/claim-compensation       → 401
+#     POST https://www.codebuddy.cn/v2/billing/meter/claim-compensation    → 404
+#
+# 所以**不能**走 `billing_paths()`（它给国内版拼的正是 `/v2`）：那样每次都会 404，
+# 而 404 的表现是「无可领补偿」，看起来跟「今天没得领」一模一样 —— 静默失效。
+# 端点名与网页 bundle（assets.workbuddy.cn/web/usercenter）里的调用逐字一致。
+#
+# **基址用 codebuddy.cn（= desktop 客户端的 billing 基址），不是公告链接里的
+# workbuddy.cn**：两条都实测存在（都是 401），但我们的账号是客户端账号，出生入死的
+# 是客户端那套 Origin/UA/身份头；而该域上的领取历史有效（升级日志里出现过
+# 「compensation ok (+100 credit)」）。公告页与客户端应是同一后端的不同品牌前端。
+# 将来若要改基址，先确认身份头（Origin/Referer）一起改 —— 不匹配的 Origin 正是
+# 风控最容易挑出来的形态。
+COMPENSATION_STATUS_PATH = '/billing/meter/compensation-status'
+COMPENSATION_CLAIM_PATH = '/billing/meter/claim-compensation'
+
 
 def _envelope(resp: httpx.Response) -> tuple[int, Any]:
     """腾讯接口统一信封 {code, msg, data}；HTTP 4xx 也可能是业务信封。"""
@@ -113,15 +138,41 @@ def _account_http_client(auth: dict):
     return config.http_client(config.TENCENT_TIMEOUT, connect=5, proxy=proxy)
 
 
-async def start_login(realm: Realm = CN, proxy_name: str = '') -> dict:
-    """发起扫码登录。realm 决定用哪套端点与 Origin（默认国内版）。"""
-    async with _account_http_client({'proxy': proxy_name}) as client:
-        resp = await client.post(
-            f'{chat_base(realm)}/v2/plugin/auth/state',
-            params={'platform': 'CLI'},
-            json={},
-            headers=_hdr(realm),
+def _login_net_hint(proxy_name: str, exc: Exception) -> str:
+    """把「扫码登录」出站的网络错误翻成可执行的中文提示（issue #194）。
+
+    为什么这条要专门翻译：登录是唯一「用户正站在弹窗前、失败就卡死」的出站调用。
+    此前 httpx 的异常直接抛到路由层，没被 `except RuntimeError` 接住 → FastAPI 兜成
+    500 + 英文 `Internal Server Error`，界面上就是一句看不懂的英文，用户既不知道是
+    线路问题也不知道该改哪里。报告人正是这么被卡住的：换了一条解析不了 .cn 的国家
+    线路，二维码一直出不来，关掉代理才好 —— 修复前他从错误里看不出这层关系。
+    """
+    detail = err_text(exc)
+    if proxy_name:
+        return (
+            f'线路「{proxy_name}」连不上腾讯登录接口：{detail}。'
+            '常见原因：这条线路访问不了国内域名、需要额外认证、或已经失效 —— '
+            '换一条线路，或先在弹窗里关掉它再试'
         )
+    return f'连不上腾讯登录接口：{detail}。请检查这台机器的网络出口（DNS 与外网连通性）'
+
+
+async def start_login(realm: Realm = CN, proxy_name: str = '') -> dict:
+    """发起扫码登录。realm 决定用哪套端点与 Origin（默认国内版）。
+
+    网络层失败统一转成 `RuntimeError`（带可执行的中文原因，见 `_login_net_hint`）：
+    路由层把它转 502，界面就能显示「哪条线路连不上、该怎么办」，而不是英文 500。
+    """
+    try:
+        async with _account_http_client({'proxy': proxy_name}) as client:
+            resp = await client.post(
+                f'{chat_base(realm)}/v2/plugin/auth/state',
+                params={'platform': 'CLI'},
+                json={},
+                headers=_hdr(realm),
+            )
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(_login_net_hint(proxy_name, exc)) from exc
     code, data = _envelope(resp)
     if code != 0 or not data:
         raise RuntimeError(f'获取授权链接失败 code={code}')
@@ -165,26 +216,31 @@ async def poll_login(state: str, realm: Realm | None = None) -> dict:
         return {'status': 'realm_mismatch', 'expected': reg_realm, 'got': realm}
     realm = reg_realm
 
-    async with _account_http_client({'proxy': proxy_name}) as client:
-        resp = await client.get(
-            f'{chat_base(realm)}/v2/plugin/auth/token',
-            params={'state': state},
-            headers=_hdr(realm),
-        )
-        code, data = _envelope(resp)
-        if code != 0 or not data or not data.get('accessToken'):
-            return {'status': 'waiting'}
+    # 出站失败同样翻成可执行的中文（与 start_login 同一口径）：中途线路挂掉时，
+    # 前端轮询此前会拿到英文 500，用户看不出是线路的问题。
+    try:
+        async with _account_http_client({'proxy': proxy_name}) as client:
+            resp = await client.get(
+                f'{chat_base(realm)}/v2/plugin/auth/token',
+                params={'state': state},
+                headers=_hdr(realm),
+            )
+            code, data = _envelope(resp)
+            if code != 0 or not data or not data.get('accessToken'):
+                return {'status': 'waiting'}
 
-        access_token = data['accessToken']
-        refresh_token = data.get('refreshToken', '')
-        expires_in = int(data.get('expiresIn', 3600) or 3600)
-        domain = data.get('domain', '')
+            access_token = data['accessToken']
+            refresh_token = data.get('refreshToken', '')
+            expires_in = int(data.get('expiresIn', 3600) or 3600)
+            domain = data.get('domain', '')
 
-        acct_resp = await client.get(
-            f'{chat_base(realm)}/v2/plugin/login/account',
-            params={'state': state},
-            headers=_hdr(realm, access_token),
-        )
+            acct_resp = await client.get(
+                f'{chat_base(realm)}/v2/plugin/login/account',
+                params={'state': state},
+                headers=_hdr(realm, access_token),
+            )
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(_login_net_hint(proxy_name, exc)) from exc
     _, acct = _envelope(acct_resp)
     acct = acct or {}
     uid = acct.get('uid')
@@ -393,7 +449,12 @@ def write_auth_file(account: dict, auth_dir: Path | None = None,
     if old_device_token:
         payload['device_token'] = old_device_token
 
-    proxy_name = str(account.get('proxy', old_proxy) or '').strip()
+    # 空串同样回退到旧值（`or old_proxy`，而不是只对「键缺失」生效的默认值）：
+    # 登录流（account 里通常没有这个键）与**导入流**（`_uploaded_account` 恒带上
+    # `'proxy': ''`）两条路都要「文件没提就不动」。否则覆盖导入一份没写 proxy 的
+    # 文件会把已绑定的线路**静默清掉**——出口无声改变正是这个功能最忌讳的事
+    # （与上面 device_token「读旧文件保留」的语义对齐）。
+    proxy_name = str(account.get('proxy') or old_proxy or '').strip()
     if proxy_name:
         payload['proxy'] = proxy_name
 
@@ -526,6 +587,93 @@ async def checkin(access_token: str | dict, realm: Realm = CN) -> tuple[int, str
         return code, f'签到返回 code={code}'
     except Exception as exc:  # noqa: BLE001
         return -1, f'签到异常: {err_text(exc)}'
+
+
+async def compensation_status(access_token: str | dict,
+                              realm: Realm = CN) -> tuple[bool, dict, str]:
+    """查询「活动补偿」当前状态（有没有得领、领过没）。
+
+    页面口径（`/profile/plans-usage` 的「领取」模块，2026-10 补偿公告）读的字段：
+    `claimed` / `claimed_at` / `claimed_text` / `button_text` / `credit_num` / `title`。
+    返回 `(ok, data, message)`；`ok=False` 时 message 是原因（网络/业务错误）。
+
+    **只在官方网页上才有的可领状态**：这个端点比「直接领」多一次请求，但它能回答
+    「有得领吗」，而领取接口在没得领时只回业务错误——用户看到「无可领」无法区分
+    「已经领过了」和「活动还没给我」。
+    """
+    try:
+        async with _account_http_client(access_token if isinstance(access_token, dict) else {}) as client:
+            resp = await client.post(
+                f'{billing_base(realm)}{COMPENSATION_STATUS_PATH}',
+                json={},
+                headers=_billing_hdr(realm, access_token),
+            )
+        code, data = _envelope(resp)
+        if code != 0:
+            return False, {}, f'查询返回 code={code}'
+        if not isinstance(data, dict):
+            return False, {}, '查询返回结构无法识别'
+        return True, data, '已查询'
+    except Exception as exc:  # noqa: BLE001
+        return False, {}, f'查询异常: {err_text(exc)}'
+
+
+async def claim_compensation(access_token: str | dict,
+                             realm: Realm = CN) -> tuple[str, int, str]:
+    """领取「活动补偿」（有则领，领过/没有则跳过）。
+
+    返回 `(status, credit, message)`，status 只有四种取值 —— **分开「无可领」与
+    「失败」是刻意的**：上游对「没有可领的补偿」和「已经领过了」都回业务错误，
+    而这两种都不是故障。混成一个 ok=False，界面会把「今天本来就没得领」报成
+    「N 个账号失败」，用户于是反复重试一个永远不会成功的动作。
+
+      · `claimed` —— 本次到账（credit 是积分，回执缺字段记 0）
+      · `nothing` —— 业务错误：没有可领的补偿 / 已经领过
+      · `failed`  —— 网络或协议层失败（可重试）
+      · `skipped` —— 国际版没有这个活动，未发请求
+    """
+    if not supports_checkin(realm):
+        # 公告只面向国内版（原话「面向 WorkBuddy 国内版全量用户」）；国际版连这个
+        # 模块都没有，打过去只会白吃一次 4xx —— 与签到的门控同理。
+        return 'skipped', 0, '国际版无此活动，已跳过'
+    try:
+        async with _account_http_client(access_token if isinstance(access_token, dict) else {}) as client:
+            resp = await client.post(
+                f'{billing_base(realm)}{COMPENSATION_CLAIM_PATH}',
+                json={},
+                headers=_billing_hdr(realm, access_token),
+            )
+        code, data = _envelope(resp)
+        if code == 0:
+            credit = 0
+            if isinstance(data, dict):
+                raw = data.get('credit')
+                if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                    credit = int(raw)
+            return 'claimed', credit, ('已领取 +%d 积分' % credit) if credit else '已领取（回执未给积分数）'
+        # 业务错误：**不是**故障（HTTP 多半还是 200，只是信封里的 code != 0）
+        return 'nothing', 0, f'无可领补偿（code={code}）'
+    except Exception as exc:  # noqa: BLE001
+        return 'failed', 0, f'领取异常: {err_text(exc)}'
+
+
+def compensation_already_claimed(data: object) -> bool:
+    """补偿状态回执是否表示「已经领过」。
+
+    字段按网页 bundle 的口径解析，且**宽容**：三个字段任一能证明领过就算领过
+    （`claimed` 布尔 / `claimed_at` 时间 / `claimed_text` 文案）。字段全缺时返回
+    False —— 那表示我们认不出这个结构，此时应继续尝试领取，而不是当成「已领」
+    把机会放过（认不出 ≠ 领过了）。
+    """
+    if not isinstance(data, dict):
+        return False
+    if data.get('claimed') is True:
+        return True
+    for key in ('claimed_at', 'claimed_text'):
+        value = data.get(key)
+        if value not in (None, '', 0):
+            return True
+    return False
 
 
 async def fetch_credits(auth: dict) -> tuple[bool, int | float | None, str, list[dict]]:
@@ -967,6 +1115,17 @@ async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
     _dt = device_token_for(auth)
     if _dt:
         headers['X-Device-Token'] = _dt
+    # 会话头族（issue #193）：上游 2026-10-16 起对**部分账号**灰度启用渠道校验，
+    # 缺 X-Conversation-ID 即判 11-128「conversation id missing」—— 被灰度到的账号在
+    # 探测里必红（真实对话走网关，同一族头由上游补）。这里补齐官方客户端那几支；
+    # 四个 ID 各有语义（会话 / 轮 / 消息 / 根），不要图省事复用成同一个值。
+    headers.update({
+        'X-Conversation-ID': uuid.uuid4().hex,
+        'X-Conversation-Request-ID': uuid.uuid4().hex,
+        'X-Conversation-Message-ID': uuid.uuid4().hex,
+        'X-Root-Request-ID': uuid.uuid4().hex,
+        'X-Trace-ID': uuid.uuid4().hex,
+    })
 
     payload = {
         'model': model,

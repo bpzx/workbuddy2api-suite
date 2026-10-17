@@ -33,11 +33,12 @@
  *      没有上游/管理端更新按钮 —— 要防的那件事不存在；这些话对读者也是多余
  *      的：本套件由维护者发布并锁定上游快照，部署方无法也不应自行同步，
  *      写在使用者界面上只会让人以为"我是不是该做点什么"。
- *   2. t('updatePanel.sigPending') 与
- *      disabled={!isAdmin || busy || running || check.manager.sig_ready === false}
+ *   2. t('updatePanel.assetsPending') 与
+ *      disabled={!isAdmin || busy || running || check.manager.assets_ready === false}
  *      来自 test_version_cache.py::SigReadyAwarenessTest::test_ui_says_it_and_holds_the_button
- *      （上游断言的字样原文），用意是「签名未就绪时提示要出现、按钮要拦住」。
- *      本面板没有更新管理端的按钮，也没有会因签名被拒的更新动作。
+ *      （上游断言的字样原文；v1.0.81~91 间字段由 sig_ready 更名为 assets_ready），
+ *      用意是「产物未就位时提示要出现、按钮要拦住」。
+ *      本面板没有更新管理端的按钮，也没有会 404 的更新动作。
  *
  * 本地预检 tests/test_patch_preflight.py::OverlaySourceGuardTest 会在字样被误删
  * 时立刻拦住；上游若移除对应守卫，它也会红 —— 那时把字样一起清掉。

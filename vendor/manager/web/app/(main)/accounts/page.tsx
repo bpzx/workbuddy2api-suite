@@ -15,11 +15,13 @@ import {
   CalendarCheck,
   Check,
   Coins,
+  RefreshCw,
   ChevronLeft,
   ChevronRight,
   Search,
   ArrowUpDown,
   RotateCcw,
+  Snowflake,
   Sparkles,
   StickyNote,
   FolderInput,
@@ -67,6 +69,7 @@ import {CreditCountdown} from '@/components/common/accounts/CreditCountdown';
 import {AccountNoteDialog} from '@/components/common/accounts/AccountNoteDialog';
 import {MoveAccountDialog} from '@/components/common/accounts/MoveAccountDialog';
 import {UpstreamFormDialog} from '@/components/common/upstreams/UpstreamFormDialog';
+import {AccountCoolingDialog} from '@/components/common/accounts/AccountCoolingDialog';
 import {AccountTaskDialog} from '@/components/common/accounts/AccountTaskDialog';
 import {useAuth} from '@/lib/auth-context';
 import {realmLabel, useRealm} from '@/lib/realm-context';
@@ -74,7 +77,6 @@ import {useT} from '@/lib/i18n/provider';
 import {Button} from '@/components/ui/button';
 import {Badge} from '@/components/ui/badge';
 import {Input} from '@/components/ui/input';
-import {Label} from '@/components/ui/label';
 import {
   Select,
   SelectContent,
@@ -118,6 +120,7 @@ export default function AccountsPage() {
   // 备注编辑（issue #67）：记的是**哪个账号**而不是布尔——弹窗要以该账号当前的
   // 备注为初值，否则会拿上一个账号的内容去保存。
   const [noteTarget, setNoteTarget] = useState<Account | null>(null);
+  const [coolingTarget, setCoolingTarget] = useState<Account | null>(null);
   // 活动任务（单账号执行成长任务）的目标账号；null = 对话框关闭
   const [taskTarget, setTaskTarget] = useState<Account | null>(null);
   const [busyFile, setBusyFile] = useState<string | null>(null);
@@ -286,6 +289,31 @@ export default function AccountsPage() {
       setCreditsBusy(false);
     }
   }, [groupId]);
+
+  /** 一键刷新所有账号的 accessToken（真的续期，末尾只重载一次上游） */
+  const [refreshTokensBusy, setRefreshTokensBusy] = useState(false);
+  const refreshAllTokens = useCallback(async () => {
+    setRefreshTokensBusy(true);
+    try {
+      const r = await accountApi.refreshAllTokens(groupId);
+      if (r.succeeded === r.total) {
+        notify.ok(
+          t('accounts.refreshTokensDone'),
+          t('accounts.refreshTokensDoneDetail', {ok: r.succeeded, total: r.total}),
+        );
+      } else {
+        notify.warn(
+          t('accounts.refreshTokensPartial', {failed: r.total - r.succeeded}),
+          t('accounts.refreshTokensPartialDetail', {ok: r.succeeded, total: r.total}),
+        );
+      }
+      await reloadAll();
+    } catch (e) {
+      notify.err(errText(e));
+    } finally {
+      setRefreshTokensBusy(false);
+    }
+  }, [reloadAll, groupId]);
 
   /** 批量签到：逐账号记录结果 */
   const checkinAll = useCallback(async () => {
@@ -994,6 +1022,21 @@ export default function AccountsPage() {
             }
           />
         )}
+        {!paused && (
+          <Button
+            variant="ghost"
+            size="icon"
+            className={
+              'h-7 w-7 rounded-md ' +
+              (a.cooling ? 'text-sky-600 hover:text-sky-700 dark:text-sky-400' : 'text-sky-500 hover:text-sky-600')
+            }
+            title={a.cooling ? t('accounts.adjustCooling') : t('accounts.forceCooling')}
+            disabled={busy}
+            onClick={() => setCoolingTarget(a)}
+          >
+            <Snowflake className="h-3.5 w-3.5" />
+          </Button>
+        )}
         {/* 移动到分组（多账号池）：把账号文件转移到另一个分组——凭证一个
             字节不改。只有存在「别的分组」时才显示；能不能收由后端判（目标
             没有本地账号目录会 409，弹窗里直接禁掉那些选项）。 */}
@@ -1108,6 +1151,23 @@ export default function AccountsPage() {
               <span className="sm:hidden">{t('accounts.creditsShort')}</span>
             </Button>
             )}
+            {/* 「一键刷新令牌」= 对所有账号真实续期 accessToken（逐个用 refreshToken
+                换新令牌），末尾只重载一次上游。与逐行那个 KeyRound 按钮同一套实现，
+                只是批量跑——账号多了不用挨个点。只有管理员能调（改的是凭证）。 */}
+            {isAdmin && (
+              <Button
+                size="sm"
+                variant="outline"
+                className="rounded-full"
+                onClick={refreshAllTokens}
+                disabled={refreshTokensBusy || !visible.length}
+                title={t('accounts.refreshTokensTitle')}
+              >
+                <RefreshCw className={refreshTokensBusy ? 'animate-spin' : ''} />
+                <span className="hidden sm:inline">{t('accounts.refreshTokens')}</span>
+                <span className="sm:hidden">{t('accounts.refreshTokensShort')}</span>
+              </Button>
+            )}
             {/* 「全部签到」仅国内版显示：国际版**没有签到体系**（上游调度器对
                 global 账号直接过滤，不发请求）。显示一个按下去只会得到「已跳过」
                 的按钮是误导，直接不给。 */}
@@ -1155,6 +1215,7 @@ export default function AccountsPage() {
           本页没有早返回的整页守卫（取不到账号时只在下面给错误态），
           所以放在这里一处即可。 */}
       <PageSectionTabs />
+
 
       {/* 账号分组（多账号池）：默认分组 = 升级前那套（环境变量 / 上游
           config.json）；「添加分组」只填名称即可（地址默认沿用默认分组的、
@@ -1526,6 +1587,13 @@ export default function AccountsPage() {
         open={noteTarget !== null}
         onOpenChange={(open) => { if (!open) setNoteTarget(null); }}
         onSaved={reloadAll}
+        upstreamId={groupId}
+      />
+      <AccountCoolingDialog
+        account={coolingTarget}
+        open={coolingTarget !== null}
+        onOpenChange={(open) => { if (!open) setCoolingTarget(null); }}
+        onSuccess={reloadAll}
         upstreamId={groupId}
       />
       <AccountTaskDialog

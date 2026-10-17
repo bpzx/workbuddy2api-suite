@@ -62,13 +62,16 @@ class TextPatchPreflightTest(unittest.TestCase):
     def test_patch_targets_are_the_expected_files(self) -> None:
         """把"改了哪些上游文件"固定下来：新增一个补丁时这里会失败，提醒复核清单。
 
-        2026-09 上游 wb2api 删除后，本项目自行维护该部分，补丁从 4 组扩到 7 组
+        2026-09 上游 wb2api 删除后，本项目自行维护该部分，补丁从 4 组扩到 7 组（
+        后 manager 内网直连补丁被上游 v1.0.91 取代删除，现为 6 组）
         （新增 3 组风控加固，因此新增 4 个 Go 文件）—— 见 UPSTREAMS.md 的登记。
+        2026-10-16 同步 v1.0.91 时，补丁「manager 内网直连」因上游用
+        _proxy_transport 自行实现而整组删除 —— manager/server/config.py
+        从此不再是补丁目标。
         """
         files = sorted({str(p.relative_to(_VENDOR)).replace('\\', '/')
                         for p, *_ in apply.build_text_edits(_VENDOR)})
         self.assertEqual(files, [
-            'manager/server/config.py',
             'manager/server/main.py',
             'manager/web/components/common/layout/ManagementBar.tsx',
             'wb2api/cmd/server/main.go',
@@ -129,12 +132,12 @@ class OverlaySourceGuardTest(unittest.TestCase):
     def test_sig_pending_tokens_survive_upstream_guard(self) -> None:
         upstream = (self._UP_TESTS / 'test_version_cache.py').read_text(encoding='utf-8')
         self.assertIn('test_ui_says_it_and_holds_the_button', upstream,
-                      '上游已移除「签名未就绪」源码守卫 —— 请清理 UpdatePanel.tsx 里的 '
-                      'sigPending 字样与禁用表达式，并删除本条测试')
+                      '上游已移除「产物未就位」源码守卫 —— 请清理 UpdatePanel.tsx 里的 '
+                      'assetsPending 字样与禁用表达式，并删除本条测试')
         panel = self._panel()
-        self.assertIn("t('updatePanel.sigPending')", panel,
-                      'UpdatePanel.tsx 丢了上游守卫要读的「签名未就绪」提示字样')
-        self.assertRegex(panel, r'disabled=\{[^}]*check\.manager\.sig_ready === false',
+        self.assertIn("t('updatePanel.assetsPending')", panel,
+                      'UpdatePanel.tsx 丢了上游守卫要读的「产物未就位」提示字样')
+        self.assertRegex(panel, r'disabled=\{[^}]*check\.manager\.assets_ready === false',
                          'UpdatePanel.tsx 丢了上游守卫要读的按钮禁用表达式字样')
 
 
@@ -184,11 +187,24 @@ class PatchIntentTest(unittest.TestCase):
     def test_go_patch_sets_proxy_field(self) -> None:
         self.assertIn('Proxy: http.ProxyFromEnvironment', apply.GO_NEW)
 
-    def test_manager_patch_adds_direct_mounts(self) -> None:
-        self.assertIn('_internal_direct_mounts', apply.MANAGER_NEW)
-        self.assertIn('kwargs[\'mounts\']', apply.MANAGER_NEW)
+    def test_manager_internal_direct_is_upstream_now(self) -> None:
+        """补丁 1「manager 内网直连」已被上游实现并删除（v1.0.91，2026-10-16）。
 
-    # ── 以下三组是上游删除后本项目自行加的风控加固（补丁 5~7）──
+        上游 _build_client() 现在用 _proxy_transport()（内网/本机直连、其余走
+        代理）。这条断言守住两件事：
+          1. 上游没有回退该实现（_proxy_transport 仍在 config.py）；
+          2. 我们没有残留旧补丁的痕迹（_internal_direct_mounts 不该再出现）。
+        若上游回退，这里会红 —— 届时按 UPSTREAMS.md 的登记恢复补丁。
+        """
+        cfg = (_VENDOR / 'manager' / 'server' / 'config.py').read_text(encoding='utf-8')
+        self.assertIn('_proxy_transport', cfg,
+                      '上游似乎回退了 _proxy_transport —— 请复核是否要恢复内网直连补丁')
+        self.assertIn('_is_internal_host', cfg,
+                      '上游的内网判定助手不见了 —— 请复核内网直连是否仍成立')
+        self.assertNotIn('_internal_direct_mounts', cfg,
+                          'vendor 里出现了我们旧补丁的函数名 —— vendor 不是干净快照')
+
+    # ── 以下三组是上游删除后本项目自行加的风控加固（补丁 4~6）──
 
     def test_device_salt_patch_keeps_default_and_adds_override(self) -> None:
         """换盐补丁必须**默认不变**（有测试断言派生值），且真的装了环境变量覆盖。"""

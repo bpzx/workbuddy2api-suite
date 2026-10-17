@@ -7,11 +7,13 @@
 逐字节一致 —— 只有这样 `scripts/sync-upstreams.sh` 才能是一条命令的事。
 
 ===== 四类改动（按侵入程度从轻到重）=====
-能用的就用轻的。当前用量：文本补丁 4 组（6 处替换）、JSON 键合并 1、文件新增 2、文件覆写 1。
+能用的就用轻的。当前用量：文本补丁 3 组（5 处替换）、JSON 键合并 1、文件新增 2、文件覆写 1。
 
   1. **文本补丁**：锚定上游某段代码原位替换，保留上游其余逻辑。
-     4 组分别是：出口代理支持（2 组）、注册套件路由（1 组）、
+     3 组分别是：出口代理支持（wb2api 侧 1 组）、注册套件路由（1 组）、
      移除不该出现的会话弹窗（1 组）。
+     （第 4 组「manager 内网直连」已被上游 v1.0.91 的 _proxy_transport 实现
+     取代并删除 —— 见下面「曾经打过」小节与 UPSTREAMS.md 的登记。）
   2. **JSON 键合并**：给 i18n 词典**新增**一个文案命名空间，不碰上游已有键。
   3. **文件新增**：放入上游没有的新文件（自研的套件更新后端）。
   4. **文件覆写**：整文件替换上游文件。**代价是放弃该文件的上游后续改进**，
@@ -54,71 +56,22 @@ SUITE_MARKER = '【SUITE-OVERLAY】'
 
 
 # ─────────────────────────────────────────────────────────────
-# 文本补丁 1：manager —— 内网请求直连，不走 WB_HTTP_PROXY
+# 文本补丁 1（manager 内网直连）：**已被上游实现并删除**（2026-10-16，v1.0.91）
 # ─────────────────────────────────────────────────────────────
-# 上游位置：vendor/manager/server/config.py 的 _build_client()（v1.0.80 起；
-# 此前是 http_client()，上游把它重构成客户端池后构造收口到了 _build_client）
-#
-# 代理（WB_HTTP_PROXY 或账号绑定线路）被直接当作 httpx 的 proxy= 传入，而该参数
-# **作用于所有请求**。官方注释只提醒「宿主机有 Clash TUN 时建议留空」，
-# 没覆盖「确实需要代理」的场景：此时连 wb2api:7863 都会被送去代理。
-#
-# 实测（httpx 0.28 + httpcore 1.0.2）：
-#   * 显式传 proxy= 时，no_proxy 环境变量**完全失效**（trust_env 与否都不行）；
-#   * 只有 mounts 能按 URL 前缀精确指定直连。
-#     → 外网 pool=AsyncSOCKSProxy / 内网 pool=AsyncConnectionPool
-MANAGER_HELPER = '''def _internal_direct_mounts() -> dict:
-    """内部服务的直连 transport（绕过 WB_HTTP_PROXY）。
-
-    【本发行版集成补丁，见 docker/patches/apply.py】
-
-    为什么必须有：httpx 的 proxy= 参数作用于**所有**请求。配了 SOCKS 代理后，
-    连同一 compose 网络内的上游 wb2api:7863 也会被送去代理，结果是管理端
-    连不上自己的上游。no_proxy 环境变量在显式 proxy= 下不生效（已实测），
-    只能靠 mounts 按 URL 前缀指定直连。
-    """
-    import httpx
-    from urllib.parse import urlsplit
-
-    mounts: dict = {}
-
-    def _add(base: str) -> None:
-        parts = urlsplit(base)
-        if not parts.hostname:
-            return
-        port = f':{parts.port}' if parts.port else ''
-        mounts[f'{parts.scheme}://{parts.hostname}{port}'] = httpx.AsyncHTTPTransport()
-
-    _add(WB2API_BASE)                # 上游网关（由配置推导，换地址自动跟上）
-    _add('http://dockerproxy:2375')  # socket 代理（实际经 docker CLI，防御性添加）
-    return mounts
-
-
-'''
-
-MANAGER_ANCHOR = 'def _build_client(tmo, proxy: str | None):'
-
-# v1.0.77~80：上游把 http_client() 重构成**客户端池**（issue #144，Windows 上每次
-# 新建 AsyncClient 要 ~1 秒）。构造收口到 _build_client()，事件循环内外的两条路径
-# （池未命中/循环外即用即弃）都经过它 —— 补丁随之移到这里，一处覆盖全部。
-# 顺带覆盖上游同轮新增的按账号代理（proxy_routes / http_client(proxy=)）：
-# 只要配了代理（无论 WB_HTTP_PROXY 还是账号绑定线路），内网就直连。
-MANAGER_OLD = """    kwargs: dict = {'timeout': tmo, 'trust_env': False}
-    if proxy:
-        kwargs['proxy'] = proxy
-    return httpx.AsyncClient(**kwargs)"""
-
-MANAGER_NEW = """    kwargs: dict = {'timeout': tmo, 'trust_env': False}
-    if proxy:
-        kwargs['proxy'] = proxy
-        # 【集成补丁】内网服务直连，不经过代理（WB_HTTP_PROXY 或账号绑定线路）。
-        # 否则配了 SOCKS 代理后，连 wb2api:7863 也会被送去代理而失败。
-        kwargs['mounts'] = _internal_direct_mounts()
-    return httpx.AsyncClient(**kwargs)"""
+# 上游 a2c78f9（#202 前的 v1.0.91 系列）把 `_build_client()` 里的
+# `kwargs['proxy'] = proxy` 换成了 `kwargs['transport'] = _proxy_transport(proxy)`，
+# 自带「内网/本机直连、其余走代理」：
+#   * `_is_internal_host()`：容器单标签主机名（wb2api）、host.docker.internal、
+#     私网/回环/链路本地/保留段 —— 覆盖面比本补丁的 URL 前缀 mounts 更广；
+#   * 请求级判定在 transport 里做，天然覆盖「账号绑定线路」路径。
+# 本补丁当初要修的「配了代理连 wb2api:7863 也被送代理」不复存在。
+# 依据本文件头的约定（「上游自行实现了其中某项能力……从 apply.py 删掉对应条目」）
+# 整组删除；如果上游回退该实现，预检锚点测试已删，需凭本注释恢复。
+# 登记见 UPSTREAMS.md「曾经打过、现已删除的补丁」。
 
 
 # ─────────────────────────────────────────────────────────────
-# 文本补丁 2：wb2api —— Go transport 读代理环境变量
+# 文本补丁 1：wb2api —— Go transport 读代理环境变量
 # ─────────────────────────────────────────────────────────────
 # 上游位置：vendor/wb2api/internal/upstream/transport.go 的 newTransport()
 #
@@ -155,7 +108,7 @@ GO_NEW = """func newTransport() *http.Transport {
 
 
 # ─────────────────────────────────────────────────────────────
-# 文本补丁 3：manager —— 注册套件更新路由
+# 文本补丁 2：manager —— 注册套件更新路由
 # ─────────────────────────────────────────────────────────────
 # 上游位置：vendor/manager/server/main.py
 #
@@ -170,11 +123,11 @@ GO_NEW = """func newTransport() *http.Transport {
 # 上游每加一个路由模块这里就会失效 —— 预检测试会在本地**立刻**报出来，
 # 按新的收尾两行照抄更新即可（不要凭记忆手写，容易被折行位置骗到）。
 MAIN_IMPORT_OLD = """    pgsync as pgsync_router, redpackets, responses, security as security_router,
-    settings, stats, system, tokens, upstreams,
+    proxies, settings, stats, system, tokens, upstreams,
 )"""
 
 MAIN_IMPORT_NEW = """    pgsync as pgsync_router, redpackets, responses, security as security_router,
-    settings, stats, system, tokens, upstreams,
+    proxies, settings, stats, system, tokens, upstreams,
 )
 # 【集成补丁】本发行版新增的套件自更新路由（实现见 server/routers/suite.py）
 from .routers import suite as suite_router"""
@@ -187,7 +140,7 @@ app.include_router(suite_router.router)"""
 
 
 # ─────────────────────────────────────────────────────────────
-# 文本补丁 4：manager —— 去掉顶部的"发现新版本"会话弹窗
+# 文本补丁 3：manager —— 去掉顶部的"发现新版本"会话弹窗
 # ─────────────────────────────────────────────────────────────
 # 上游位置：vendor/manager/web/components/common/layout/ManagementBar.tsx
 #
@@ -429,7 +382,7 @@ def _plan_i18n(root: Path, overlay: Path) -> list[tuple[Path, dict, str, dict]]:
 
 
 # ─────────────────────────────────────────────────────────────
-# 补丁 5：wb2api —— 设备标识派生盐可轮换
+# 补丁 4：wb2api —— 设备标识派生盐可轮换
 # ─────────────────────────────────────────────────────────────
 # 上游位置：vendor/wb2api/internal/upstream/headers.go 的 deriveAccountStableID()
 #
@@ -483,7 +436,7 @@ func deriveAccountStableID(uid, purpose string) string {
 
 
 # ─────────────────────────────────────────────────────────────
-# 补丁 6：wb2api —— max_in_flight=0（不限流）时启动告警
+# 补丁 5：wb2api —— max_in_flight=0（不限流）时启动告警
 # ─────────────────────────────────────────────────────────────
 # 上游位置：cmd/server/main.go 的池初始化
 #
@@ -501,7 +454,7 @@ GO_MAXINFLIGHT_NEW = """	// 【本发行版集成补丁】0 = 单账号在途**�
 
 
 # ─────────────────────────────────────────────────────────────
-# 补丁 7：wb2api —— 合成任务的固定间隔加抖动
+# 补丁 6：wb2api —— 合成任务的固定间隔加抖动
 # ─────────────────────────────────────────────────────────────
 # 上游位置：internal/scheduler/travel.go（常量所在处）与 scheduler.go（调用点）
 #
@@ -569,12 +522,8 @@ def build_text_edits(root: Path) -> list[tuple[Path, str, str, str]]:
     go_sched = root / 'wb2api' / 'internal' / 'scheduler' / 'scheduler.go'
 
     return [
-        (root / 'manager' / 'server' / 'config.py',
-         MANAGER_ANCHOR, MANAGER_HELPER + MANAGER_ANCHOR,
-         'manager: 注入 _internal_direct_mounts()'),
-        (root / 'manager' / 'server' / 'config.py',
-         MANAGER_OLD, MANAGER_NEW,
-         'manager: 内网请求直连（mounts）'),
+        # （补丁 1「manager 内网直连」已删除 —— 上游 v1.0.91 用 _proxy_transport
+        #  自行实现了更完备的版本，见文件头对应小节与 UPSTREAMS.md 的登记。）
         (root / 'wb2api' / 'internal' / 'upstream' / 'transport.go',
          GO_OLD, GO_NEW,
          'wb2api: Transport 读代理环境变量'),

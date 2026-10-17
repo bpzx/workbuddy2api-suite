@@ -74,7 +74,10 @@ class RedirectFallback(_HTTPServerBase, unittest.TestCase):
         self.assertEqual(info['tag'], 'v9.9.9')
         self.assertEqual(info['pkg_url'], f'{base}/workbuddy-manager-v9.9.9.tar.gz')
         self.assertEqual(info['pkg_name'], 'workbuddy-manager-v9.9.9.tar.gz')
-        self.assertEqual(info['sig_url'], f'{base}/workbuddy-manager-v9.9.9.tar.gz.sig')
+        # 这条路径只有重定向里的 tag，拿不到发布页摘要与大小 —— 如实留空，
+        # 由 verify_download 把「未比对」记进状态（别在这里编一个假的）。
+        self.assertEqual(info['pkg_digest'], '')
+        self.assertIsNone(info['pkg_size'])
 
     def test_redirect_fallback_rejects_tagless_location(self):
         """Location 里没有 /tag/ 时必须报错，不能拿空 tag 去拼下载地址。"""
@@ -162,11 +165,22 @@ class GithubTokenHeader(_HTTPServerBase, unittest.TestCase):
 
 class FallbackWiring(unittest.TestCase):
     def test_update_manager_wires_fallback(self):
-        """update_manager 必须先走 API、失败后回退到 302 路径。"""
-        src = inspect.getsource(worker.update_manager)
+        """取版本必须先走 API、失败后回退到 302 路径。
+
+        这条接线现在住在 `_fetch_release_info()` 里 —— 管理端与上游两条路径都
+        经它取包，所以回退只要修一处就两边都受益（上游同步也需要包）。
+        `update_manager` 自身则必须经 `_release_root()` 取包，不能绕开。
+        """
+        src = inspect.getsource(worker._fetch_release_info)
         self.assertIn('fetch_release_via_api()', src)
         self.assertIn('fetch_release_via_redirect()', src)
         self.assertIn('回退', src)
+
+        mgr = inspect.getsource(worker.update_manager)
+        self.assertIn('_fetch_release_info(', mgr,
+                      '管理端没经共用的取版本入口 —— 回退接线可能被绕开')
+        self.assertIn('_release_root(', mgr,
+                      '管理端没经共用的取包入口 —— 上游同步会另下一次包')
 
 
 if __name__ == '__main__':

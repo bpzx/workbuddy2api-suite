@@ -30,10 +30,10 @@
       "repo": "ithtelab/workbuddy-manager",
       "repo_url": "https://github.com/ithtelab/workbuddy-manager.git",
       "branch": "main",
-      "commit": "86f2dc1787d42af44a930fbcad515b499dd32358",
-      "commit_short": "86f2dc1",
-      "commit_date": "2026-10-08T12:51:41+08:00",
-      "subject": "fix(http): 借来的客户端不许被 aclose 真关（#144 自查发现的并发隐患）",
+      "commit": "a2c78f9c372355c3b677870bf6597ee6e969f8d3",
+      "commit_short": "a2c78f9",
+      "commit_date": "2026-10-16T23:35:48+08:00",
+      "subject": "fix: 随包上游源码行尾归一（CRLF → LF），修「更新后脚本类功能失效」(#202)",
       "vendor_path": "vendor/manager",
       "license": "MIT",
       "license_file": "vendor/manager/LICENSE",
@@ -41,7 +41,7 @@
         ".git"
       ],
       "note": "镜像内置于 /opt/manager；deploy/update.py 在构建期由 docker/stub/update.py 覆盖（容器内无 git/systemctl）。保留 .github：上游测试会读 .github/workflows/release.yml",
-      "synced_at": "2026-10-10T12:23:13+08:00"
+      "synced_at": "2026-10-17T00:34:19+08:00"
     }
   }
 }

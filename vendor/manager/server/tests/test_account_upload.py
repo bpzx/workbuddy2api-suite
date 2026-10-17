@@ -280,5 +280,90 @@ class ImportExportAuditTest(AccountUploadTest):
         self.assertIn('accounts.import', str(rows[0][0]))
 
 
+class AccountImportHardeningTest(AccountUploadTest):
+    """三处收口：非 JSON 的提示、覆盖导入的线路保留、导出包不重复条目。
+
+    前两条都来自现场：用户传 PDF / SVG / 导出包 ZIP 得到一句「文件内容无效」，
+    不知道该传什么；覆盖导入一份没写 proxy 的文件会把账号的出口线路**静默清掉**。
+    """
+
+    def test_non_json_name_reports_actionable_message(self) -> None:
+        """非 .json 的名字要给**可操作**的原因，而不是一句「文件内容无效」。
+
+        以前这条检查的 ValueError 落进兜底分支被统一换成「文件内容无效」——
+        既不说明支持什么，也不提「导出包是 ZIP、要先解压」。
+        """
+        for name in ('result.pdf', '1.svg', 'accounts.zip'):
+            with self.subTest(name=name):
+                response = self.client.post('/api/accounts/upload', files=[
+                    ('files', (name, b'not json at all', 'application/octet-stream')),
+                ])
+                self.assertEqual(response.status_code, 200)
+                message = response.json()['failed'][0]['message']
+                self.assertIn('.json', message, '没有说明支持什么格式')
+                self.assertIn('解压', message, '没有说明 ZIP 导出包要先解压')
+                self.assertEqual(list(self.auth_dir.glob('*')), [],
+                                 '非 JSON 文件不该在账号目录留下任何东西')
+
+    def test_overwrite_keeps_proxy_and_token_when_omitted(self) -> None:
+        """覆盖导入一份**没写** proxy / device_token 的文件：已有绑定必须保住。
+
+        这两者都是「文件没提就不动」的语义（与 device_token 对齐）：之前 proxy
+        会被静默清掉，账号出口随之无声改变——正是这个功能最忌讳的一类变更。
+        """
+        with mock.patch.object(config, 'proxy_routes',
+                               return_value={'route-a': 'http://proxy.local:8080'}):
+            first = {
+                'account': {'uid': 'keep-1', 'nickname': '旧'},
+                'auth': {'accessToken': 'at-old', 'refreshToken': 'rt-old',
+                         'expiresAt': 4102444800},
+                'device_token': 'dt-old',
+                'proxy': 'route-a',
+            }
+            r1 = self.client.post('/api/accounts/upload', files=[
+                ('files', ('a.json', json.dumps(first).encode(), 'application/json'))])
+            self.assertEqual(r1.json()['added'][0]['uid'], 'keep-1')
+
+            second = {
+                'account': {'uid': 'keep-1', 'nickname': '新'},
+                'auth': {'accessToken': 'at-new', 'refreshToken': 'rt-new',
+                         'expiresAt': 4102444801},
+            }
+            r2 = self.client.post('/api/accounts/upload?overwrite=true', files=[
+                ('files', ('b.json', json.dumps(second).encode(), 'application/json'))])
+            self.assertEqual(r2.json()['overwritten'][0]['uid'], 'keep-1')
+
+        saved = json.loads((self.auth_dir / 'workbuddy-keep-1.json').read_text(encoding='utf-8'))
+        self.assertEqual(saved['auth']['accessToken'], 'at-new')
+        self.assertEqual(saved.get('device_token'), 'dt-old', 'device_token 被覆盖导入弄丢了')
+        self.assertEqual(saved.get('proxy'), 'route-a',
+                         'proxy 被覆盖导入静默清掉了 —— 账号出口会无声改变')
+
+    def test_export_skips_duplicate_output_names(self) -> None:
+        """`.json` 与 `.json.disabled` 同时存在（手工拷贝/异常状态）时不许出重复条目。
+
+        两个文件会折成同一个导出名（`.disabled` 要被剥掉才能重新导入），zip 里
+        出现**重复条目**时解压方行为依工具而异（Python 打包自己都会告警）。
+        保留先扫到的 enabled 那份——上游实际加载的就是它。
+        """
+        enabled = {'account': {'uid': 'dup-1', 'nickname': '启用'},
+                   'auth': {'accessToken': 'at-e', 'expiresAt': 4102444800}}
+        disabled = {'account': {'uid': 'dup-1', 'nickname': '停用'},
+                    'auth': {'accessToken': 'at-d', 'expiresAt': 4102444800}}
+        (self.auth_dir / 'workbuddy-dup-1.json').write_text(
+            json.dumps(enabled), encoding='utf-8')
+        (self.auth_dir / 'workbuddy-dup-1.json.disabled').write_text(
+            json.dumps(disabled), encoding='utf-8')
+
+        response = self.client.get('/api/accounts/export')
+
+        self.assertEqual(response.status_code, 200)
+        with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+            names = archive.namelist()
+            self.assertEqual(len(names), len(set(names)), f'出现重复条目：{names}')
+            self.assertEqual(names, ['workbuddy-dup-1.json'])
+            self.assertEqual(json.loads(archive.read('workbuddy-dup-1.json')), enabled)
+
+
 if __name__ == '__main__':
     unittest.main()

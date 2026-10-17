@@ -447,8 +447,12 @@ def billing_headers(realm: Realm, auth: dict | None = None) -> dict:
 def supports_checkin(realm: Realm) -> bool:
     """该 realm 是否有签到体系。
 
-    国际版**没有**签到 / 旅行 / 活跃上报（上游调度器对 global 账号直接过滤、
-    不发起任何请求，理由是避免风控）。调用方据此跳过，而不是打过去吃 4xx。
-    令牌保活两边都支持，不在此列。
+    国际版**没有**签到 / 旅行（上游调度器对 global 账号直接过滤、不发起任何请求，
+    理由是避免风控）。调用方据此跳过，而不是打过去吃 4xx。
+
+    **活跃上报不在此列**（此前这句多写了它，让用户以为国际版刷不了活跃 —— 见
+    issue #134）：上游 `RunActivityNow` 对 CN 与 global 都上报（其 `gating_test.go`
+    的 `TestRunActivityNowReportsGlobalAccounts` 锁定了这条），面板文案也已同步。
+    令牌保活同样两边都支持。
     """
     return realm != GLOBAL
