@@ -23,14 +23,29 @@
 | 上游 | 仓库 | 分支 | Commit | 提交时间 | 快照位置 |
 |---|---|---|---|---|---|
 | wb2api | `Sliverkiss/workbuddy2api` ⚠️ **已删除** | `master` | `d1023f3` | 2026-09-21 09:52 | `vendor/wb2api` |
-| manager | [ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) | `main` | [`a2c78f9`](https://github.com/ithtelab/workbuddy-manager/commit/a2c78f9) | 2026-10-16 23:35 | `vendor/manager` |
+| manager | [ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) | `main` | [`9cb188f`](https://github.com/ithtelab/workbuddy-manager/commit/9cb188f) | 2026-10-17 00:39 | `vendor/manager` |
 
 > wb2api 那一行**不再有可点的链接**：仓库已 404（见下节）。
 > 它是**我们开始自行维护时的起点**，不是"待同步的目标"。
 
 - wb2api：`Merge pull request #184 from .../fix/image-url-`（+764/−21，15 个文件）
   含图片 URL 修复、积分口径、成长任务链、WAF 403 处理等
-- manager：`fix: 随包上游源码行尾归一（CRLF → LF），修「更新后脚本类功能失效」(#202)`
+- manager：`fix: 渠道校验不再误禁用账号；/v2 被拦时自动换 /console（用户报告）`
+  （10 文件 / +773 −25）
+  **面板显示版本 v1.0.97**（v1.0.92~96 是 a2c78f9 快照里 `server/main.py` 已带
+  的版本号）。**风控层重要修复**：上游给 `/v2/chat/completions` 加了渠道强校验
+  后，一批完全正常的账号被**误禁用**（同一业务码随封带不同 msg，按 msg 分野的
+  `request illegal` 那条会硬禁用）。修复三件套：① 新增 `upstream.IsChannelCheck`
+  （码 + 渠道校验文案**两条同时成立**，且判在 `request illegal` 之前）—— 渠道
+  校验**永不禁用**，只软冷却（策略随时可能变，禁用会逼用户白重新扫码）；
+  ② `chat_paths` 加 `/console` 兜底：主路径仍是 `/v2`（#119 实测 `/console` 挂
+  WAF 内容规则），**只在 /v2 被判渠道校验时**才换 `/console`（官方客户端走的
+  端点，用户实测恢复正常）；③ 配套测试 8 条。
+  **集成面零改动**：`server/main.py` 只动了版本号字面量（两处锚点未碰），
+  config.py / updater.py / 覆写目标 / 源码级守卫全部未变 —— 是一次"纯落盘"
+  同步（预检直接全绿）。
+
+- manager（上一轮）：`fix: 随包上游源码行尾归一（CRLF → LF），修「更新后脚本类功能失效」(#202)`
   （204 文件 / +25330 −3923）
   **面板显示版本 v1.0.91**；期间跨 **11 个发版**（v1.0.81~v1.0.91）：**代理改为
   「代理池」方案**（池开关、优先级/轮询/随机/最少调用策略、线路权重与启用开关、

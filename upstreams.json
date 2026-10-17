@@ -30,10 +30,10 @@
       "repo": "ithtelab/workbuddy-manager",
       "repo_url": "https://github.com/ithtelab/workbuddy-manager.git",
       "branch": "main",
-      "commit": "a2c78f9c372355c3b677870bf6597ee6e969f8d3",
-      "commit_short": "a2c78f9",
-      "commit_date": "2026-10-16T23:35:48+08:00",
-      "subject": "fix: 随包上游源码行尾归一（CRLF → LF），修「更新后脚本类功能失效」(#202)",
+      "commit": "9cb188f0b000ff3246f4205bba8e399a06fb9c7d",
+      "commit_short": "9cb188f",
+      "commit_date": "2026-10-17T00:39:11+08:00",
+      "subject": "fix: 渠道校验不再误禁用账号；/v2 被拦时自动换 /console（用户报告）",
       "vendor_path": "vendor/manager",
       "license": "MIT",
       "license_file": "vendor/manager/LICENSE",
@@ -41,7 +41,7 @@
         ".git"
       ],
       "note": "镜像内置于 /opt/manager；deploy/update.py 在构建期由 docker/stub/update.py 覆盖（容器内无 git/systemctl）。保留 .github：上游测试会读 .github/workflows/release.yml",
-      "synced_at": "2026-10-17T00:34:19+08:00"
+      "synced_at": "2026-10-17T13:15:12+08:00"
     }
   }
 }

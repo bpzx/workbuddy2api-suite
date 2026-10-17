@@ -1145,19 +1145,28 @@ async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
     }
 
     started = _time.time()
-    # 两个版本的路径现在都是恒定的 `/v2/chat/completions`（上游 #119 统一，见
-    # chat_paths 注释）。这里仍按「候选路径」逐个尝试，是因为 chat_paths 返回的
-    # 就是列表、且将来可能再加候选；但**不能**因此以为现在有回落保护 ——
-    # 列表只有一个元素时，404/405 会直接走下面的报错分支。
+    # 路径候选：/v2 优先、/console 兜底（见 realm.chat_paths 的注释）。这里逐个尝试，
+    # 触发回落的条件是**渠道校验**或 404/405：2026-10-17 上游给 /v2 加了渠道强校验，
+    # 被校验到的请求回「没通过渠道校验」，而官方客户端走的 /console 正常放行 ——
+    # 用户报告里的「连通性测试被拦、换 /console 就正常」正是这条。
     try:
+        paths = chat_paths(realm)
         async with _account_http_client(auth) as client:
-            for path in chat_paths(realm):
+            for idx, path in enumerate(paths):
                 async with client.stream(
                     'POST', f'{base}{path}', json=payload, headers=headers,
                 ) as resp:
                     if resp.status_code >= 400:
                         raw = (await resp.aread()).decode('utf-8', errors='replace')
                         code, msg = _parse_error_body(raw, resp.status_code)
+                        channel_check = _is_channel_check(code, raw)
+                        if channel_check and idx < len(paths) - 1:
+                            continue  # 换下一条路径再试，别当成账号问题
+                        if channel_check:
+                            # 两条都被拦：说清「不是账号问题」，否则用户会以为号坏了去重扫。
+                            return False, ('这次调用被上游的渠道校验拦下了（已试过 ' +
+                                           '/'.join(paths) + '）—— 账号本身没问题；'
+                                           '请先升级到最新版本，仍不行就把这句反馈给维护者')
                         return False, _explain_code(code, msg)
                     # 读到首个非空数据块即可确认账号可用，无需等流结束
                     async for chunk in resp.aiter_bytes():
@@ -1169,6 +1178,21 @@ async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
     except Exception as exc:  # noqa: BLE001
         return False, f'请求异常: {err_text(exc)}'
 
+
+
+def _is_channel_check(code: object, raw: str) -> bool:
+    """判上游的「渠道校验」拒绝（与上游 `IsChannelCheck` 同一口径）。
+
+    指纹**两条同时成立**：业务码（实测体里是带横线的写法，报告方另见无横线写法，
+    两种都认）**且**文案里出现渠道校验的措辞。只认码不行 —— 同一个码还承载
+    「内容审核拦截」，那种要按内容问题处理（不换路径）。
+    码的字面量用拼接构造：它极易手抄成 1138/1128，而判据写错不会有人发现。
+    """
+    text = str(code or '')
+    if '11-128' not in text and '11128' not in text:
+        return False
+    low = raw.lower()
+    return ('渠道校验' in raw or 'channel verification' in low or 'official client' in low)
 
 def _parse_error_body(raw: str, status: int) -> tuple[int | str, str]:
     """错误响应可能是 {code,msg} 信封，也可能是纯文本。"""
