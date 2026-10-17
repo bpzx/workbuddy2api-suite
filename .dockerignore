@@ -36,6 +36,11 @@ data/
 /.env
 /.env.local
 
+# 防御性排除：根目录 auths/。今天仓库根没有这个目录，但 .gitignore 认它
+# （wb2api 的 CLI 在仓库根跑过 login.sh 时会创建 ./auths，存账号凭据）。
+# 与上面 data/ 同一逻辑：构建上下文会被整体发给 daemon，绝不能带凭据。
+/auths/
+
 # ⚠️ node_modules 必须排除。Dockerfile 的 web 阶段先 `npm ci` 装依赖，
 # 再 `COPY vendor/manager/web/ ./` 覆盖源码。若宿主的 node_modules 进了上下文，
 # 这一步会用宿主（可能是别的平台/Node 版本）装出来的依赖盖掉容器里刚装好的，
