@@ -30,10 +30,10 @@
       "repo": "ithtelab/workbuddy-manager",
       "repo_url": "https://github.com/ithtelab/workbuddy-manager.git",
       "branch": "main",
-      "commit": "9cb188f0b000ff3246f4205bba8e399a06fb9c7d",
-      "commit_short": "9cb188f",
-      "commit_date": "2026-10-17T00:39:11+08:00",
-      "subject": "fix: 渠道校验不再误禁用账号；/v2 被拦时自动换 /console（用户报告）",
+      "commit": "ec7eccba04106e2f75b054cd17b175313704f3e2",
+      "commit_short": "ec7eccb",
+      "commit_date": "2026-10-18T22:08:25+08:00",
+      "subject": "fix: v2.6.3 —— 宽屏账号表格操作列保持单行",
       "vendor_path": "vendor/manager",
       "license": "MIT",
       "license_file": "vendor/manager/LICENSE",
@@ -41,7 +41,7 @@
         ".git"
       ],
       "note": "镜像内置于 /opt/manager；deploy/update.py 在构建期由 docker/stub/update.py 覆盖（容器内无 git/systemctl）。保留 .github：上游测试会读 .github/workflows/release.yml",
-      "synced_at": "2026-10-17T13:15:12+08:00"
+      "synced_at": "2026-10-19T12:25:46+08:00"
     }
   }
 }

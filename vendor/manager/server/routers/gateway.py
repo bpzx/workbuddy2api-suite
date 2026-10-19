@@ -723,6 +723,9 @@ async def list_models(request: Request):
         latency = int((time.time() - started) * 1000)
         _record(key, ip, '', '', resp.status_code, 0, 0, latency, request.headers.get('user-agent'), None, False)
         payload = _scope_models(resp.json(), key)
+        # 能力字段兜底（issue #211）：随包上游的版本可能比面板旧 —— 补丁只在上游
+        # 侧时，下游经面板拿到的清单仍缺字段，客户端会整条跳过模型。
+        payload = _listing_compat_models(payload)
         # Anthropic 客户端（Claude Code 等）也会调这个路径，但期望的结构不同
         if request.headers.get('anthropic-version'):
             payload = _as_anthropic_models(payload)
@@ -843,6 +846,51 @@ def _scope_models(payload: object, key: dict | None) -> object:
     # 别名：白名单可能写的是下游熟悉的别名，它不在清单里，要补进来
     scoped += _alias_entries(in_realm, allow)
     return {**payload, 'data': scoped}
+
+
+def _listing_compat_models(payload: object) -> object:
+    """补齐第三方模型目录客户端要读的能力字段（issue #211）。
+
+    上游从 #156 起在它自己的 `/v1/models` 里补了 `modalities` /
+    `supported_reasoning_levels`。但面板是**独立进程**，随包分发的上游可能比面板
+    旧（补丁只打在上游），于是下游经面板拿到的清单仍缺字段 —— 报告人的 Magpie
+    就是这样整条跳过模型、看不到多模态与推理档位的。
+
+    这里在面板侧再补一遍，口径与上游的 `addListingCompat` 一致，且**只增不改**：
+
+      · `modalities`：缺字段时补 `{"input": ["text"] + (["image"] if
+        supports_images)}`。文本是所有模型都有的能力；缺整个字段会让客户端
+        直接跳过（这正是 #211 的现场）；
+      · `supported_reasoning_levels`：缺字段且有 `reasoning_supported_efforts`
+        时派生成 `[{"effort": e}]`；没有档位就不编造；
+      · `supports_reasoning`：有档位而字段缺失时补 `true`。
+
+    认不出的结构（不是 `{data:[...]}`）原样透传 —— 不在看不懂的响应上动手脚。
+    """
+    if not isinstance(payload, dict):
+        return payload
+    items = payload.get('data')
+    if not isinstance(items, list):
+        return payload
+    out: list = []
+    for m in items:
+        if not isinstance(m, dict) or not m.get('id'):
+            out.append(m)
+            continue
+        entry = dict(m)
+        if 'modalities' not in entry:
+            inputs = ['text']
+            if entry.get('supports_images') is True:
+                inputs.append('image')
+            entry['modalities'] = {'input': inputs}
+        efforts = entry.get('reasoning_supported_efforts')
+        if 'supported_reasoning_levels' not in entry and isinstance(efforts, list):
+            levels = [{'effort': e} for e in efforts if isinstance(e, str) and e]
+            if levels:
+                entry['supported_reasoning_levels'] = levels
+                entry.setdefault('supports_reasoning', True)
+        out.append(entry)
+    return {**payload, 'data': out}
 
 
 # ── 对话补全（v1 / v2）──────────────────────────────────

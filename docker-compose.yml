@@ -135,6 +135,11 @@ services:
       # 面板「设置 → 出口线路」里配的"更新代理"才是运行时等价物。透传它是为了
       # 不出现"写进 .env、面板设置页却不显示"的静默断线（该页会展示此变量）。
       WB_UPDATE_PROXY: ${WB_UPDATE_PROXY:-}
+      # 可选：GitHub 镜像加速（上游 v2.4.0+ 新增，issue #216）。国内机器直连
+      # GitHub 超时时填基址（如 https://gh-proxy.com/ ）：版本检测与发布包下载
+      # 先走镜像，失败回退直连。本套件面板的套件版本检测走的是独立实现
+      # （server/services/suite.py），不消费这个变量；透传给上游自己的检测与更新用。
+      WB_GITHUB_MIRROR: ${WB_GITHUB_MIRROR:-}
     volumes:
       # 与 wb2api 共用同一份数据目录（宿主机可见）
       - ${WB_DATA_PATH:-./data}:/data

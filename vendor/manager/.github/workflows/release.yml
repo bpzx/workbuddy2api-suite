@@ -144,19 +144,112 @@ jobs:
              && tar -xzf /tmp/upstream-src.tar.gz -C "$STAGE/upstream" --strip-components=1 \
              && [ -f "$STAGE/upstream/docker-compose.yml" ]; then
             echo "已内嵌上游源码：$(find "$STAGE/upstream" -type f | wc -l) 个文件"
+            echo "has_upstream=1" >> $GITHUB_OUTPUT
           else
             echo "::warning::取不到上游源码包（$UPSTREAM_SRC_URL）——本次发布包不含 upstream/，新装用户需自备源码（UPSTREAM_SRC）"
             rmdir "$STAGE/upstream" 2>/dev/null || true
+            echo "has_upstream=0" >> $GITHUB_OUTPUT
           fi
           # 写入版本标记：管理端「系统更新」页与安装流程据此显示当前版本
           echo "${TAG}" > "$STAGE/.version"
           # 不含运行时数据与凭据
           find "$STAGE" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
           echo "stage=$STAGE" >> $GITHUB_OUTPUT
-          tar czf "${STAGE}.tar.gz" "$STAGE"
-          zip -qr "${STAGE}.zip" "$STAGE"
+          # ── 可复现打包 ─────────────────────────────────────────────
+          # 发布说明把 sha256 当作对用户的承诺。普通 `tar czf` 会把文件的
+          # mtime、属主与 gzip 自己的时间戳写进字节流 —— 同一份内容在不同
+          # 时刻/机器上重打会得到不同哈希，「基线摘要 → 产出摘要」的核对
+          # 就失去意义。这里固定排序、mtime、属主，并让 gzip 不写时间戳；
+          # 只要暂存内容一致，tar.gz 的 sha256 就一致。
+          find "$STAGE" -exec touch -h -d @0 {} + 2>/dev/null || true
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+              --format=gnu -cf - "$STAGE" | gzip -n -9 > "${STAGE}.tar.gz"
+          # zip 不是一键更新的载体（updater 只取 tar.gz），但同样去掉
+          # 平台扩展属性，避免无意义的字节差异。
+          rm -f "${STAGE}.zip"
+          zip -qrX "${STAGE}.zip" "$STAGE"
           ls -lh "${STAGE}.tar.gz" "${STAGE}.zip"
           echo "打包完成"
+
+      - name: 安装 Go（校验随包上游）
+        if: steps.pack.outputs.has_upstream == '1'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ steps.pack.outputs.stage }}/upstream/go.mod
+          cache: false
+
+      # 发布前把「随包上游」当成一次真正的构建来验：补丁是否齐全、能否编译、
+      # 单测是否通过、我们自己的改动是否 gofmt 干净。补丁是上游改动的唯一事实
+      # 来源，而 CI 以前只跑 Python 测试 —— 补丁出错会一路带进 Release。
+      - name: 校验随包上游与版本一致性
+        run: |
+          set -eu
+          TAG="${{ steps.vars.outputs.tag }}"
+          VERSION="${{ steps.vars.outputs.version }}"
+          STAGE="${{ steps.pack.outputs.stage }}"
+
+          CODE_VER=$(python3 - "$STAGE/server/main.py" <<'PY'
+          import re, sys
+          text = open(sys.argv[1], encoding='utf-8').read()
+          m = re.search(r"version='([^']+)'", text)
+          print(m.group(1) if m else '')
+          PY
+          )
+          if [ "$CODE_VER" != "$VERSION" ]; then
+            echo "::error::server/main.py 的 version=$CODE_VER 与 tag ${TAG} 不一致"
+            exit 1
+          fi
+          echo "版本一致：$CODE_VER"
+
+          if [ "${{ steps.pack.outputs.has_upstream }}" != "1" ]; then
+            echo "::warning::本包不含上游源码，跳过上游校验"
+            exit 0
+          fi
+
+          # 在副本上验，避免把 __pycache__ / 测试缓存写进要发布的目录
+          TMP=$(mktemp -d)
+          cp -a "$STAGE/upstream/." "$TMP/"
+          OUT=$(python3 dev/apply_upstream_patches.py "$TMP")
+          echo "$OUT"
+          if echo "$OUT" | grep -q '^applied:'; then
+            echo "::error::随包上游不是最新资产：仍有补丁需要现场应用"
+            exit 1
+          fi
+          N=$(ls dev/upstream-patches/*.patch | wc -l)
+          GOT=$(echo "$OUT" | grep -c '^already applied:' || true)
+          if [ "$GOT" -ne "$N" ]; then
+            echo "::error::随包上游的补丁数不符：已应用 $GOT / 共 $N"
+            exit 1
+          fi
+
+          ( cd "$TMP" && go build ./... )
+          ( cd "$TMP" && go test ./... )
+          # 只检查**补丁新增的 Go 文件**（整份都是我们写的，格式该由我们负责）。
+          # 改动过的既有文件里夹着上游自己的历史格式问题，整文件 gofmt 会误报；
+          # 而补丁里的 Python 脚本也不能喂给 gofmt。
+          NEWFILES=$(python3 - <<'PY'
+          import glob
+          out = set()
+          for path in glob.glob('dev/upstream-patches/*.patch'):
+              lines = open(path, encoding='utf-8').read().splitlines()
+              for i, line in enumerate(lines):
+                  if (line.startswith('--- /dev/null') and i + 1 < len(lines)
+                          and lines[i + 1].startswith('+++ b/')):
+                      name = lines[i + 1][6:].strip()
+                      if name.endswith('.go'):
+                          out.add(name)
+          print('\n'.join(sorted(out)))
+          PY
+          )
+          if [ -n "$NEWFILES" ]; then
+            FMT=$(cd "$TMP" && gofmt -l $NEWFILES || true)
+            if [ -n "$FMT" ]; then
+              echo "::error::补丁新增的 Go 文件未通过 gofmt：$FMT"
+              exit 1
+            fi
+          fi
+          rm -rf "$TMP"
+          echo "随包上游校验通过（$N 条补丁、build/test/gofmt）"
 
       - name: 生成发布说明
         run: |
@@ -205,6 +298,12 @@ jobs:
           if ! grep -qE '^[0-9a-f]{64}  workbuddy-manager' RELEASE_NOTES.md; then
             echo "::error::发布说明里的产物 sha256 为空，检查 STAGE 变量与打包步骤"
             exit 1
+          fi
+          # 包内上游的稳定标识：面板据此判断「这次更新是否需要同步上游」。
+          # 用 HTML 注释写在正文末尾，用户看不到，但 check-update 能读到。
+          if [ -f "$STAGE/upstream/.upstream-id" ]; then
+            echo "" >> RELEASE_NOTES.md
+            echo "<!-- upstream-id: $(cat "$STAGE/upstream/.upstream-id") -->" >> RELEASE_NOTES.md
           fi
           echo "--- 发布说明预览 ---"
           head -26 RELEASE_NOTES.md

@@ -46,10 +46,15 @@ import time
 from pathlib import Path
 
 TOP = 'workbuddy2api'
-EXCLUDE_DIRS = {'.git', '__pycache__', 'node_modules'}
-EXCLUDE_SUFFIX = {'.pyc', '.pyo'}
-# 打进去会出问题的东西：用户的运行时数据与凭据不该随源码分发。
-EXCLUDE_NAMES = {'config.json', 'auths', 'data'}
+# 打包进公开 Release 的东西必须**只含源码**：部署树的 .env、数据库、日志、Python
+# 虚拟环境里全是凭据与运行时垃圾（2026-10-18 审计：旧清单只排除了 config.json /
+# auths / data，`.env`、`*.db`、`logs/` 会被原样打进公开资产）。
+EXCLUDE_DIRS = {'.git', '__pycache__', 'node_modules', '.venv', '.runtime',
+                'logs', 'tmp', 'data', 'auths'}
+EXCLUDE_SUFFIX = {'.pyc', '.pyo', '.log', '.db', '.db-wal', '.db-shm',
+                  '.sqlite', '.sqlite3'}
+EXCLUDE_NAMES = {'config.json', 'auths', 'data', 'users.json',
+                 'update-status.json', 'version-check.json', 'upstream-ref.txt'}
 
 
 def _lf_text(raw: bytes) -> bytes:
@@ -80,11 +85,28 @@ def _iter_files(root: Path) -> list[Path]:
         if p.suffix in EXCLUDE_SUFFIX:
             continue
         # 只排除**顶层**的运行时文件/目录：源码树里若有 scripts/config.json 之类的
-        # 示例文件，那是要保留的。
-        if len(rel.parts) == 1 and rel.parts[0] in EXCLUDE_NAMES:
+        # 示例文件，那是要保留的。`.env*` 一律排除（含 .env.local 这类备份）。
+        if len(rel.parts) == 1 and (rel.parts[0] in EXCLUDE_NAMES
+                                    or rel.parts[0].startswith('.env')):
             continue
         out.append(p)
     return out
+
+
+def tree_id(root: Path) -> str:
+    """源码树的稳定标识：路径 + 内容哈希（排除了会随时间变化的说明文件）。
+
+    写进包内 `.upstream-id`，面板用它判断「这次 Release 带的上游与本机是否
+    同一份」——没有它就只能比较版本号，而版本号在纯上游修复时不会变。
+    """
+    h = hashlib.sha256()
+    for f in _iter_files(root):
+        rel = f.relative_to(root).as_posix()
+        if rel in ('UPSTREAM-SRC.txt', '.upstream-id'):
+            continue
+        h.update(rel.encode('utf-8')); h.update(b'\0')
+        h.update(f.read_bytes()); h.update(b'\0')
+    return h.hexdigest()
 
 
 def main() -> int:
@@ -137,6 +159,8 @@ LICENSE 与版权声明。
 打包说明：{args.stamp or '（未填写）'}
 打包时间：{time.strftime('%Y-%m-%d %H:%M:%S')}
 """, encoding='utf-8')
+
+        (work / '.upstream-id').write_text(tree_id(work) + '\n', encoding='utf-8')
 
         files = _iter_files(work)
         out_path: Path = args.out / 'workbuddy2api-src.tar.gz'

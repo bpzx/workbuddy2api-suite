@@ -412,6 +412,38 @@ async def account_set_proxy(
     return {'ok': True, **result, 'reload_triggered': scheduled}
 
 
+@router.put('/accounts/{filename}/weight')
+async def account_set_weight(
+    filename: str, body: dict = Body(...),
+    upstream_id: int | None = Query(None),
+    user: dict = Depends(security.require_admin),
+) -> dict:
+    """设置 / 清除账号手写权重（issue #187）。
+
+    权重是**乘数**不是优先级：上游本来就按「余额 + 快过期占比 + 闲置时长」加权
+    随机选号（见 pool.weightOf），这里把结果再乘该值 —— 2 表示同等条件下被抽中的
+    机会约为默认的两倍。它不改变可用性（冷却 / 禁用 / 在途占满照旧拦截），也不会
+    让低权重的号彻底饿死（固定优先会让闲置号的积分白过期，这正是 #187 另一半
+    诉求要避免的）。
+
+    `weight` 传 0 = 恢复默认（等价 1.0，并从文件里删掉该键）。
+
+    为什么改完要重载上游：权重在上游是**加载时**解析进内存的（auth.Parse），
+    磁盘改完不重载不生效 —— 与「出口线路」同一套机制。
+    """
+    group = _group(upstream_id)
+    try:
+        result = wb2api.set_account_weight(filename, body.get('weight', 0),
+                                           _require_dir(group))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail='账号文件不存在') from exc
+    security.audit(user, 'update_account_weight', filename, f"weight={result['weight']}")
+    scheduled = reload.request_restart(_reload_target(group))
+    return {'ok': True, **result, 'reload_triggered': scheduled}
+
+
 @router.get('/accounts')
 async def list_accounts(upstream_id: int | None = Query(None),
                         user: dict = Depends(security.current_user)) -> dict:
@@ -1115,6 +1147,13 @@ async def refresh_all_credits(
 
     base_dir = _require_dir(_group(upstream_id))
     accounts = wb2api.list_auth_accounts(base_dir)
+    # 扇出上限（issue #161）：本接口对**全部账号**并发，而它们共用同一个 httpx
+    # 连接池（借用语义见 config.http_client）。不设上限时账号一多就把池占满，
+    # 排队超过 pool 超时（WB_TENCENT_TIMEOUT）即抛 PoolTimeout —— 报告人看到的
+    # 「单号测活报 请求异常: PoolTimeout」正是被这一批批量请求挤出来的：测活借的
+    # 是同一个池，它排在队尾。限流后批量任务最多占 CREDITS_CONCURRENCY 个连接，
+    # 而交互操作（测活/单号刷新）另走独立车道，谁也不会把谁饿死。
+    sem = asyncio.Semaphore(config.CREDITS_CONCURRENCY)
 
     async def one(
         acc: dict,
@@ -1123,9 +1162,12 @@ async def refresh_all_credits(
             raw = wb2api.read_account_file(acc['file'], base_dir)
         except Exception as exc:  # noqa: BLE001
             return acc['uid'], None, f'读取失败: {exc}', False, None, []
-        ok, value, message, cached, age, expiries = await creditsvc.get_credits(
-            _auth_dict(raw), force=force, nickname=str(acc.get('nickname') or ''),
-        )
+        # 信号量包住**整次取数**而不是只包网络那一段：缓存命中时它几乎瞬时，
+        # 冷启动时这才是真正要限流的窗口。
+        async with sem:
+            ok, value, message, cached, age, expiries = await creditsvc.get_credits(
+                _auth_dict(raw), force=force, nickname=str(acc.get('nickname') or ''),
+            )
         return acc['uid'], value if ok else None, message, cached, age, expiries
 
     results = await asyncio.gather(*(one(a) for a in accounts)) if accounts else []
@@ -1460,6 +1502,8 @@ def task_logs(
     分页返回：列表只取当前页，`total` 为**当前筛选下**的总数，
     概览 `stats` 也按同一时间范围统计，保证数字与列表一致。
     """
+    limit = max(1, min(int(limit), 500))
+    offset = max(0, min(int(offset), 10_000_000))
     logs = db.list_task_logs(limit=limit, uid=uid, kind=kind, offset=offset, days=days)
 
     # 按版本过滤（realm 为空则不过滤）。日志表无 realm 列，按账号表映射 uid
@@ -1614,6 +1658,7 @@ def upstream_logs(limit: int = 200, user: dict = Depends(security.current_user))
     上游只在失败时打日志、成功大多静默（旅行与活跃上报除外，它们会记录
     积分与服务端判据）。结构化、可长期保留的记录见 /api/task-logs。
     """
+    limit = max(1, min(int(limit), 2000))
     lines = wb2api.read_container_logs(limit=limit)
     keywords = ('checkin', 'keepalive', 'user-resource', 'travel', 'activity')
     interesting = [

@@ -31,7 +31,6 @@ import {RichText} from '@/lib/i18n/rich-text';
 import {settingsApi, upstreamApi, errText} from '@/lib/api';
 import {useAsyncAll} from '@/lib/use-async-data';
 import {UpstreamEndpoints} from '@/components/settings/UpstreamEndpoints';
-import {BASE_PATH} from '@/lib/base-path';
 import {scheduleDelayError} from '@/lib/schedule-validation';
 import {
   DEFAULT_SETTINGS_TAB,
@@ -1323,7 +1322,13 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
               <div className="mb-2 text-sm font-medium">{t('settings.serviceInfo')}</div>
               <div className="space-y-1.5 text-xs">
                 {([
-                  ['listen', t('settings.infoListen'), cfg?.listen ? `127.0.0.1${cfg.listen}` : '—'],
+                  // listen 可能是 ":7863"，也可能是 "127.0.0.1:9000" / "0.0.0.0:8080"：
+                  // 只有以冒号开头时才需要补主机名，否则会出现
+                  // "127.0.0.1127.0.0.1:9000" 这种拼接。
+                  ['listen', t('settings.infoListen'),
+                   cfg?.listen
+                     ? (cfg.listen.startsWith(':') ? `127.0.0.1${cfg.listen}` : cfg.listen)
+                     : '—'],
                   ['apiKey', t('settings.infoApiKey'), cfg?.api_key_masked ? t('settings.infoApiKeySet') : '—'],
                   ['authDir', t('settings.infoAuthDir'), cfg?.auth_dir || '—'],
                 ] as [string, string, string][]).map(([id, k, v]) => (
@@ -1416,7 +1421,7 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
                   授权，所以「同样的部署、不同账号看到的模型数量不同」是正常的——
                   并非本站少显示。上游自身还会缓存 1 小时。 */}
               {models.length > 0 && (
-                <p className="mt-2 text-[10px] leading-4 text-muted-foreground/80">
+                <p className="mt-2 text-[11px] leading-4 text-muted-foreground">
                   {modelSource === 'static' ? (
                     <RichText text={t('settings.modelsStaticNote')} />
                   ) : (
@@ -1444,6 +1449,7 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
                 />
               </div>
               <Switch
+                aria-label={t('settings.expiryDailyLabel')}
                 checked={expiryDaily}
                 onCheckedChange={(v) => {
                   setExpiryDaily(v);
@@ -1513,6 +1519,7 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
 
                         {f.kind === 'bool' ? (
                           <Switch
+                            aria-label={tp(f.label)}
                             checked={!!form[g.id][f.key]}
                             disabled={!isAdmin || !upstreamReady}
                             onCheckedChange={(v) => setField(g.id, f.key, v)}
@@ -1545,7 +1552,7 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
                             disabled={!isAdmin || !upstreamReady}
                             onValueChange={(v) => setField(g.id, f.key, v)}
                           >
-                            <SelectTrigger className="h-8 w-[168px] shrink-0 bg-background text-xs">
+                            <SelectTrigger className="h-8 w-[168px] shrink-0 bg-background text-xs" aria-label={tp(f.label)}>
                               <SelectValue />
                             </SelectTrigger>
                             <SelectContent>
@@ -1920,7 +1927,7 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
               <div className="space-y-1.5">
                 <Label className="text-[11px] text-muted-foreground">{t('settings.mapTarget')}</Label>
                 <Select value={mapTarget} onValueChange={setMapTarget} disabled={!isAdmin}>
-                  <SelectTrigger className="bg-background"><SelectValue placeholder={t('chat.selectModel')} /></SelectTrigger>
+                  <SelectTrigger className="bg-background" aria-label={t('settings.mapTarget')}><SelectValue placeholder={t('chat.selectModel')} /></SelectTrigger>
                   <SelectContent>
                     {models.map((m) => (
                       <SelectItem key={m.id} value={m.id}>{m.id}</SelectItem>
@@ -2019,7 +2026,7 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
                 <div className="space-y-1.5">
                   <Label className="text-[11px] text-muted-foreground">{t('settings.usersRole')}</Label>
                   <Select value={newUser.role} onValueChange={(v) => setNewUser({...newUser, role: v})}>
-                    <SelectTrigger className="bg-background"><SelectValue /></SelectTrigger>
+                    <SelectTrigger className="bg-background" aria-label={t('settings.usersRole')}><SelectValue /></SelectTrigger>
                     <SelectContent>
                       <SelectItem value="admin">{t('settings.roleAdmin')}</SelectItem>
                       <SelectItem value="viewer">{t('settings.roleViewer')}</SelectItem>

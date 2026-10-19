@@ -1,4 +1,5 @@
 ﻿# WorkBuddy Manager —— 跨机器通用自动化更新程序（Windows）
+param([switch]$AllowUnverified)
 $ErrorActionPreference = 'Stop'
 # 脚本住在 windows\ 子目录里：项目根（server/、web/out、.env、upstream/ 所在处）
 # 是它的上一级。拼项目内的路径一律用 $root；只有找**同一目录里的兄弟脚本**才用 $scriptDir。
@@ -82,7 +83,10 @@ function Find-LocalPackage {
             Where-Object {
                 $_.Length -gt 5000000 -and `
                 -not (Test-Path "$($_.FullName).crdownload") -and `
-                -not (Test-Path "$($_.FullName).tmp")
+                -not (Test-Path "$($_.FullName).tmp") -and `
+                -not (Test-Path "$($_.FullName).part") -and `
+                -not (Test-Path "$($_.FullName).partial") -and `
+                -not (Test-Path "$($_.FullName).download")
             } | Sort-Object LastWriteTime -Descending
         
         foreach ($c in $candidates) {
@@ -97,6 +101,44 @@ function Find-LocalPackage {
 }
 
 # ── 2. 免 API 限制的版本检测（彻底杜绝 GitHub API 403 频率超限）──
+
+# GitHub 镜像（issue #216）：国内机器直连 github.com / api.github.com 常超时。
+# gh-proxy 一类服务的用法是「镜像基址 + 完整原始地址」。只在显式配置时启用；
+# 走镜像时**不发送任何 Token**（镜像会把请求转给第三方）。
+function Get-GitHubMirror {
+    $raw = $env:WB_GITHUB_MIRROR
+    if (-not $raw) {
+        # 面板里配的镜像存在数据库里，这个独立脚本读不到；.env 是它能拿到的口径。
+        $envPath = Join-Path $root '.env'
+        if (Test-Path $envPath) {
+            foreach ($line in Get-Content $envPath) {
+                if ($line -match '^\s*WB_GITHUB_MIRROR\s*=\s*(.+)$') {
+                    $raw = $Matches[1].Trim().Trim('"').Trim("'")
+                    break
+                }
+            }
+        }
+    }
+    if (-not $raw) { return '' }
+    $raw = $raw.Trim()
+    if ($raw -notmatch '^https?://') { $raw = 'https://' + $raw }
+    if ($raw -notmatch '^https?://[^/?#]+') { return '' }
+    # 拼地址的规则是「基址 + 完整原始地址」：带查询串/片段必然拼出错误页，直接不用
+    if ($raw -match '[?#]') { return '' }
+    return $raw.TrimEnd('/') + '/'
+}
+
+function New-MirrorUrl {
+    param([string]$Url, [string]$Mirror)
+    if (-not $Mirror) { return $Url }
+    if ($Url -notmatch '^https://(github\.com|api\.github\.com|codeload\.github\.com|raw\.githubusercontent\.com|objects\.githubusercontent\.com)/') {
+        return $Url
+    }
+    return "$Mirror$Url"
+}
+
+$mirrorBase = Get-GitHubMirror
+
 function Get-LatestGitHubTag {
     $proxyList = [System.Collections.Generic.List[string]]::new()
     if ($env:HTTPS_PROXY) { $proxyList.Add($env:HTTPS_PROXY) }
@@ -108,7 +150,29 @@ function Get-LatestGitHubTag {
 
     $curlExe = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
 
+    # 方式 0: 经镜像取 Releases API（镜像可代理 api.github.com，且不受网页正文限制）
+    if ($mirrorBase) {
+        try {
+            $apiParams = @{
+                Uri = "$mirrorBase" + 'https://api.github.com/repos/ithtelab/workbuddy-manager/releases/latest'
+                Headers = @{"User-Agent"="workbuddy-updater"}
+                TimeoutSec = 15
+            }
+            $res = Invoke-RestMethod @apiParams
+            if ($res.tag_name) {
+                $digest = ''
+                foreach ($a in @($res.assets)) {
+                    if ($a.name -like '*.tar.gz') { $digest = "$($a.digest)" }
+                }
+                return @{ Tag = $res.tag_name; Proxy = ''; Digest = $digest }
+            }
+        } catch {
+            Write-Host "[WARN] 镜像版本检测失败，回退直连：$($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+
     # 方式 1: 直接向 github.com 发起 HEAD 请求取重定向 Location（无 60次/小时 API 限制）
+    # 注意：gh-proxy 一类镜像只放行资源下载，对网页正文返回 403，所以这条**不走镜像**。
     if ($curlExe) {
         foreach ($p in $proxyList) {
             try {
@@ -201,10 +265,15 @@ function Test-PackageDigest {
         return $false
     }
 
+    if ($AllowUnverified) {
+        Write-Host "[WARN] 未取得发布页摘要，按 -AllowUnverified 继续（无法证明包未被替换）。" -ForegroundColor Yellow
+        Write-Host "[WARN] 本地 sha256：$actual" -ForegroundColor Yellow
+        return $true
+    }
+    Write-Host "[ERROR] 未取得发布页摘要，无法校验安装包，已拒绝安装。" -ForegroundColor Red
     Write-Host "[INFO] 本地 sha256：$actual" -ForegroundColor Cyan
-    Write-Host "[WARN] 本次未比对发布页摘要（当前走的是免 API 的版本检测路径）。" -ForegroundColor Yellow
-    Write-Host "[INFO] 想核对：把上面的值与 Releases 页面「产物校验（sha256）」比一眼。" -ForegroundColor DarkGray
-    return $true
+    Write-Host "[INFO] 请确认网络能访问 GitHub API 后重试；只在确认包来自官方发布页时才加 -AllowUnverified。" -ForegroundColor DarkGray
+    return $false
 }
 
 # ── 4. 版本比对与流程确认 ─────────────────────────────────
@@ -285,6 +354,40 @@ $targetPkg = Find-LocalPackage -searchDirectories $searchDirs -targetVersion $la
 # 走 GitHub API 时顺手拿到的发布页摘要（形如 sha256:…）；免 API 路径为空
 $expectedDigest = if ($tagInfo -and $tagInfo.Digest) { "$($tagInfo.Digest)" } else { '' }
 
+# 免 API 的版本检测（HEAD/重定向）拿不到摘要，但**摘要校验不能因此跳过**：
+# 再向 Releases API 要一次 asset.digest。拿不到就由 Test-PackageDigest 拒绝安装
+# （除非显式 -AllowUnverified）——「本机下载目录里恰好有个同名包」是最现实的
+# 投毒路径，不能默认放行。
+if (-not $expectedDigest -and $latestVer) {
+    try {
+        # 配了镜像时先经镜像取摘要（api.github.com 可被镜像代理）
+        $apiUrl = "https://api.github.com/repos/ithtelab/workbuddy-manager/releases/tags/$latestVer"
+        $apiTargets = @()
+        if ($mirrorBase) { $apiTargets += (New-MirrorUrl -Url $apiUrl -Mirror $mirrorBase) }
+        $apiTargets += $apiUrl
+        $release = $null
+        foreach ($target in $apiTargets) {
+            try {
+                $release = Invoke-RestMethod -Uri $target -TimeoutSec 15 -Headers @{
+                    'User-Agent' = 'workbuddy-updater'
+                    'Accept' = 'application/vnd.github+json'
+                }
+                break
+            } catch {}
+        }
+        if (-not $release) { throw '所有地址都取不到 Releases API' }
+        foreach ($asset in $release.assets) {
+            if ($asset.name -like 'workbuddy-manager-*.tar.gz' -and $asset.digest) {
+                $expectedDigest = [string]$asset.digest
+                Write-Host "[INFO] 已取得发布页摘要：$expectedDigest" -ForegroundColor DarkGray
+                break
+            }
+        }
+    } catch {
+        Write-Host "[WARN] 无法从 GitHub API 取得摘要：$($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
 if ($targetPkg) {
     Write-Host "[INFO] 已在目录中识别到本地安装包: $($targetPkg.FullName)" -ForegroundColor Green
     Copy-Item -Path $targetPkg.FullName -Destination $tempTar -Force
@@ -294,16 +397,31 @@ if ($targetPkg) {
     $downloadSuccess = $false
 
     # 尝试方式 1: 使用 curl.exe 命令行静默下载
+    # 配了镜像时先走镜像，失败再直连 —— 镜像自己也会抖，不能因为它挂了就没法更新。
     if ($curlExe) {
-        Write-Host "[INFO] 正在尝试后台下载官方发布包 ($latestVer)..." -ForegroundColor Cyan
-        $cArgsBase = @('-L', '--fail', '--connect-timeout', '10')
-        if ($detectedProxy) { $cArgsBase += @('-x', $detectedProxy) }
+        $downloadTargets = @()
+        if ($mirrorBase) { $downloadTargets += (New-MirrorUrl -Url $tarUrl -Mirror $mirrorBase) }
+        $downloadTargets += $tarUrl
+        foreach ($dlUrl in $downloadTargets) {
+            if ($mirrorBase -and $dlUrl -ne $tarUrl) {
+                Write-Host "[INFO] 正在尝试经镜像下载官方发布包 ($latestVer)..." -ForegroundColor Cyan
+            } else {
+                Write-Host "[INFO] 正在尝试后台下载官方发布包 ($latestVer)..." -ForegroundColor Cyan
+            }
+            $cArgsBase = @('-L', '--fail', '--connect-timeout', '10')
+            if ($detectedProxy) { $cArgsBase += @('-x', $detectedProxy) }
 
-        & $curlExe ($cArgsBase + @('-o', $tempTar, $tarUrl))
+            & $curlExe ($cArgsBase + @('-o', $tempTar, $dlUrl))
 
-        if ($LASTEXITCODE -eq 0 -and (Test-Path $tempTar) -and ((Get-Item $tempTar).Length -gt 5000000)) {
-            $downloadSuccess = $true
-            Write-Host "[SUCCESS] 发布包下载完成。" -ForegroundColor Green
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $tempTar) -and ((Get-Item $tempTar).Length -gt 5000000)) {
+                $downloadSuccess = $true
+                Write-Host "[SUCCESS] 发布包下载完成。" -ForegroundColor Green
+                break
+            }
+            Remove-Item $tempTar -Force -ErrorAction SilentlyContinue
+            if ($dlUrl -ne $tarUrl) {
+                Write-Host "[WARN] 镜像下载失败，回退直连..." -ForegroundColor Yellow
+            }
         }
     }
 
@@ -373,11 +491,10 @@ foreach ($s in $scriptsToProtect) {
     if (Test-Path $src) { Copy-Item $src (Join-Path $backupDir $s) -Force }
 }
 
-# ── 9. 安全解压并覆盖（包在解压前已核对摘要）──────────────
-Write-Host "[INFO] 正在安全解压并更新前端静态资源 (web/out) 与服务端核心文件..." -ForegroundColor Cyan
+# ── 9. 安全解压到 staging，校验后再替换（失败不动现有文件）─────────
+Write-Host "[INFO] 正在安全解压并校验发布包..." -ForegroundColor Cyan
 
 # Python 解释器：预置运行时（.runtime\python）优先，uv 虚拟环境（.venv）兜底
-# 先于清空 web/out 解析：缺解释器时立即中止，不破坏现有部署
 . (Join-Path $scriptDir 'python-env.ps1')
 $pyExe = Get-WbPython -Root $root
 if (-not $pyExe) {
@@ -385,64 +502,138 @@ if (-not $pyExe) {
     exit 1
 }
 
-# 清空旧的前端静态编译目录，避免历史版本残留
-$webOut = Join-Path $root 'web\out'
-if (Test-Path $webOut) { Remove-Item $webOut -Recurse -Force }
-
+$stage = Join-Path $root ('.tools\stage-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $stage -Force | Out-Null
 $extractScript = Join-Path $root '.tools\extract_release.py'
 New-Item -ItemType Directory -Path (Join-Path $root '.tools') -Force | Out-Null
 
+# 解压器只做一件事：把**白名单内**的成员写到 staging。
+# 安全要点（缺一不可）：
+#   · 拒绝 .. / 绝对路径 / 盘符 —— 以前的字符串前缀判断会被 `server/../.env` 绕过；
+#   · 拒绝符号链接/硬链接/设备节点 —— 它们能把写入引到安装目录之外；
+#   · 解析后再次确认落在 staging 之内（双保险）。
 $pyContent = @'
 import tarfile, sys, os
 from pathlib import Path
 
 archive_path = sys.argv[1]
-root_dir = Path(sys.argv[2])
+root_dir = Path(sys.argv[2]).resolve()
+
+def inside(target, base):
+    try:
+        target.relative_to(base)
+        return True
+    except ValueError:
+        return False
+
+def fail(message):
+    print("[extract] " + message, flush=True)
+    raise SystemExit(2)
+
+ALLOWED_PREFIX = ("web/out/", "server/", "deploy/", "docs/")
+ALLOWED_FILE = (".version", "CHANGELOG.md", "README.md", "README.en.md")
 
 with tarfile.open(archive_path, "r:gz") as tf:
     for member in tf.getmembers():
         name = member.name.replace("\\", "/")
-        parts = name.split("/")
-        if len(parts) > 1 and parts[0].startswith("workbuddy-manager-"):
-            rel_path = "/".join(parts[1:])
-        else:
-            rel_path = name
-        
-        if not rel_path:
+        parts = [p for p in name.split("/") if p not in ("", ".")]
+        if not parts:
             continue
-            
-        # 严格隔离保护项：绝不覆盖用户个人配置文件及环境
-        if (rel_path == ".env" or 
-            rel_path.startswith("data/") or 
-            rel_path.startswith(".venv/") or 
-            rel_path.startswith(".tools/") or 
-            rel_path.startswith("upstream/auths/") or 
-            rel_path == "upstream/config.json" or 
-            rel_path == "upstream/wb2api.exe"):
+        if parts[0].startswith("workbuddy-manager-"):
+            parts = parts[1:]
+        if not parts:
             continue
-            
-        # 允许更新的白名单项目产物
-        if (rel_path.startswith("web/out/") or 
-            rel_path.startswith("server/") or 
-            rel_path.startswith("deploy/") or 
-            rel_path.startswith("docs/") or 
-            rel_path in (".version", "CHANGELOG.md", "README.md", "README.en.md")):
-            target = root_dir / rel_path
-            if member.isdir():
-                target.mkdir(parents=True, exist_ok=True)
-            elif member.isfile():
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with tf.extractfile(member) as source, open(target, "wb") as dest:
-                    dest.write(source.read())
+        if any(p == ".." for p in parts) or ":" in parts[0]:
+            fail("unsafe member: " + member.name)
+        rel_path = "/".join(parts)
+        if not (rel_path in ALLOWED_FILE or rel_path.startswith(ALLOWED_PREFIX)):
+            continue
+        target = (root_dir / rel_path).resolve()
+        if not inside(target, root_dir):
+            fail("path escapes staging: " + member.name)
+        if member.issym() or member.islnk() or member.isdev():
+            fail("unsupported member type: " + member.name)
+        if member.isdir():
+            target.mkdir(parents=True, exist_ok=True)
+        elif member.isfile():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with tf.extractfile(member) as source, open(target, "wb") as dest:
+                dest.write(source.read())
 '@
 
 [System.IO.File]::WriteAllText($extractScript, $pyContent, [System.Text.Encoding]::UTF8)
 
-& $pyExe $extractScript $tempTar $root
+$extractExit = 0
+try {
+    & $pyExe $extractScript $tempTar $stage
+    $extractExit = $LASTEXITCODE
+} catch {
+    $extractExit = 1
+}
 Remove-Item $extractScript -Force -ErrorAction SilentlyContinue
 
-# 更新本地 .version 标记文件
-        # 无 BOM：别让版本号被读成「﻿v1.0.x」（面板与更新脚本都会读这个文件）
+function Restore-Scripts {
+    foreach ($s in $scriptsToProtect) {
+        $bak = Join-Path $backupDir $s
+        if (Test-Path $bak) { Copy-Item $bak (Join-Path $scriptDir $s) -Force }
+    }
+    Remove-Item $backupDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+function Fail-Update([string]$message) {
+    Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+    Restore-Scripts
+    Write-Host "[ERROR] $message" -ForegroundColor Red
+    Write-Host "[ERROR] 本次更新已中止，现有文件未做替换。" -ForegroundColor Red
+    exit 1
+}
+
+if ($extractExit -ne 0) {
+    Fail-Update "解压失败（退出码 $extractExit）—— 包可能损坏或被篡改"
+}
+# 必需产物校验：缺了任何一个都说明包不完整，绝不能进入替换阶段
+foreach ($need in @('server\main.py', 'web\out\index.html')) {
+    if (-not (Test-Path (Join-Path $stage $need))) {
+        Fail-Update "发布包缺少 $need，拒绝替换"
+    }
+}
+
+# 目录替换：先改名为 .old，再把新目录换上去；失败就把旧的换回来。
+function Replace-Dir([string]$incoming, [string]$target) {
+    $old = "$target.old"
+    if (Test-Path $old) { Remove-Item $old -Recurse -Force -ErrorAction SilentlyContinue }
+    $hadOld = Test-Path $target
+    if ($hadOld) { Move-Item -Path $target -Destination $old -Force }
+    try {
+        Move-Item -Path $incoming -Destination $target -Force
+    } catch {
+        if ($hadOld -and (Test-Path $old)) { Move-Item -Path $old -Destination $target -Force }
+        throw
+    }
+    if (Test-Path $old) { Remove-Item $old -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Write-Host "[INFO] 正在替换 server/ 与 web/out/..." -ForegroundColor Cyan
+try {
+    Replace-Dir (Join-Path $stage 'server') (Join-Path $root 'server')
+    if (Test-Path (Join-Path $stage 'web\out')) {
+        Replace-Dir (Join-Path $stage 'web\out') (Join-Path $root 'web\out')
+    }
+} catch {
+    Fail-Update "替换文件失败：$($_.Exception.Message)"
+}
+
+# 其余白名单项按整体覆盖（deploy/docs 是脚本与文档；失败不影响服务启动）
+foreach ($item in @('deploy', 'docs', 'CHANGELOG.md', 'README.md', 'README.en.md')) {
+    $src = Join-Path $stage $item
+    if (-not (Test-Path $src)) { continue }
+    $dst = Join-Path $root $item
+    if (Test-Path $dst) { Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue }
+    Copy-Item -Path $src -Destination $dst -Recurse -Force
+}
+Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+
+# .version 只在全部替换成功后写（以前失败也写，导致「代码是旧的、版本号是新的」）
 [System.IO.File]::WriteAllText((Join-Path $root '.version'), $latestVer, (New-Object System.Text.UTF8Encoding($false)))
 
 # 彻底清理临时安装包，绝不遗留磁盘垃圾

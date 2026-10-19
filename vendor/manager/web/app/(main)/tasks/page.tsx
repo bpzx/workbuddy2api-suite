@@ -409,7 +409,7 @@ export default function TasksPage() {
             </div>
             <div className="flex items-center gap-2">
               <Select value={checkinDays} onValueChange={setCheckinDays}>
-                <SelectTrigger className="h-7 w-[116px] rounded-full text-[11px]"><SelectValue /></SelectTrigger>
+                <SelectTrigger className="h-7 w-[116px] rounded-full text-[11px]" aria-label={t('tasks.checkinTitle')}><SelectValue /></SelectTrigger>
                 <SelectContent>
                   {RANGES.map((r) => (
                     <SelectItem key={r.value} value={r.value} className="text-xs">{t(r.key)}</SelectItem>
@@ -481,7 +481,7 @@ export default function TasksPage() {
                         {checkinResultText(l)}
                       </span>
                     </div>
-                    <div className="mt-0.5 flex items-center justify-between gap-2 text-[10px] text-muted-foreground">
+                    <div className="mt-0.5 flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
                       <span className="truncate tabular-nums">{fmtDateTimeMarked(l.ts)}</span>
                       <span className="shrink-0">{sourceLabel(l.source)}</span>
                     </div>
@@ -607,7 +607,7 @@ export default function TasksPage() {
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <Select value={taskDays} onValueChange={setTaskDays}>
-              <SelectTrigger className="h-7 w-[116px] rounded-full text-[11px]">
+              <SelectTrigger className="h-7 w-[116px] rounded-full text-[11px]" aria-label={t('tasks.taskLogTitle')}>
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -741,7 +741,7 @@ export default function TasksPage() {
                   >
                     {taskLogResultText(l)}
                   </div>
-                  <div className="mt-1 flex items-center justify-between gap-2 text-[10px] text-muted-foreground">
+                  <div className="mt-1 flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
                     <span className="truncate" title={l.uid}>
                       {accountLabel(l)}
                     </span>

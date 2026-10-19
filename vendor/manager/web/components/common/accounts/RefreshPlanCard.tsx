@@ -323,7 +323,7 @@ function DailyTasksSection({onRan}: {onRan?: () => void}) {
                   {warn && <TriangleAlert className="h-3.5 w-3.5 text-amber-500" />}
                   <span className={warn ? 'text-amber-600 dark:text-amber-400' : ''}>{t(labelKey)}</span>
                   {ranToday && (
-                    <span className="rounded-full bg-muted-foreground/10 px-1.5 text-[10px] text-muted-foreground">
+                    <span className="rounded-full bg-muted-foreground/10 px-1.5 text-[11px] text-muted-foreground">
                       {t('tasks.dailyRan')}
                     </span>
                   )}

@@ -48,7 +48,10 @@ function chromiumExecutable() {
 fs.mkdirSync(OUT, {recursive: true});
 const chromium = await loadPlaywright();
 const browser = await chromium.launch({executablePath: chromiumExecutable()});
-const ctx = await browser.newContext({viewport: {width: 1600, height: 1000}});
+// 视口宽度可用 WB_WIDTH 覆盖：issue #151 的现场是 1828px 出现横向滚动条，
+// 固定 1600 永远看不到它。
+const WIDTH = Number(process.env.WB_WIDTH || 1600);
+const ctx = await browser.newContext({viewport: {width: WIDTH, height: 1000}});
 const page = await ctx.newPage();
 
 const findings = [];
@@ -362,6 +365,31 @@ await page.screenshot({path: path.join(OUT, 'accounts-cooling.png'), fullPage: t
     await page.keyboard.press('Escape');   // 不提交：真实停/起上游不在这里做
     await page.waitForTimeout(400);
   }
+}
+
+// ═══ 横向溢出（issue #151：1828px 下账号页/任务页出现横向滚动条） ═══
+console.log(`
+── 横向溢出（视口 ${WIDTH}px）`);
+for (const path of ['/accounts', '/tasks']) {
+  await page.goto(`${BASE}${path}`, {waitUntil: 'load'});
+  await page.waitForTimeout(2200);
+  const info = await page.evaluate(() => {
+    const d = document.documentElement;
+    const over = d.scrollWidth - d.clientWidth;
+    let widest = null;
+    if (over > 1) {
+      for (const el of Array.from(document.querySelectorAll('*'))) {
+        const r = el.getBoundingClientRect();
+        if (r.right > d.clientWidth + 1) {
+          widest = {tag: el.tagName, cls: String(el.className || '').slice(0, 80), right: Math.round(r.right)};
+          break;
+        }
+      }
+    }
+    return {over, widest, table: !!document.querySelector('table')};
+  });
+  step(info.over <= 1, `${path} 没有横向滚动条（溢出 ${info.over}px）`,
+       info.widest ? `${info.widest.tag}.${info.widest.cls} 右边界 ${info.widest.right}` : '');
 }
 
 // ═══ 控制台 ═══

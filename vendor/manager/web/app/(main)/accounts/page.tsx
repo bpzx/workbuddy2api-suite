@@ -24,6 +24,7 @@ import {
   Snowflake,
   Sparkles,
   StickyNote,
+  Scale,
   FolderInput,
   TriangleAlert,
 } from 'lucide-react';
@@ -67,6 +68,7 @@ import {AddAccountDialog} from '@/components/common/accounts/AddAccountDialog';
 import {UploadAccountsButton} from '@/components/common/accounts/UploadAccountsButton';
 import {CreditCountdown} from '@/components/common/accounts/CreditCountdown';
 import {AccountNoteDialog} from '@/components/common/accounts/AccountNoteDialog';
+import {AccountWeightDialog} from '@/components/common/accounts/AccountWeightDialog';
 import {MoveAccountDialog} from '@/components/common/accounts/MoveAccountDialog';
 import {UpstreamFormDialog} from '@/components/common/upstreams/UpstreamFormDialog';
 import {AccountCoolingDialog} from '@/components/common/accounts/AccountCoolingDialog';
@@ -120,6 +122,9 @@ export default function AccountsPage() {
   // 备注编辑（issue #67）：记的是**哪个账号**而不是布尔——弹窗要以该账号当前的
   // 备注为初值，否则会拿上一个账号的内容去保存。
   const [noteTarget, setNoteTarget] = useState<Account | null>(null);
+  // 权重弹窗的目标账号（issue #187）：与备注分开两个弹窗 —— 备注存本端库，
+  // 权重写上游账号文件，混在一起容易让人以为「改了不用重启」。
+  const [weightTarget, setWeightTarget] = useState<Account | null>(null);
   const [coolingTarget, setCoolingTarget] = useState<Account | null>(null);
   // 活动任务（单账号执行成长任务）的目标账号；null = 对话框关闭
   const [taskTarget, setTaskTarget] = useState<Account | null>(null);
@@ -174,7 +179,7 @@ export default function AccountsPage() {
    * 留着上一组的账号渲染，分组按钮已经写着新分组了、列表却还是旧分组的人——那正是
    * 这个 hook 要消灭的谎话（同 `tasks` 的 `realm`）。
    */
-  const {values, isInitialLoading, isInitialFailed, isRefreshing, reload} =
+  const {values, errors, isInitialLoading, isInitialFailed, isRefreshing, reload} =
     useAsyncAll({pool: () => accountApi.list(groupId)}, [groupId]);
 
   /**
@@ -264,7 +269,13 @@ export default function AccountsPage() {
   //
   // 走 reload（刷新模式）：只把新数据换上去，**不**重走首屏流程——否则骨架会每
   // 30 秒闪一次。分组清单不随心跳刷新（它变的是「有哪些分组」，不是运行时状态）。
-  useHeartbeat(reload, 30000);
+  //
+  // 心跳同时刷**上游状态**（poolStatus）：只刷账号池的话，页头那组「可用 / 冷却」
+  // 会停在进页面那一刻；账号行内的冷却来自 pool 的合并结果，本来就会刷。
+  const heartbeatReload = useCallback(
+    () => { void reload(); void poolStatus.reload(); },
+    [reload, poolStatus.reload]);
+  useHeartbeat(heartbeatReload, 30000);
 
   /** 刷新所有账号的实时积分（直接向腾讯查询，非上游缓存值） */
   const [creditsBusy, setCreditsBusy] = useState(false);
@@ -718,7 +729,9 @@ export default function AccountsPage() {
     const sep = t('common.listSeparator');
     const lines = limited.map((m) => {
       const until = a.rate_limited_models?.find((x) => x.model === m.model)?.until;
-      const at = until ? new Date(until).toLocaleTimeString() : '';
+      // 用统一格式化（跟随界面语言，并带日期）：只给时分秒时跨天就分不清
+      // 「今晚恢复」还是「明晚恢复」。
+      const at = until ? fmtDateTime(Date.parse(until) / 1000) : '';
       // 11102（该账号没有这个模型）与 6004（限流）含义不同：前者等多久都不会好，
       // 该换模型；后者等一会儿就恢复。上游的 reason 前缀就是判据。
       const why = m.reason.startsWith('11102')
@@ -791,7 +804,7 @@ export default function AccountsPage() {
         </span>
         {fromSnapshot ? (
           <span
-            className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] leading-3 text-muted-foreground"
+            className="rounded-full bg-muted px-1.5 py-0.5 text-[11px] leading-3 text-muted-foreground"
             title={t('accounts.snapshotTitle')}
           >
             {t('accounts.snapshot')}
@@ -839,13 +852,19 @@ export default function AccountsPage() {
     || (accounts ?? []).some((a) => a.proxy);   // accounts 可能还没取到
 
   function renderProxy(a: Account) {
-    if (!isAdmin) return <span className="text-xs">{a.proxy || t('accounts.proxyDirect')}</span>;
+    const direct = a.proxy === '__direct__';
+    if (!isAdmin) {
+      return <span className="text-xs">{direct ? t('accounts.proxyDirectOnly') : (a.proxy || t('accounts.proxyDirect'))}</span>;
+    }
     return (
-      <Select value={a.proxy ? `route:${a.proxy}` : 'default'} disabled={proxyRoutes === null || busyFile === a.file}
+      <Select value={direct ? '__direct__' : (a.proxy ? `route:${a.proxy}` : 'default')}
+              disabled={proxyRoutes === null || busyFile === a.file}
               onValueChange={async (value) => {
                 setBusyFile(a.file);
                 try {
-                  await accountApi.setProxy(a.file, value === 'default' ? '' : value.slice(6), groupId);
+                  const next = value === 'default' ? ''
+                    : value === '__direct__' ? '__direct__' : value.slice(6);
+                  await accountApi.setProxy(a.file, next, groupId);
                   notify.ok(t('accounts.proxySaved'));
                   await reloadAll();
                 } catch (error) { notify.err(errText(error)); }
@@ -856,6 +875,7 @@ export default function AccountsPage() {
         </SelectTrigger>
         <SelectContent>
           <SelectItem value="default">{t('accounts.proxyDirect')}</SelectItem>
+          <SelectItem value="__direct__">{t('accounts.proxyDirectOnly')}</SelectItem>
           {a.proxy && !(proxyRoutes ?? []).includes(a.proxy) &&
             <SelectItem value={`route:${a.proxy}`}>{a.proxy} ({t('accounts.proxyMissing')})</SelectItem>}
           {(proxyRoutes ?? []).map((route) => <SelectItem key={route} value={`route:${route}`}>{route}</SelectItem>)}
@@ -884,7 +904,7 @@ export default function AccountsPage() {
         </div>
         {issued != null && (
           <div
-            className="mt-1 text-[10px] text-muted-foreground/70"
+            className="mt-1 text-[11px] text-muted-foreground"
             title={t('accounts.issuedAt', {at: fmtDateTime(issued)})}
           >
             {t('accounts.lastRenewed', {ago: fmtAgo(issued)})}
@@ -925,8 +945,11 @@ export default function AccountsPage() {
     // manual_disabled（越弄越糟），而真正需要的「启用」根本没有入口。
     const stopped = paused || viaBit || autoDisabled;
     const hasClearableState = a.cooling === true || rateLimitedModels(a).length > 0;
+    // 手机卡片宽度只有 260–300px，必须换行（否则最右侧的停用/删除被裁掉）；
+    // 桌面表格空间足够，固定一行 —— 否则窄的「操作」列会把图标挤成两行
+    // （issue #151 的后续反馈）。表格容器自身可横向滚动，md 以上不再换行。
     return (
-      <div className="flex justify-end gap-1">
+      <div className="flex flex-wrap justify-end gap-1 md:flex-nowrap">
         {/* 备注（issue #67）：只动本端库里的一行文本，不碰上游、不重启容器，
             所以放在最前——它是最轻的动作。任何状态下的账号都能写备注：
             停用的号恰恰更容易忘了它是谁。 */}
@@ -939,6 +962,24 @@ export default function AccountsPage() {
           onClick={() => setNoteTarget(a)}
         >
           <StickyNote className={'h-3.5 w-3.5 ' + (a.note ? 'text-amber-600 dark:text-amber-400' : '')} />
+        </Button>
+        {/* 手写权重（issue #187）：上游选号的乘数，默认 1。
+            与备注同一类「账号元数据」，所以挨着放；但它是**写上游账号文件**的，
+            改完要重载上游才生效——弹窗里写清了这一点。设过权重（≠1）时图标染成
+            主题色，否则一眼看不出这个号被特殊对待过。 */}
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-7 w-7 rounded-md"
+          title={`${t('accounts.weight')}${a.weight ? ' ×' + a.weight : ''}`}
+          disabled={busy}
+          onClick={() => setWeightTarget(a)}
+        >
+          <Scale
+            className={
+              'h-3.5 w-3.5 ' + (a.weight ? 'text-primary' : '')
+            }
+          />
         </Button>
         {/* 临时停用 / 启用（issue #21、#45）。放在最前：它是最轻的「止血」动作——
             某个号在拖后腿（一直失败、触发风控）时，先停用它比删掉更合适
@@ -1297,6 +1338,11 @@ export default function AccountsPage() {
       {/* 部分取数失败：**不能**升级成整页错误——账号列表本身可能是好的，
           把它顶掉等于因为一个配件坏掉就说「什么都看不到」。逐条说清是哪一份、
           以及它会让界面上的哪个地方失真。 */}
+      {/* 首屏成功之后**刷新失败**：以前完全无声，界面继续显示旧列表，用户以为
+          看到的是最新的。首屏失败另有整页/骨架分支，这里只报「刷新没成功」。 */}
+      {!isInitialLoading && !isInitialFailed && 'pool' in errors && (
+        <LoadError message={t('accounts.refreshFailed')} onRetry={reload} />
+      )}
       {upstreamFailed && (
         <LoadError message={t('accounts.upstreamStatusFailed')} onRetry={reload} />
       )}
@@ -1356,7 +1402,7 @@ export default function AccountsPage() {
             <div className="flex shrink-0 items-center gap-1.5">
               <ArrowUpDown className="h-3.5 w-3.5 text-muted-foreground" />
               <Select value={sort} onValueChange={(v) => { setSort(v as SortKey); setPage(1); }}>
-                <SelectTrigger className="h-9 w-[150px] bg-background"><SelectValue /></SelectTrigger>
+                <SelectTrigger className="h-9 w-[150px] bg-background" aria-label={t('accounts.sortLabel')}><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="default">{t('accounts.sortDefault')}</SelectItem>
                   <SelectItem value="remain">{t('accounts.sortRemain')}</SelectItem>
@@ -1386,9 +1432,9 @@ export default function AccountsPage() {
                     >
                       {a.nickname || t('accounts.unnamed')}
                     </div>
-                    <div className="truncate font-mono text-[10px] text-muted-foreground">{a.uid}</div>
+                    <div className="truncate font-mono text-[11px] text-muted-foreground">{a.uid}</div>
                     {a.note ? (
-                      <div className="truncate text-[10px] text-muted-foreground" title={a.note}>
+                      <div className="truncate text-[11px] text-muted-foreground" title={a.note}>
                         {t('accounts.noteLabel')}{a.note}
                       </div>
                     ) : null}
@@ -1427,7 +1473,7 @@ export default function AccountsPage() {
               <TableHead className="text-[11px] text-muted-foreground">{t('metric.credits')}</TableHead>
               <TableHead className="text-[11px] text-muted-foreground">{t('accounts.colExpiry')}</TableHead>
               {hasProxyUi && <TableHead className="text-[11px] text-muted-foreground">{t('accounts.proxyLine')}</TableHead>}
-              {isAdmin && <TableHead className="pr-4 text-right text-[11px] text-muted-foreground">{t('accounts.colActions')}</TableHead>}
+              {isAdmin && <TableHead className="whitespace-nowrap pr-4 text-right text-[11px] text-muted-foreground">{t('accounts.colActions')}</TableHead>}
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -1441,7 +1487,7 @@ export default function AccountsPage() {
                         {a.nickname || t('accounts.unnamed')}
                       </div>
                       {a.note ? (
-                        <div className="truncate text-[10px] text-muted-foreground" title={a.note}>
+                        <div className="truncate text-[11px] text-muted-foreground" title={a.note}>
                           {t('accounts.noteLabel')}{a.note}
                         </div>
                       ) : null}
@@ -1469,7 +1515,7 @@ export default function AccountsPage() {
                 <TableCell>{renderCredits(a)}</TableCell>
                 <TableCell>{renderExpiry(a)}</TableCell>
                 {hasProxyUi && <TableCell>{renderProxy(a)}</TableCell>}
-                {isAdmin && <TableCell className="pr-4">{renderActions(a)}</TableCell>}
+                {isAdmin && <TableCell className="whitespace-nowrap pr-4">{renderActions(a)}</TableCell>}
               </TableRow>
             ))}
           </TableBody>
@@ -1530,6 +1576,7 @@ export default function AccountsPage() {
                 variant="outline"
                 size="icon"
                 className="h-7 w-7 rounded-md"
+                aria-label={t('common.previousPage')}
                 disabled={paged.page <= 1}
                 onClick={() => setPage(paged.page - 1)}
               >
@@ -1539,6 +1586,7 @@ export default function AccountsPage() {
                 variant="outline"
                 size="icon"
                 className="h-7 w-7 rounded-md"
+                aria-label={t('common.nextPage')}
                 disabled={paged.page >= paged.pages}
                 onClick={() => setPage(paged.page + 1)}
               >
@@ -1586,6 +1634,13 @@ export default function AccountsPage() {
         account={noteTarget}
         open={noteTarget !== null}
         onOpenChange={(open) => { if (!open) setNoteTarget(null); }}
+        onSaved={reloadAll}
+        upstreamId={groupId}
+      />
+      <AccountWeightDialog
+        account={weightTarget}
+        open={weightTarget !== null}
+        onOpenChange={(open) => { if (!open) setWeightTarget(null); }}
         onSaved={reloadAll}
         upstreamId={groupId}
       />

@@ -19,6 +19,51 @@
 
 ## [未发布]
 
+### 同步上游：manager v2.1.0 → v2.6.3（22 个提交，含"上游自维护"体系与安全批次）
+
+`9cb188f` → `ec7eccb`（141 文件 / +9067 −2470；中间还消化了 v1.0.97 的单提交
+风控修复）。wb2api 侧维持方案 A：**不采纳**上游的 Go 补丁链（0007~0013），
+理由与实测证据见 UPSTREAMS.md 本轮登记。
+
+用户可见的主要变化（全部来自上游）：
+
+- **可信代理默认收紧**（2.3.0 安全批次）：`WB_TRUSTED_PROXY_CIDRS` 默认从
+  全部 RFC1918 收到**只信回环** —— 同一局域网/同一 Docker 网络里的其他主机
+  不再能伪造 `X-Real-IP` 绕过登录锁定、密钥 IP 白名单与红包限领。本套件默认
+  部署（反代与面板同机）不受影响；反代在别的机器/CDN 回源的部署需显式加网段。
+- **更新检测不再谎报「已是最新」**（#204）：检测失败回退旧缓存时标
+  `stale/stale_at`，界面写明「本次没拿到数据，下面是 X 时的旧结果」。
+- **GitHub Token / 镜像可在面板填**（#205/#216）：面板「设置 → 系统」填的与
+  环境变量等价（只回掩码）；新增环境变量 `WB_GITHUB_MIRROR`（compose 与
+  `.env.example` 已透传；本套件的套件版本检测走独立实现，不消费它）。
+- **连接池按用途分车道**（#161）：`http_client(lane=)` —— 批量刷积分不再把
+  交互操作的连接占满（表现为「测活」假报 PoolTimeout）；新增
+  `WB_CREDITS_CONCURRENCY`（默认 8）。
+- **账号权重 / 活动任务按任务看**（#187/#189）：auth 文件顶层 `weight` 乘数、
+  账号页「权重」入口、活动任务弹窗按任务列出状态摘要。
+- **渠道校验风控修复**（v1.0.97，#193/#201 报告的误禁用）：`IsChannelCheck`
+  永不禁用只软冷却；`/v2` 被拦时自动换 `/console`（仅该情形，主路径不变）。
+- 其他：lighthouse 真实桌面专家对话链；免费模型筛选；tok/s 统计；更新日志
+  脱敏与原子替换；pgsync 恢复改在临时库完成（换库只锁毫秒级）；a11y/弱对比/
+  移动端溢出修复；用量页 tok/s。
+
+**集成层核对**：
+
+- **预检零失效**：22 个提交跨 5 个 minor 版本，`main.py` import 块、
+  `config.py` 的 `_build_client`、ManagementBar 全部未动，锚点一次没红；
+  守卫字样（`assetsPending`/`assets_ready`/`can_update_upstream`）未变，
+  覆写面板无需跟改。新增 `test_web_a11y` 扫全部 TSX 的 `SelectTrigger`/
+  `Switch` —— 本套件覆写面板一个都没有，不受影响。
+- **`updater.py` +370 行但 `read_status` 字段口径未变**；`stale/stale_at` 是
+  加法字段且本套件不消费 —— `docker/stub/update.py` 与侧车无需调整。面板
+  「全部更新（含上游）」走的是本容器不可用的更新器路径（无 docker 能力），
+  与 stub 既有约定一致。
+- `config.example.json` 未变动；`server/requirements.txt` 未变动。
+
+**验证**：打补丁树上游 Python 全套 **2540** 项（+96）**0 失败**（4 个错误仍是
+那批 Windows 专有的迁移用例 `tearDown` 假失败）；前端静态导出通过；本项目
+**133** 项全绿。
+
 ### 修复：tag 构建因 Google Fonts 拉取偶发抖动而假红
 
 v0.2.12 首次 tag 构建红在 `build` 作业的 `npm run build:export`（Dockerfile

@@ -250,7 +250,7 @@ export default function RedPacketsPage() {
             <div className="flex items-center justify-between gap-3 rounded-2xl bg-background/60 px-3 py-2">
               <Label className="text-xs">{t('redPacket.fieldKind')}</Label>
               <Select value={kind} onValueChange={(v) => setKind(v as RedPacketKind)}>
-                <SelectTrigger className="h-8 w-44"><SelectValue /></SelectTrigger>
+                <SelectTrigger className="h-8 w-44" aria-label={t('redPacket.fieldKind')}><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="credit">{t('redPacket.kindCredit')}</SelectItem>
                   <SelectItem value="token">{t('redPacket.kindToken')}</SelectItem>
@@ -260,7 +260,7 @@ export default function RedPacketsPage() {
             <div className="flex items-center justify-between gap-3 rounded-2xl bg-background/60 px-3 py-2">
               <Label className="text-xs">{t('redPacket.fieldMode')}</Label>
               <Select value={mode} onValueChange={(v) => setMode(v as RedPacketMode)}>
-                <SelectTrigger className="h-8 w-44"><SelectValue /></SelectTrigger>
+                <SelectTrigger className="h-8 w-44" aria-label={t('redPacket.fieldMode')}><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="lucky">{t('redPacket.modeLucky')}</SelectItem>
                   <SelectItem value="even">{t('redPacket.modeEven')}</SelectItem>
@@ -301,7 +301,7 @@ export default function RedPacketsPage() {
                   placeholder={t('redPacket.fieldModelsPlaceholder')}
                 />
               </div>
-              <div className="mt-1 text-[10px] leading-3 text-muted-foreground">
+              <div className="mt-1 text-[11px] leading-3 text-muted-foreground">
                 {kind === 'token' ? t('redPacket.fieldModelsHint') : t('redPacket.fieldModelsHintOptional')}
               </div>
             </div>
@@ -348,7 +348,7 @@ export default function RedPacketsPage() {
                   <Copy className="mr-1 h-3 w-3" />{t('redPacket.copyLink')}
                 </Button>
               </div>
-              <div className="mt-1 text-[10px] leading-4 text-muted-foreground">
+              <div className="mt-1 text-[11px] leading-4 text-muted-foreground">
                 {t('redPacket.claimLinkHint')}
               </div>
             </div>
@@ -425,14 +425,14 @@ export default function RedPacketsPage() {
                       {/* 已领取 / 总量。抽奖式红包一眼要看的是这个进度 ——
                           「还剩几份」比「谁发的」重要得多。 */}
                       <span
-                        className="shrink-0 rounded-full bg-background px-1.5 py-0.5 text-[10px] tabular-nums text-muted-foreground"
+                        className="shrink-0 rounded-full bg-background px-1.5 py-0.5 text-[11px] tabular-nums text-muted-foreground"
                         title={t('redPacket.claimedTip', {n: p.claimed, total: p.shares})}
                       >
                         {p.claimed}/{p.shares}
                       </span>
 
                       {p.revoked ? (
-                        <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                        <span className="rounded-full bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
                           {t('redPacket.revokedTag')}
                         </span>
                       ) : (

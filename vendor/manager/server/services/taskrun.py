@@ -48,6 +48,7 @@ from pathlib import Path
 
 from .. import config, db
 from .errtext import err_text
+from .task_summary import summarize as summarize_tasks
 
 
 logger = logging.getLogger('workbuddy.taskrun')
@@ -319,6 +320,10 @@ def status() -> dict:
     """
     snap = dict(_state)
     snap['lines'] = list(_state['lines'])
+    # 按任务聚合（issue #189）：原始行照旧给全，额外给一份「任务 → 状态」的摘要，
+    # 界面默认展示它（用户看不出 `Sequential_Tasks_2: query 1/1 -> 可点亮…` 的
+    # 要点），原文仍在「原文」页签里可查。
+    snap['tasks'] = summarize_tasks(snap['lines'])
     snap['available'], snap['unavailable_reason'] = available()
     snaps = db.get_setting('task_claim_schedule') or {}
     snap['schedule'] = snaps if isinstance(snaps, dict) else {}
@@ -365,8 +370,18 @@ def _prepare(mode: str, target: str) -> tuple[bool, object]:
 
 
 def _launch(argv: list[str], mode: str, target: str, loop) -> tuple[bool, str]:
-    """登记状态并调度后台任务。**必须在事件循环线程里调用**（要 create_task）。"""
+    """登记状态并调度后台任务。**必须在事件循环线程里调用**（要 create_task）。
+
+    「检查是否在跑 + 置 running」必须是**原子**的：`_prepare` 在线程池里做的
+    那次检查只是快速失败提示，两次检查之间隔着一次 `await`，并发点击完全可能
+    都通过。本函数在事件循环里执行且中间没有 await，检查与置位不会交错，
+    于是这里才是真正的闸门（审计 2026-10-18：以前这里不检查，能起两个脚本，
+    对同一批账号叠写请求 —— 风控敏感）。
+    """
     global _task
+    if _state['running'] or (_task is not None and not _task.done()):
+        return False, (f'已有任务正在执行（{_state["mode"]} / {_state["target"]}），'
+                       f'请等它结束')
     _state.update({
         'running': True, 'mode': mode, 'target': target,
         'started_at': int(time.time()), 'finished_at': 0,
@@ -559,14 +574,27 @@ def os_environ() -> dict:
 
 
 async def stop() -> bool:
-    """终止正在跑的进程（界面上的「停止」）。"""
+    """终止正在跑的进程（界面上的「停止」）。
+
+    取消失竟要等 `_run` 的 finally 跑完（它会 kill 子进程、写运行历史）：
+    以前只 cancel 不 await，紧接着再点「开始」可能在新旧两个任务之间看到
+    `running=False` 的瞬间，从而起出第二个子进程。
+    """
     global _task
     if not _state['running'] or _task is None or _task.done():
         return False
+    _append('!! 已手动停止')
     _task.cancel()
+    try:
+        await _task
+    except asyncio.CancelledError:
+        pass
+    except Exception:  # noqa: BLE001
+        # 子进程失败已经在 _run 里记进状态；这里只等它收尾。
+        pass
+    # _run 的 finally 已把 running 置回 False；任务若在启动前就被取消，兜一次底。
     _state['running'] = False
     _state['finished_at'] = int(time.time())
-    _append('!! 已手动停止')
     return True
 
 

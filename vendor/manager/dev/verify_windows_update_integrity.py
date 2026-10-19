@@ -10,7 +10,8 @@ PowerShell 里跑三种输入：
 
     摘要一致（发布页给的那份）        → 期望放行
     摘要不一致（改一个字节的包）      → 期望中止
-    没给摘要（免 API 路径）           → 期望放行，只打印本地摘要
+    没给摘要（拿不到发布页摘要）      → **期望中止**（除非显式 -AllowUnverified）
+    没给摘要 + -AllowUnverified       → 期望放行并大声警告
 
 用法：
 
@@ -40,9 +41,12 @@ function Try-One($label, $a, $d) {
     Write-Output ("RESULT|{0}|EXC|{1}" -f $label, $_.Exception.Message)
   }
 }
+$AllowUnverified = $false
 Try-One 'match'     '@TAR@'      '@DIGEST@'
 Try-One 'mismatch'  '@TAMPERED@' '@DIGEST@'
 Try-One 'no-digest' '@TAR@'      ''
+$AllowUnverified = $true
+Try-One 'no-digest-allowed' '@TAR@' ''
 """
 
 
@@ -93,7 +97,10 @@ def main() -> int:
 
     want = {'match': ('BOOL', 'PROCEED'),
             'mismatch': ('BOOL', 'ABORT'),
-            'no-digest': ('BOOL', 'PROCEED')}
+            # 拿不到摘要默认拒绝：本机下载目录里的同名包是最现实的投毒路径，
+            # 「只打印本地 sha256 就放行」等于没有门禁。
+            'no-digest': ('BOOL', 'ABORT'),
+            'no-digest-allowed': ('BOOL', 'PROCEED')}
     bad = []
     for label, expected in want.items():
         actual = got.get(label)
@@ -106,7 +113,7 @@ def main() -> int:
         print('提示：返回 ARRAY 说明函数里有语句把值写进了输出流（判空数组会恒假）；'
               'mismatch 若是 PROCEED，就是「比对结果没被拿来中止」。')
         return 1
-    print('\n校验门禁正确：摘要一致放行 / 不一致中止 / 拿不到摘要则只提示')
+    print('\n校验门禁正确：一致放行 / 不一致中止 / 拿不到摘要默认拒绝（可显式放行）')
     return 0
 
 

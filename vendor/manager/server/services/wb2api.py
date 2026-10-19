@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 from .. import config
+from .filelock import file_lock
 from . import realm as _realm
 from .errtext import err_text
 from .realm import realm_of, supports_checkin
@@ -66,15 +67,72 @@ def set_account_proxy(filename: str, proxy: str, auth_dir: Path | None = None) -
     path = _safe_file(filename, auth_dir)
     if path.is_symlink():
         raise ValueError('账号文件不能是符号链接')
-    raw = json.loads(path.read_text(encoding='utf-8'))
-    if not isinstance(raw, dict):
-        raise ValueError('账号文件格式异常')
-    if proxy:
-        raw['proxy'] = proxy
-    else:
-        raw.pop('proxy', None)
-    _atomic_write_json(path, raw)
+    # 读—改—写串行（见 filelock.py）：与续期/导入并发时，后写者不会用旧快照
+    # 把先写者刚改的字段盖回去。
+    with file_lock(path):
+        raw = json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(raw, dict):
+            raise ValueError('账号文件格式异常')
+        if proxy:
+            raw['proxy'] = proxy
+        else:
+            raw.pop('proxy', None)
+        _atomic_write_json(path, raw)
     return {'file': filename, 'proxy': proxy}
+
+
+# 手写权重的取值范围（issue #187）：与上游 `auth.MinWeight` / `auth.MaxWeight`
+# 是同一口径。两边各有一份常量是因为它们跑在不同进程里——改一处必须同时改另一处。
+WEIGHT_MIN = 0.1
+WEIGHT_MAX = 100.0
+
+
+def _weight_of(raw: dict) -> float:
+    """读 auth 文件顶层 `weight`：非法值按 0（未设置）处理，与上游 Parse 同口径。
+
+    不做上下限钳制：钳制只在选号时发生（上游 `auth.PickWeight`），而列表要按
+    文件里的真实值回显，否则用户会看到「我填了 0.01，界面显示 0.1」。
+    """
+    try:
+        value = float(raw.get('weight') or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if value != value or value in (float('inf'), float('-inf')) or value < 0:
+        return 0.0
+    return value
+
+
+def set_account_weight(filename: str, weight: float,
+                       auth_dir: Path | None = None) -> dict:
+    """只更新手写权重，保留凭据及其他字段；写入复用账号文件的原子替换。
+
+    `weight` 传 0 = **清除**（恢复默认 1.0），与「把 1 写进文件」刻意区分：
+    默认值不该出现在每个账号文件里，否则手改过的文件会被悄悄加上一个键。
+    范围校验只在这里做（服务层唯一口径），路由负责把 ValueError 转成 400。
+    """
+    from .tencent import _atomic_write_json
+
+    try:
+        value = float(weight)
+    except (TypeError, ValueError) as exc:
+        raise ValueError('权重必须是数字') from exc
+    if value != value or value in (float('inf'), float('-inf')):
+        raise ValueError('权重必须是有限数字')
+    if value != 0 and not (WEIGHT_MIN <= value <= WEIGHT_MAX):
+        raise ValueError(f'权重需在 {WEIGHT_MIN:g} 与 {WEIGHT_MAX:g} 之间（0 = 清除）')
+    path = _safe_file(filename, auth_dir)
+    if path.is_symlink():
+        raise ValueError('账号文件不能是符号链接')
+    with file_lock(path):
+        raw = json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(raw, dict):
+            raise ValueError('账号文件格式异常')
+        if value == 0:
+            raw.pop('weight', None)
+        else:
+            raw['weight'] = value
+        _atomic_write_json(path, raw)
+    return {'file': filename, 'weight': value}
 
 
 def _jwt_times(access_token: str) -> tuple[int, int] | None:
@@ -206,6 +264,10 @@ def list_auth_accounts(auth_dir: Path | None = None) -> list[dict]:
                 'realm': realm_of({'realm': raw.get('realm') or auth.get('realm'),
                                    'domain': auth.get('domain')}),
                 'domain': str(auth.get('domain') or ''),
+                # 手写权重（issue #187）：0 = 未设置（上游按 1.0 处理）。
+                # 原样给出，不做钳制——界面要按文件里的真实值回显，
+                # 钳制与默认值只在选号时生效（上游 auth.PickWeight）。
+                'weight': _weight_of(raw),
                 # 该版本是否支持签到体系（国际版没有，调用方据此跳过而不是打 4xx）
                 'checkin_supported': supports_checkin(
                     realm_of({'realm': raw.get('realm') or auth.get('realm'),
@@ -1656,7 +1718,12 @@ def save_upstream_config(patch: dict) -> dict:
             'token': str(current.get('token') or ''),
         }
 
-    path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding='utf-8')
+    # 原子写（issue：审计 2026-10-18）：直接 write_text 会先截断再写，保存的瞬间
+    # 并发的网关请求可能读到半截文件（api_key / 代理线路回退为空），进程崩溃还会
+    # 留下坏配置。与账号文件同一套 tmp + os.replace。
+    from .tencent import _atomic_write_json
+    with file_lock(path):
+        _atomic_write_json(path, cfg)
     # 保存后立即让 realm 的配置缓存失效：否则 global.enabled / 两个 base 的改动
     # 最长要 10 秒后才生效，用户会以为没保存成功
     _realm.invalidate()
@@ -1935,9 +2002,18 @@ async def test_upstash(url: str, token: str | None = None) -> tuple[bool, str]:
         return False, blocked
 
     if not token:
+        # 用**已保存**的 Token 时，地址也必须是已保存的那一个：只允许测保存过的
+        # 组合，不允许「拿存好的 Token 去请求任意公网地址」。否则管理端（或
+        # admin scope 的 API Token）传入自己的服务器地址、token 留空，就能把
+        # 配置里的 Upstash Token 以 Authorization 头带出去（审计 2026-10-18）。
         try:
             cfg = json.loads(config.UPSTREAM_CONFIG.read_text(encoding='utf-8'))
-            token = str((cfg.get('upstash') or {}).get('token') or '')
+            saved = (cfg.get('upstash') or {}) if isinstance(cfg, dict) else {}
+            saved_base = _upstash_rest_base(str(saved.get('url') or ''))
+            if not saved_base or saved_base != base:
+                return False, ('未提供 Token，且地址与已保存的不一致 —— '
+                               '请填写 Token 后再测试（不会把已存 Token 发往新地址）')
+            token = str(saved.get('token') or '')
         except Exception:  # noqa: BLE001
             token = ''
     if not token:

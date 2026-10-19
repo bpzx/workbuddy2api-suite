@@ -7,6 +7,11 @@ export interface Me {
 
 export interface Account {
   proxy?: string;
+  /**
+   * 手写权重（issue #187）：上游选号的**乘数**，默认 1；0 = 未设置（等价 1）。
+   * 写在上游 auth 文件顶层 `weight` 里 —— 上游刷新 token 时会保留它。
+   */
+  weight?: number;
   /** 该令牌签发的总时长（秒）；后端从 JWT 解出，解不出为 null */
   ttl_seconds?: number | null;
   /** 令牌签发时间（秒）≈ 最近一次刷新时间；后端从 JWT iat 解出，解不出为 null */
@@ -728,6 +733,13 @@ export interface UsageBreakdown {
   completion_tokens: number;
   /** 该维度实际扣费合计 */
   credit: number;
+  /**
+   * 输出速率（tokens/秒，issue #214）：按「生成耗时 = 总耗时 − 首字耗时」估算。
+   * null / 缺省 = 没有可用样本（日志已清或该模型没成功请求），界面显示「—」。
+   */
+  tokens_per_sec?: number | null;
+  /** 参与速率计算的请求条数（只覆盖日志保留期内的成功请求） */
+  throughput_samples?: number;
 }
 
 export interface StatsSummary {
@@ -930,6 +942,17 @@ export interface TaskLogResponse {
  *   claim   只领已完成任务的奖励（幂等，不伪造行为）
  *   full    点亮 + 领奖（会伪造活跃上报，有风控风险，需二次确认）
  */
+/** 活动任务的一行摘要（后端 task_summary.summarize 产出，issue #189） */
+export interface TaskRunSummaryItem {
+  /** 上游任务码，如 `Sequential_Tasks_2`；认不出的就原样显示 */
+  code: string;
+  state: 'pending' | 'claimed' | 'skipped' | 'failed';
+  /** 该任务最有代表性的一条原始日志行（未翻译） */
+  line: string;
+  /** 命中该任务的行数（多行时取最需要行动的那条做代表） */
+  count: number;
+}
+
 export interface TaskRunStatus {
   running: boolean;
   mode: string;
@@ -941,6 +964,12 @@ export interface TaskRunStatus {
   error: string;
   /** 输出尾部（脚本按行打印，后端只保留最近若干行） */
   lines: string[];
+  /**
+   * 按任务聚合的摘要（issue #189）：每条 `{code, state, line, count}`。
+   * `line` 是原始日志行（前端按当前语言渲染），`state` 是机器可读枚举。
+   * 后端按「失败 → 待处理 → 已领取 → 跳过」排好序，前端不再重排。
+   */
+  tasks?: TaskRunSummaryItem[];
   /** 上游脚本与账号目录是否就位；false 时 unavailable_reason 说明原因与做法 */
   available: boolean;
   unavailable_reason: string;
@@ -1010,6 +1039,15 @@ export interface VersionSide {
   has_update: boolean;
   /** 检测失败原因 */
   error: string;
+  /**
+   * 这一侧的值是否来自**上一次**成功检测（本次失败了）。
+   *
+   * 为 true 时界面不能下「已是最新」的结论 —— 那等于把一次 403/网络失败说成
+   * 「确实没有新版本」（issue #204）。
+   */
+  stale?: boolean;
+  /** 旧值的检测时间（秒，配合 stale 显示「下面是 X 时的结果」） */
+  stale_at?: number;
 }
 
 export interface ManagerVersion extends VersionSide {
@@ -1022,6 +1060,12 @@ export interface ManagerVersion extends VersionSide {
    * 只会拿到 404，界面要**先说清楚**。`null` = 未知（旧缓存）。
    */
   assets_ready: boolean | null;
+  /** Release 正文（纯文本，截断）；更新前展示，避免装完才知道配套要求 */
+  release_notes?: string;
+  /** Release 发布时间（ISO 字符串） */
+  published_at?: string;
+  /** 本次发布包内的上游与本机不一致（由 Release 正文里的 upstream-id 判断） */
+  upstream_changed?: boolean;
   repo: string;
 }
 
@@ -1082,6 +1126,22 @@ export interface Versions {
   upstream_connected: boolean;
   upstream_accounts: number | null;
   upstream_dir: string;
+}
+
+/**
+ * GitHub 镜像（issue #216）：国内机器直连 GitHub 超时时，用加速服务取
+ * Release 元信息与发布包。走镜像时**不会**发送 GitHub Token。
+ */
+export interface GithubMirror {
+  /** 生效的镜像基址（规范化后带尾斜杠）；空串 = 直连 */
+  mirror: string;
+  /** 面板里存的值（空 = 没设过） */
+  stored: string;
+  /** 部署时注入的环境变量 WB_GITHUB_MIRROR */
+  env_mirror: string;
+  source: 'panel' | 'env' | '';
+  /** 界面上的快捷选项 */
+  presets: string[];
 }
 
 /** 更新日志中的一条（level 1 = 二级缩进，作为子项展示） */

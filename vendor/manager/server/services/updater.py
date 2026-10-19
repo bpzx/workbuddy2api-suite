@@ -16,11 +16,16 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
+import logging
+
 from .. import config, db
 from .errtext import err_text
+
+logger = logging.getLogger(__name__)
 
 STATUS_FILE = config.DATA_DIR / 'update-status.json'
 # docker 可用性缓存（(时间, 布尔)）。每次探测要跑 docker info（~50ms），
@@ -164,6 +169,20 @@ def can_control_docker() -> bool:
     return ok
 
 
+# 代理地址里的 userinfo（`http://user:pass@host`）。日志与状态文件会经
+# /api/system/update-status 返回给登录用户，凭据不能就这么露出去。
+_PROXY_CRED_RE = re.compile(r'(?i)(https?|socks5h?|socks4)://[^/@\s]+@')
+
+
+def redact_credentials(text: str) -> str:
+    """把文本里的 `scheme://user:pass@host` 脱敏成 `scheme://***@host`。
+
+    用于更新日志的出口（读状态、tail 日志）。写入口也在脱敏（update.py 的
+    redact_proxy），这里是**存量文件**的兜底 —— 旧版本已经写进去的日志同样会被洗。
+    """
+    return _PROXY_CRED_RE.sub(lambda m: f'{m.group(1)}://***@', str(text))
+
+
 def read_status() -> dict:
     """读取进度；附上当前版本与是否正在运行。"""
     container = in_container()
@@ -215,6 +234,21 @@ def read_status() -> dict:
 
     if _lock_active():
         status['running'] = True
+    # 出口兜底：旧版本写在 update-status.json 里的日志可能带过凭据，读取时统一洗一遍。
+    logs = status.get('logs')
+    if isinstance(logs, list):
+        # 日志条目是 dict（ts/level/text），不能整体 str()：那会把结构变成
+        # Python repr 字符串，前端读 l.text 全部是 undefined，看起来就是
+        # 「有行数、正文空白」（issue #224）。只洗 text 字段，结构原样保留。
+        cleaned = []
+        for item in logs:
+            if isinstance(item, dict):
+                entry = dict(item)
+                entry['text'] = redact_credentials(str(entry.get('text') or ''))
+                cleaned.append(entry)
+            else:
+                cleaned.append(redact_credentials(str(item)))
+        status['logs'] = cleaned
     return status
 
 
@@ -341,6 +375,42 @@ def _pid_alive_windows(pid_int: int) -> bool:
         return exit_code.value == STILL_ACTIVE
     finally:
         kernel32.CloseHandle(handle)
+
+
+def _claim_lock() -> bool:
+    """原子抢占更新锁：True = 抢到，False = 已有任务 / 无法创建。
+
+    为什么不能「先 _lock_active() 再等 spawn 之后写锁」：两次检查之间的窗口里，
+    第二个请求同样能通过检查，于是两个更新进程同时替换 server/（审计
+    2026-10-18 的 check-then-spawn 竞态）。O_CREAT|O_EXCL 让「检查 + 占用」
+    成为一次原子操作。
+
+    占位先写面板 pid，spawn 成功后改写为 worker pid —— `_lock_active` 按
+    「pid 存活 + mtime 未超 TTL」判活，占位只是极短窗口内的安全值。
+    """
+    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # 顺手清掉已失效的旧锁（进程没了 / 超过 TTL）；清理与创建之间仍可能竞争，
+    # 所以创建本身必须是原子的。
+    _lock_active()
+    try:
+        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return False
+    except OSError as exc:  # noqa: BLE001
+        logger.warning('无法创建更新锁：%s', err_text(exc))
+        return False
+    try:
+        os.write(fd, str(os.getpid()).encode())
+    finally:
+        os.close(fd)
+    return True
+
+
+def _release_lock() -> None:
+    try:
+        LOCK_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _lock_active() -> bool:
@@ -505,6 +575,16 @@ def start_update(target: str, *, source: str = 'release') -> tuple[bool, str]:
         env['WB_HTTP_PROXY'] = stored_http_proxy
     if stored_update_proxy:
         env['WB_UPDATE_PROXY'] = str(stored_update_proxy)
+    # GitHub Token 一并传给更新器（issue #205）：它拉 Release / 校验也走 GitHub API，
+    # 未认证同样吃 60/h 的限流。空值不传（避免把空变量覆盖掉部署环境里的那份）。
+    _token = github_token()
+    if _token:
+        env['WB_GITHUB_TOKEN'] = _token
+    # GitHub 镜像（issue #216）：面板设置里配了才传，空值不覆盖部署环境里的那份。
+    # 走镜像时更新器**不会**把 Token 发出去（见 deploy/update.py 的 _github_headers）。
+    _mirror = github_mirror()
+    if _mirror:
+        env['WB_GITHUB_MIRROR'] = _mirror
     env.update({
         'WB_INSTALL_DIR': str(config.ROOT),
         'WB_UPSTREAM_DIR': str(_upstream_dir()),
@@ -529,6 +609,11 @@ def start_update(target: str, *, source: str = 'release') -> tuple[bool, str]:
         if package_expected:
             env['WB_UPDATE_PACKAGE_SHA256'] = package_expected
 
+    # 原子抢占：到这里所有前置校验都过了，下一行就是 spawn。抢不到说明另一个
+    # 请求刚好抢先（上面的 _lock_active 只是快速失败，两个请求可以同时通过）。
+    if not _claim_lock():
+        return False, '已有更新任务正在执行'
+
     try:
         logfh = open(LOG_FILE, 'ab')
     except Exception:  # noqa: BLE001
@@ -546,6 +631,7 @@ def start_update(target: str, *, source: str = 'release') -> tuple[bool, str]:
    if os.name == 'nt' else {'start_new_session': True}),
         )
     except Exception as exc:  # noqa: BLE001
+        _release_lock()   # 抢到锁但没起来：必须放掉，否则界面永远显示「已有任务」
         return False, f'启动更新失败：{err_text(exc)}'
     finally:
         try:
@@ -557,6 +643,7 @@ def start_update(target: str, *, source: str = 'release') -> tuple[bool, str]:
     _write_initial_status(target, proc.pid)
 
     try:
+        # 锁里换成 worker 的 pid：_lock_active 靠它判断「更新进程还在不在」。
         LOCK_FILE.write_text(str(proc.pid), encoding='utf-8')
     except Exception:  # noqa: BLE001
         pass
@@ -587,7 +674,8 @@ def tail_log(lines: int = 80) -> str:
         return ''
     try:
         content = LOG_FILE.read_text(encoding='utf-8', errors='replace').splitlines()
-        return '\n'.join(content[-lines:])
+        tail = '\n'.join(content[-lines:])
+        return redact_credentials(tail)
     except Exception:  # noqa: BLE001
         return ''
 
@@ -606,20 +694,200 @@ MANAGER_REPO = os.environ.get('WB_MANAGER_REPO') or 'ithtelab/workbuddy-manager'
 _upstream_api_repo_cache: str | None = None
 
 
+def github_token() -> str:
+    """生效的 GitHub Token：环境变量优先，其次「设置 → 系统」里填的那份。
+
+    为什么要有面板这一份（issue #205）：未认证的 API 配额只有 60 次/小时/IP，
+    容器/系统代理共享出口时极易被同出口的其他人打满，表现为「检测更新」403；
+    而代码一直支持认证（限额 5000 次/小时），用户却没地方知道、也没地方填 ——
+    只能翻源码或更新日志。面板填的这份与部署时注入的环境变量等价。
+    """
+    for key in ('WB_GITHUB_TOKEN', 'GITHUB_TOKEN'):
+        v = (os.environ.get(key) or '').strip()
+        if v:
+            return v
+    try:
+        return str(db.get_setting('github_token', '') or '').strip()
+    except Exception:  # noqa: BLE001
+        return ''
+
+
+def mask_token(token: str) -> str:
+    """只露尾 4 位，供界面回显（**绝不回明文**）。"""
+    t = (token or '').strip()
+    if not t:
+        return ''
+    return ('*' * max(0, len(t) - 4)) + t[-4:]
+
+
+# ── GitHub 镜像（issue #216）──────────────────────────────────
+# 国内机器直连 github.com / api.github.com 常超时。gh-proxy 这类服务的用法是
+# 「镜像基址 + 完整原始地址」：
+#   https://gh-proxy.com/https://api.github.com/repos/<owner>/<repo>/releases/latest
+# 只在部署者显式配置时启用 —— 镜像会把请求转给第三方。
+GITHUB_PREFIXES = (
+    'https://github.com/',
+    'https://api.github.com/',
+    'https://codeload.github.com/',
+    'https://raw.githubusercontent.com/',
+    'https://objects.githubusercontent.com/',
+)
+
+
+def normalize_mirror(value: object) -> str:
+    """把镜像基址规范成 `https://host/`；非法值返回空串（= 不启用）。
+
+    带查询串 / 片段的地址直接拒绝：拼出来的必须是「基址 + 完整原始地址」，
+    多一个 `?` 或 `#` 会让后半截被当成镜像自己的参数。
+    """
+    raw = str(value or '').strip()
+    if not raw or any(c.isspace() for c in raw):
+        return ''
+    if '://' not in raw:
+        raw = 'https://' + raw
+    try:
+        parts = urllib.parse.urlsplit(raw)
+    except ValueError:
+        return ''
+    if parts.scheme not in ('http', 'https') or not parts.hostname:
+        return ''
+    # 主机段只允许主机名/IP 字面量会出现的字符：`https://not a url` 这类
+    # 输入会被 urlsplit 当成合法 hostname，拼出来的地址必然连不上。
+    if not re.fullmatch(r'[A-Za-z0-9._\-:\[\]]+', parts.netloc):
+        return ''
+    if parts.query or parts.fragment:
+        return ''
+    return f'{parts.scheme}://{parts.netloc}{parts.path.rstrip("/")}/'
+
+
+def stored_github_mirror() -> str:
+    """面板设置里存的镜像；空串 = 没设过。"""
+    try:
+        return str(db.get_setting('github_mirror', '') or '').strip()
+    except Exception:  # noqa: BLE001
+        return ''
+
+
+def github_mirror() -> str:
+    """生效的镜像基址：面板设置优先，其次环境变量 WB_GITHUB_MIRROR。"""
+    return normalize_mirror(stored_github_mirror()
+                            or os.environ.get('WB_GITHUB_MIRROR') or '')
+
+
+def _mirror_url(url: str, mirror: str) -> str:
+    if not mirror or not url.startswith(GITHUB_PREFIXES):
+        return url
+    return f'{mirror}{url}'
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """不让 urllib 自动跟随 302：我们要读 Location 里的 tag（issue #226）。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def _release_latest_via_redirect(url: str) -> dict:
+    """API 不可用时的回退：读 github.com/.../releases/latest 的 302 Location。
+
+    很多企业网关会 TLS 拦截 api.github.com 并返回 HTML 提示页，但放行
+    github.com 的网页与资产下载。这条路径不消耗 API 配额，只需要一个 tag。
+    """
+    m = re.match(r'https://api\.github\.com/repos/([^/]+)/([^/]+)/releases/latest$', url)
+    if not m:
+        raise ValueError('not a releases/latest API URL')
+    repo = f'{m.group(1)}/{m.group(2)}'
+    page = f'https://github.com/{repo}/releases/latest'
+    req = urllib.request.Request(page, headers={'User-Agent': 'workbuddy-manager-updater'})
+    try:
+        with _NO_REDIRECT_OPENER.open(req, timeout=15):
+            raise RuntimeError('releases/latest 没有返回重定向')
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (301, 302, 303, 307, 308):
+            raise
+        location = str(exc.headers.get('Location') or '')
+        tag = ''
+        marker = '/tag/'
+        if marker in location:
+            tag = location.split(marker, 1)[1].split('?', 1)[0].strip('/')
+        if not tag:
+            raise RuntimeError('releases/latest 的 Location 里没有 tag')
+        return {
+            'tag_name': tag,
+            'html_url': f'https://github.com/{repo}/releases/tag/{tag}',
+            'assets': [],
+            '_fallback': True,   # 没有 assets 信息：assets_ready 保持未知
+        }
+
+
+def _git_remote_head(slug: str) -> str:
+    """API 不可用时用本机 git 问远端 HEAD（自定义上游仓库场景）。"""
+    exe = shutil.which('git')
+    if not exe:
+        return ''
+    try:
+        proc = subprocess.run(
+            [exe, 'ls-remote', f'https://github.com/{slug}.git', 'HEAD'],
+            capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return ''
+    if proc.returncode != 0:
+        return ''
+    line = (proc.stdout or '').strip().splitlines()
+    return line[0].split()[0] if line and line[0].split() else ''
+
+
 def _gh_get(url: str, timeout: int = 15) -> object:
-    headers = {
-        'Accept': 'application/vnd.github+json',
-        'User-Agent': 'workbuddy-manager-updater',
-    }
-    # 认证后 5000 次/小时；未认证仅 60 次/小时/IP——共享出口（TUN/系统代理）
-    # 极易被同出口的其他用户打满，表现为设置页"检测更新"偶发 403
-    token = (os.environ.get('WB_GITHUB_TOKEN')
-             or os.environ.get('GITHUB_TOKEN') or '').strip()
-    if token:
-        headers['Authorization'] = f'Bearer {token}'
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode('utf-8'))
+    """取一个 GitHub JSON；配了镜像就先走镜像，失败再直连（issue #216）。
+
+    **走镜像时不带 Authorization**：镜像会把请求转给第三方，Token 不该为了
+    提速离开本机；镜像按自己的出口访问 GitHub，也不需要我们的配额。
+
+    **404 不回退**：镜像明确回答「仓库/Release 不存在」时，直连只会给出同一个
+    结论（或更糟 —— 被限流的 403 把真实原因盖掉）。实测踩到过：上游仓库已删除，
+    镜像返回 404，回退直连拿到 403，界面于是显示「HTTP 403」，看起来像限流，
+    与事实（仓库没了）完全无关。403/429 这类「可能换条路就好」的才值得回退。
+    """
+    mirror = github_mirror()
+    candidates = [url]
+    mirrored = _mirror_url(url, mirror)
+    if mirrored != url:
+        candidates.insert(0, mirrored)
+
+    last: BaseException | None = None
+    for candidate in candidates:
+        headers = {
+            'Accept': 'application/vnd.github+json',
+            'User-Agent': 'workbuddy-manager-updater',
+        }
+        # 认证后 5000 次/小时；未认证仅 60 次/小时/IP——共享出口（TUN/系统代理）
+        # 极易被同出口的其他用户打满，表现为设置页"检测更新"偶发 403
+        if candidate == url:
+            token = github_token()
+            if token:
+                headers['Authorization'] = f'Bearer {token}'
+        req = urllib.request.Request(candidate, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode('utf-8'))
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                raise
+            last = exc
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            # ValueError 涵盖「镜像返回了非 JSON 错误页」；两类都该换下一条候选
+            last = exc
+    assert last is not None
+    # 最后一层：API 完全不可用时，用 github.com 的 302 回退拿 tag（issue #226）。
+    if '/releases/latest' in url:
+        try:
+            return _release_latest_via_redirect(url)
+        except Exception:  # noqa: BLE001 —— 回退也失败时保留原始错误
+            pass
+    raise last
 
 
 def _upstream_api_slug() -> str:
@@ -654,6 +922,10 @@ def _local_upstream_head(full: bool = False) -> str:
 
 # 变更列表最多带回多少条提交说明（界面上展示最近若干条即可）
 _CHANGES_LIMIT = 20
+
+# Release 正文最多回传多少字符（界面折叠展示，不做 Markdown 渲染）
+_RELEASE_NOTES_LIMIT = 4000
+_UPSTREAM_ID_RE = re.compile(r'<!--\s*upstream-id:\s*([0-9a-f]{64})\s*-->')
 
 
 def _fetch_upstream_changes(slug: str, base_sha: str, head_sha: str) -> dict:
@@ -748,11 +1020,24 @@ def _write_cache(data: dict) -> None:
         pass
 
 
+def _local_upstream_id() -> str:
+    """本机随包上游的稳定标识（打包时写入 upstream/.upstream-id）。
+
+    老部署没有这个文件时返回空串 = 未知，不能据此判断「上游有变化」。
+    """
+    try:
+        path = _upstream_dir() / '.upstream-id'
+        return path.read_text(encoding='utf-8').strip() if path.is_file() else ''
+    except Exception:  # noqa: BLE001
+        return ''
+
+
 def _fetch_remote_versions() -> dict:
     """向 GitHub 查询管理端与上游的最新版本（不做缓存判断）。"""
     result: dict = {
         'checked_at': int(time.time()),
-        'manager': {'latest': '', 'url': '', 'assets_ready': None, 'error': ''},
+        'manager': {'latest': '', 'url': '', 'assets_ready': None, 'error': '',
+                    'release_notes': '', 'published_at': '', 'upstream_id': ''},
         'upstream': {'latest': '', 'date': '', 'subject': '', 'error': ''},
     }
 
@@ -762,11 +1047,20 @@ def _fetch_remote_versions() -> dict:
         if isinstance(rel, dict):
             result['manager']['latest'] = str(rel.get('tag_name') or '')
             result['manager']['url'] = str(rel.get('html_url') or '')
+            body = str(rel.get('body') or '')
+            # Release 正文：更新前就能看到「本版本需要什么」，不必等装完再翻
+            # 本地 CHANGELOG（issue #217）。只回传纯文本，界面不渲染 Markdown。
+            # 隐藏的 upstream-id 标记不能出现在界面（它是给程序读的）。
+            result['manager']['release_notes'] = _UPSTREAM_ID_RE.sub('', body)[:_RELEASE_NOTES_LIMIT]
+            result['manager']['published_at'] = str(rel.get('published_at') or '')
+            m_id = _UPSTREAM_ID_RE.search(body)
+            result['manager']['upstream_id'] = m_id.group(1) if m_id else ''
             # 产物是否就位：Release 一般由 CI 连产物一起创建，但「手工建了 Release
             # 还没上传产物」也会被 releases/latest 看到（issue #127/#129 是同一类
             # 窗口期问题）—— 在版本检查里就说清，别让用户点下去才拿到 404。
             assets = rel.get('assets') or []
-            result['manager']['assets_ready'] = any(
+            # 302 回退拿不到资产清单：标成未知，不能误报「产物未就位」。
+            result['manager']['assets_ready'] = None if rel.get('_fallback') else any(
                 str((a or {}).get('name') or '').endswith('.tar.gz')
                 for a in assets if isinstance(a, dict))
     except urllib.error.HTTPError as exc:
@@ -774,8 +1068,13 @@ def _fetch_remote_versions() -> dict:
     except Exception as exc:  # noqa: BLE001
         result['manager']['error'] = str(exc)[:120]
 
-    # 上游：默认分支最新提交
+    # 上游源码随发布包分发后，默认公开仓库已下线；无需再请求它做版本检测。
+    # 用户若配置了自己的 WB_UPSTREAM_REPO / WB_UPSTREAM_API_REPO，仍照常检查。
     slug = _upstream_api_slug()
+    if slug == 'Sliverkiss/workbuddy2api':
+        return result
+
+    # 上游：默认分支最新提交
     try:
         repo = _gh_get(f'https://api.github.com/repos/{slug}')
         branch = (repo.get('default_branch') if isinstance(repo, dict) else '') or 'master'
@@ -791,9 +1090,19 @@ def _fetch_remote_versions() -> dict:
             if local_full and not head_sha.startswith(local_full) and not local_full.startswith(head_sha):
                 result['upstream'].update(_fetch_upstream_changes(slug, local_full, head_sha))
     except urllib.error.HTTPError as exc:
-        result['upstream']['error'] = f'HTTP {exc.code}'
+        head = _git_remote_head(slug)
+        if head:
+            result['upstream']['latest'] = head[:8]
+            result['upstream']['subject'] = '（API 不可用，经本机 git ls-remote 获取）'
+        else:
+            result['upstream']['error'] = f'HTTP {exc.code}'
     except Exception as exc:  # noqa: BLE001
-        result['upstream']['error'] = str(exc)[:120]
+        head = _git_remote_head(slug)
+        if head:
+            result['upstream']['latest'] = head[:8]
+            result['upstream']['subject'] = '（API 不可用，经本机 git ls-remote 获取）'
+        else:
+            result['upstream']['error'] = str(exc)[:120]
 
     return result
 
@@ -809,9 +1118,16 @@ def check_updates(force: bool = False) -> dict:
     if force or not cache or age > ttl:
         fresh = _fetch_remote_versions()
         # 保留上次成功结果：临时网络故障不应让界面显示「未知」
+        #
+        # 但**必须标记这是旧结果**（issue #204）：把上一次的 latest 当成这次检测的
+        # 结论，界面就会在 403 限流时照样报「已是最新版本」—— 把一次失败说成了
+        # 结论，用户会以为确实没有新版本。stale/stale_at 让界面能如实说
+        # 「这次没拿到，下面是 X 时刻的旧结果」。
         for key in ('manager', 'upstream'):
             if fresh[key].get('error') and cache.get(key, {}).get('latest'):
-                fresh[key] = {**cache[key], 'error': fresh[key]['error']}
+                old_at = int(cache.get('checked_at') or 0)
+                fresh[key] = {**cache[key], 'error': fresh[key]['error'],
+                              'stale': True, 'stale_at': old_at}
         _write_cache(fresh)
         cache = fresh
 
@@ -822,6 +1138,7 @@ def check_updates(force: bool = False) -> dict:
     # 只有远端确实更新才提示；不能只判「不相等」，否则当前版本领先于缓存里的
     # 旧 latest 时会冒出降级提示（如 v1.0.5 → v1.0.4）
     manager_has = bool(m_latest) and _version_newer(m_latest, current_manager)
+    local_upstream_id = _local_upstream_id()
 
     u_latest = str(cache.get('upstream', {}).get('latest') or '')
     # 有本地 HEAD 时按 commit 比较；否则仅展示远端最新
@@ -837,7 +1154,18 @@ def check_updates(force: bool = False) -> dict:
             'has_update': manager_has,
             'url': str(cache.get('manager', {}).get('url') or ''),
             'assets_ready': cache.get('manager', {}).get('assets_ready'),
+            'release_notes': str(cache.get('manager', {}).get('release_notes') or ''),
+            'published_at': str(cache.get('manager', {}).get('published_at') or ''),
+            # 远端包内上游 id 与本机不一致：界面把主按钮改成「全部更新」
+            'upstream_changed': bool(
+                cache.get('manager', {}).get('upstream_id')
+                and local_upstream_id
+                and cache['manager']['upstream_id'] != local_upstream_id),
             'error': str(cache.get('manager', {}).get('error') or ''),
+            # stale=True：这一节的值来自**上一次**成功检测（本次失败了），
+            # 界面不能据此下「已是最新」的结论（issue #204）。
+            'stale': bool(cache.get('manager', {}).get('stale')),
+            'stale_at': int(cache.get('manager', {}).get('stale_at') or 0),
             'repo': MANAGER_REPO,
         },
         'upstream': {
@@ -853,6 +1181,8 @@ def check_updates(force: bool = False) -> dict:
             'changes': cache.get('upstream', {}).get('changes') or [],
             'truncated': bool(cache.get('upstream', {}).get('truncated')),
             'error': str(cache.get('upstream', {}).get('error') or ''),
+            'stale': bool(cache.get('upstream', {}).get('stale')),
+            'stale_at': int(cache.get('upstream', {}).get('stale_at') or 0),
             'repo': _upstream_api_slug(),
         },
         'has_any': manager_has or upstream_has,

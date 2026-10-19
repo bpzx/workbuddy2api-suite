@@ -814,7 +814,7 @@ export default function DashboardPage() {
                     {/* 多于一个分组时才标归属：交错排列之后，光看昵称分不出
                         这条属于哪个池。单分组时它只是句废话。 */}
                     {multiGroup && (
-                      <span className="shrink-0 text-[10px] text-muted-foreground">
+                      <span className="shrink-0 text-[11px] text-muted-foreground">
                         {a.group.name}
                       </span>
                     )}
@@ -849,7 +849,9 @@ export default function DashboardPage() {
                       title={t('metric.credits')}
                     >
                       {typeof credOf(a) === 'number'
-                        ? t('metric.creditAmount', {n: fmtNumber(credOf(a))})
+                        ? t('metric.creditAmount',
+                            {n: fmtNumber(credOf(a)),
+                             count: Math.round(credOf(a) as number)})
                         : ''}
                     </span>
                   </div>

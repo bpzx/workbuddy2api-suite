@@ -23,29 +23,61 @@
 | 上游 | 仓库 | 分支 | Commit | 提交时间 | 快照位置 |
 |---|---|---|---|---|---|
 | wb2api | `Sliverkiss/workbuddy2api` ⚠️ **已删除** | `master` | `d1023f3` | 2026-09-21 09:52 | `vendor/wb2api` |
-| manager | [ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) | `main` | [`9cb188f`](https://github.com/ithtelab/workbuddy-manager/commit/9cb188f) | 2026-10-17 00:39 | `vendor/manager` |
+| manager | [ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) | `main` | [`ec7eccb`](https://github.com/ithtelab/workbuddy-manager/commit/ec7eccb) | 2026-10-18 22:08 | `vendor/manager` |
 
 > wb2api 那一行**不再有可点的链接**：仓库已 404（见下节）。
 > 它是**我们开始自行维护时的起点**，不是"待同步的目标"。
 
 - wb2api：`Merge pull request #184 from .../fix/image-url-`（+764/−21，15 个文件）
   含图片 URL 修复、积分口径、成长任务链、WAF 403 处理等
-- manager：`fix: 渠道校验不再误禁用账号；/v2 被拦时自动换 /console（用户报告）`
-  （10 文件 / +773 −25）
-  **面板显示版本 v1.0.97**（v1.0.92~96 是 a2c78f9 快照里 `server/main.py` 已带
-  的版本号）。**风控层重要修复**：上游给 `/v2/chat/completions` 加了渠道强校验
-  后，一批完全正常的账号被**误禁用**（同一业务码随封带不同 msg，按 msg 分野的
-  `request illegal` 那条会硬禁用）。修复三件套：① 新增 `upstream.IsChannelCheck`
-  （码 + 渠道校验文案**两条同时成立**，且判在 `request illegal` 之前）—— 渠道
-  校验**永不禁用**，只软冷却（策略随时可能变，禁用会逼用户白重新扫码）；
-  ② `chat_paths` 加 `/console` 兜底：主路径仍是 `/v2`（#119 实测 `/console` 挂
-  WAF 内容规则），**只在 /v2 被判渠道校验时**才换 `/console`（官方客户端走的
-  端点，用户实测恢复正常）；③ 配套测试 8 条。
-  **集成面零改动**：`server/main.py` 只动了版本号字面量（两处锚点未碰），
-  config.py / updater.py / 覆写目标 / 源码级守卫全部未变 —— 是一次"纯落盘"
-  同步（预检直接全绿）。
+- manager：`fix: v2.6.3 —— 宽屏账号表格操作列保持单行`
+  （141 文件 / +9067 −2470，22 个提交，v2.1.0 → v2.6.3）
+  **面板显示版本 v2.6.3**。要点：**上游"自维护"成体系**（v2.6.0：发布包内嵌打过
+  13 条补丁的 wb2api 源码，面板发现上游变化时主按钮变「全部更新（含上游）」，
+  更新器自动同步并重建容器 —— 这些路径在本容器里本就不可用，见 stub 说明）；
+  **账号级出口线路/直连**（2.0.0+#210 与 2.6.0 的 `__direct__`：对话流量按账号
+  绑定线路走、Transport 按线路分开缓存防出口串线）—— **属 wb2api Go 侧，
+  本套件未采纳**（见下面专节）；**可信代理默认收紧**（2.3.0：从全部 RFC1918
+  收到只信回环 —— 本套件反代与面板同机，默认值恰好安全）；池按用途分车道
+  （`lane`，修批量刷积分把池占满导致测活假报 PoolTimeout，#161）；
+  `WB_CREDITS_CONCURRENCY`（默认 8）；更新检测失败不再谎报「已是最新」
+  （`stale/stale_at`，#204）；GitHub Token / 镜像可在面板填（#205/#216，
+  新环境变量 `WB_GITHUB_MIRROR`，compose/.env.example 已透传）；lighthouse
+  真实桌面专家对话链；免费模型筛选；tok/s 统计；更新日志脱敏、原子替换、
+  a11y/弱对比修复、pgsync 临时库毫秒级锁等。
 
-- manager（上一轮）：`fix: 随包上游源码行尾归一（CRLF → LF），修「更新后脚本类功能失效」(#202)`
+> **本次同步（v2.1.0 → v2.6.3）值得记住的**：
+>
+> 1. **首次成规模地"不采纳"上游的 Go 侧增量**（0007~0013 补丁链，含 2.0.0
+>    主打的账号级出口线路）。上游 wb2api 仓库删除后，manager 项目把 Go 改动
+>    维护成**顺序耦合的补丁链 + 定期重打的 upstream-src 资产包**（v2.6.0 时已
+>    13 条）。实测 0007/0008 在我们的基线（`d1023f3`，2026-09-21 冻结）上
+>    **5 个文件 patch does not apply**（`cmd/server/config.go`、
+>    `cmd/server/main.go`、`internal/server/handler.go`、
+>    `internal/upstream/client.go`、`internal/auth/auth.go`）—— 它们的基线是
+>    打过 0001~0006 前置补丁的更新源码。采纳（方案 B）意味着每轮同步都要
+>    重建他们的有效基线、整链重放、解决随链增长而单调上升的冲突，并把我们的
+>    4 组风控补丁（Proxy / 盐 / 并发告警 / 抖动）重新锚定 —— 0007 恰好也改
+>    `transport.go`（线路表）与 `travel.go`（`doJSON` 加了账号参数，正是抖动
+>    补丁的调用点邻域）。方案 A（本套件采用）：manager 本体照常同步，wb2api
+>    维持冻结基线 + 自有 4 组补丁；**代价**是账号级出口线路/直连在镜像里
+>    不生效 —— 账号绑线路只影响 manager 自己的出站（签到/查积分），对话流量
+>    仍走全局 `WB_HTTP_PROXY` 或直连。这是本套件一直以来的实际行为，无回归。
+>    将来若某个单点修复价值够高，按「公开派生参考实现」的口径**按我们基线
+>    手工移植**，不整链背回。
+> 2. **预检零失效**：`main.py` import 块、`config.py` 的 `_build_client`、
+>    ManagementBar 全部未被动过 —— 22 个提交跨 5 个 minor 版本，锚点一次没红。
+>    守卫字样（`assetsPending` / `assets_ready` / `can_update_upstream`）也未变，
+>    覆写面板无需跟改。新增的 `test_web_a11y` 扫全部 TSX 的 `SelectTrigger`/
+>    `Switch`，我们的覆写面板一个都没有，不受影响。
+> 3. **`updater.py` +370 行**（镜像下载、release notes、日志脱敏、原子换目录、
+>    `.upstream-id`），但 `read_status` 的**字段口径未变**，`stale/stale_at`
+>    是加法字段且本套件面板不消费 —— `docker/stub/update.py` 与侧车无需调整。
+>    面板「全部更新（含上游）」调的是上游自己的更新器路径，在本容器里本就
+>    不可用（无 docker 能力），与 stub 的既有约定一致。
+> 4. **compose 新增 `WB_GITHUB_MIRROR` 透传**（issue #216，GitHub 镜像加速）。
+>    本套件面板的套件版本检测走独立实现（`suite.py`）不消费它，透传只为
+>    上游自己的检测/更新链路。
   （204 文件 / +25330 −3923）
   **面板显示版本 v1.0.91**；期间跨 **11 个发版**（v1.0.81~v1.0.91）：**代理改为
   「代理池」方案**（池开关、优先级/轮询/随机/最少调用策略、线路权重与启用开关、
@@ -60,6 +92,14 @@
   导出包去重、出站补齐会话头族（修「部分账号经面板必失败」）、扫码登录失败给
   可执行原因、新增 Windows 安装器（C# launcher）、README 精简成落地页、
   随包上游源码行尾归一（修 #202）。
+
+- manager（中间一轮，2026-10-17）：`fix: 渠道校验不再误禁用账号；/v2 被拦时
+  自动换 /console（用户报告）`（`9cb188f`，10 文件 / +773 −25，v1.0.97）。
+  **风控层重要修复**：同一业务码随封带不同 msg，按 msg 分野的 `request illegal`
+  会硬禁用正常账号；新增 `IsChannelCheck`（码+文案双条件，判在其前）——渠道
+  校验**永不禁用**只软冷却；`chat_paths` 加 `/console` 兜底（仅在被判渠道校验
+  时切换，主路径 `/v2` 不变）。该轮集成面零改动（main.py 仅版本号字面量，
+  预检直接全绿的"纯落盘"同步）。
 
 > **本次同步（v1.0.80 → v1.0.91）值得记住的**：
 >

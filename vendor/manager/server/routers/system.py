@@ -39,7 +39,12 @@ class UpstreamRefIn(BaseModel):
 def update_status(user: dict = Depends(security.current_user)) -> dict:
     """更新进度与当前版本（含运行中的日志）。"""
     status = updater.read_status()
-    status['log_tail'] = updater.tail_log(80)
+    is_admin = str((user or {}).get('role') or '') == 'admin'
+    # 日志里可能有代理地址、绝对路径与命令输出：只给管理员。只读账号仍能看到
+    # 版本与「是否在更新」，但拿不到实现细节（旧版对 viewer 是全量返回的）。
+    status['log_tail'] = updater.tail_log(80) if is_admin else ''
+    if not is_admin:
+        status['logs'] = []
     return status
 
 

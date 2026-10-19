@@ -39,7 +39,9 @@
    存成 `dev/upstream-patches/000N-<名字>.patch`（**含测试文件**，0001/0003 都是这个
    体例；后续补丁只描述自己的增量，不要重述前面几个补丁）；
 3. 验补丁：在一份**未被该补丁改动过**的资产基线上 `git apply --check` 通过、
-   `apply_upstream_patches.py` 报 `applied:`、再跑一次报 `already applied:`；
+   `apply_upstream_patches.py` 报 `applied:`、再跑一次报 `already applied:`。
+   源码树里会生成 `.wb2a-patches.json`（补丁名 → 字节哈希）：后续补丁改写前面补丁的
+   新增行时（0009 → 0010 就是），按内容判定会误报「没打」，清单记录的是事实；
 4. 重打包：`dev/pack_fixed_upstream_src.py <那份树> -o <输出> --stamp '<一句话>'`
    —— 它会按序号依次应用全部补丁（已应用的会跳过），再打成 `workbuddy2api-src.tar.gz`；
 5. 验收：解开新包 `go build ./...` + `go test ./...`（必要时加 `-race`）、
@@ -51,6 +53,12 @@
 **顺序要求**：重打包必须在**当次面板发版之前**完成 —— CI 是从载体 Release 取
 `upstream/` 塞进发布包的，晚一步设备装到的就还是旧上游。面板侧只加字段不算完成：
 旧上游会忽略未知字段，用户会看到「保存成功但没生效」。
+
+**CI 的发布门禁**（2.2.1 起）：发布作业会把随包上游当成一次真实构建来验 ——
+`apply_upstream_patches.py` 必须报「补丁数 = 文件数，且没有现场新应用的」，
+然后 `go build ./...`、`go test ./...`、对**补丁动过的文件**跑 `gofmt -l`，
+并校验 `server/main.py` 的 `version=` 与 tag 一致。以前只跑 Python 测试，
+上游补丁的缺陷可以一路进 Release。
 
 - **`adapt(upstream)` 提交**：有可访问的上游代码要跟时照旧写——把核对过的上游
   提交号写进提交信息，供下次对照。
@@ -196,7 +204,17 @@ bash deploy/verify-release.sh /tmp/vX.Y.Z/workbuddy-manager-vX.Y.Z.tar.gz
 tar tzf /tmp/vX.Y.Z/workbuddy-manager-vX.Y.Z.tar.gz | head -5      # 抽查包结构
 #    再解开看 .version 与 server/main.py 的版本号
 
-# 5) 核对无误后**发布**（草稿对用户不可见，这一步才让版本生效）
+# 5) 给旧版更新器补过渡签名（v1.0.85 及更早仍强制验签；私钥只在维护者本机）
+cd /tmp/vX.Y.Z
+ssh-keygen -Y sign -f ~/.ssh/workbuddy-release -n file workbuddy-manager-vX.Y.Z.tar.gz
+gh release upload vX.Y.Z workbuddy-manager-vX.Y.Z.tar.gz.sig \
+  --repo ithtelab/workbuddy-manager
+#    验一下再继续（用仓库里记录的公钥，或 update.py 里内嵌的那把）：
+#    printf 'release %s\n' "$(cat ~/.ssh/workbuddy-release.pub)" > allowed_signers
+#    ssh-keygen -Y verify -f allowed_signers -I release -n file \
+#      -s workbuddy-manager-vX.Y.Z.tar.gz.sig < workbuddy-manager-vX.Y.Z.tar.gz
+
+# 6) 核对无误后**发布**（草稿对用户不可见，这一步才让版本生效）
 gh release edit vX.Y.Z --repo ithtelab/workbuddy-manager --draft=false
 ```
 
@@ -205,9 +223,16 @@ gh release edit vX.Y.Z --repo ithtelab/workbuddy-manager --draft=false
 直接把 Release 公开发布，产物还在上传时点「一键更新」就会拿到半成品或 404。现在
 用户侧看到的一直是上一个**已发布且产物齐全**的版本。
 
-2026-10-14 起**不再有「维护者离线签名」这一步**：更新器只核对发布页给的 sha256 与
-文件大小（发布说明里就印着那个哈希，工作流自动附上）。为什么取消、还剩下哪些保证、
-老版本怎么过渡，见 [release-signing.md](release-signing.md)。
+2026-10-14 起**新版本更新器不再要求签名**：只核对发布页给的 sha256 与文件大小
+（发布说明里就印着那个哈希，工作流自动附上）。但 `.sig` 仍要按第 5 步手工补 ——
+停在 v1.0.85 及更早的更新器强制验签，漏掉就会让这批老部署无法升级。为什么这样
+过渡、私钥如何保管，见 [release-signing.md](release-signing.md)。
+
+## 发布包字节的可复现性
+
+CI 打包时固定了文件排序、mtime 与属主，并让 gzip 不写时间戳（`gzip -n`）。同一份
+暂存内容重复打包会得到同一个 sha256 —— 这是发布说明里的哈希能作为承诺的前提。
+改打包命令时不要退回普通的 `tar czf`（它会把构建时刻与属主写进字节流）。
 
 ## 发布包里放哪些文档
 

@@ -79,6 +79,7 @@ export function ProxyPanel() {
   const [query, setQuery] = useState('');
   const [intervalText, setIntervalText] = useState<string | null>(null);
   const [bindOpen, setBindOpen] = useState(false);
+  const [bindLoading, setBindLoading] = useState(false);
   const [accounts, setAccounts] = useState<RouteAccount[]>([]);
   const [autoFor, setAutoFor] = useState<ProxyRoute | null>(null);
   const [autoCount, setAutoCount] = useState('10');
@@ -220,15 +221,24 @@ export function ProxyPanel() {
     }
   }
 
+  async function refreshBindings(): Promise<boolean> {
+    setBindLoading(true);
+    try {
+      setAccounts((await proxyApi.bindings()).accounts);
+      return true;
+    } catch (e) {
+      notify.err(errText(e));
+      return false;
+    } finally {
+      setBindLoading(false);
+    }
+  }
+
   async function openBindings() {
     setBindOpen(true);
     setAccounts([]);
-    try {
-      setAccounts((await proxyApi.bindings()).accounts);
-    } catch (e) {
-      notify.err(errText(e));
-      setBindOpen(false);
-    }
+    // 失败才关窗：列表没拿到时留在原地，用户看得到错误提示，不会以为「没有账号」。
+    if (!(await refreshBindings())) setBindOpen(false);
   }
 
   async function assign(account: RouteAccount, value: string) {
@@ -281,7 +291,15 @@ export function ProxyPanel() {
       || r.masked.toLowerCase().includes(needle)
       || (r.bound_names || []).some((n) => n.toLowerCase().includes(needle));
   });
-  const strategyKey = (s: string) => `settings.proxyStrategy${s.charAt(0).toUpperCase()}${s.slice(1)}`;
+  // 显式映射（不是拼驼峰）：`round_robin` → Round_robin 会拼出一个不存在的
+  // 键名，界面上直接显示 `settings.proxyStrategyRound_robin`（两种策略中招）。
+  const STRATEGY_KEY: Record<string, string> = {
+    priority: 'settings.proxyStrategyPriority',
+    round_robin: 'settings.proxyStrategyRoundRobin',
+    random: 'settings.proxyStrategyRandom',
+    least_connections: 'settings.proxyStrategyLeastConnections',
+  };
+  const strategyKey = (s: string) => STRATEGY_KEY[s] ?? s;
   const sourceKey = settings?.source === 'off' ? 'settings.proxyGlobalSourceOff'
     : settings?.source === 'panel' ? 'settings.proxyGlobalSourcePanel'
       : settings?.source === 'env' ? 'settings.proxyGlobalSourceEnv'
@@ -296,9 +314,10 @@ export function ProxyPanel() {
           {pool && (
             <>
               <Switch checked={pool.enabled}
+                      aria-label={t('settings.proxyRoutesTitle')}
                       onCheckedChange={(v) => void savePool({enabled: v})} />
               <Select value={pool.strategy} onValueChange={(v) => void savePool({strategy: v as ProxyPool['strategy']})}>
-                <SelectTrigger className="h-8 w-32 rounded-full bg-background text-xs">
+                <SelectTrigger className="h-8 w-32 rounded-full bg-background text-xs" aria-label={t('settings.proxyStrategyLabel')}>
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -364,8 +383,20 @@ export function ProxyPanel() {
         </div>
 
         {shown.length === 0 ? (
-          <EmptyState icon={Globe} title={t('settings.proxyEmpty')}
-                      description={t('settings.proxyEmptyDesc')} />
+          routes.length === 0 ? (
+            <EmptyState icon={Globe} title={t('settings.proxyEmpty')}
+                        description={t('settings.proxyEmptyDesc')} />
+          ) : (
+            // 有线路但被搜索过滤光了：不能沿用「还没有配置任何线路」，
+            // 否则用户会以为线路被删了。
+            <EmptyState icon={Search} title={t('settings.proxyNoMatch')}
+                        description={t('settings.proxyNoMatchDesc', {query: query.trim()})}>
+              <Button variant="outline" size="sm" className="rounded-full"
+                      onClick={() => setQuery('')}>
+                {t('settings.proxyClearSearch')}
+              </Button>
+            </EmptyState>
+          )
         ) : (
           <div className="overflow-hidden rounded-2xl bg-background/60">
             <Table>
@@ -450,7 +481,7 @@ export function ProxyPanel() {
                             </Badge>
                           )}
                           {!route.bound && (
-                            <span className="text-[10px] text-muted-foreground">
+                            <span className="text-[11px] text-muted-foreground">
                               {t('settings.proxyNoBindings')}
                             </span>
                           )}
@@ -463,6 +494,9 @@ export function ProxyPanel() {
                                   onClick={() => {
                                     setAutoFor(route);
                                     setAutoCount('10');
+                                    // 「可分配 N 台」来自账号绑定列表：没打开过绑定管理时
+                                    // accounts 还是空的，这里补拉一次，否则永远显示 0。
+                                    if (!accounts.length) void refreshBindings();
                                   }}>
                             <Users className="h-3.5 w-3.5" />
                           </Button>
@@ -513,6 +547,7 @@ export function ProxyPanel() {
         <div className="mb-1 flex items-center gap-2">
           <span className="text-sm font-medium">{t('settings.proxyGlobalTitle')}</span>
           <Switch checked={globalForm.enabled}
+                  aria-label={t('settings.proxyGlobalTitle')}
                   onCheckedChange={(v) => setGlobalForm({...globalForm, enabled: v})} />
         </div>
         <div className="mb-3 text-[11px] leading-4 text-muted-foreground">
@@ -606,7 +641,7 @@ export function ProxyPanel() {
               <Input className="mt-1 h-8 bg-background font-mono text-xs" value={form.url}
                      placeholder="socks5://user:pass@host:10000"
                      onChange={(e) => setForm({...form, url: e.target.value})} />
-              <p className="mt-1 text-[10px] leading-4 text-muted-foreground">
+              <p className="mt-1 text-[11px] leading-4 text-muted-foreground">
                 {t('settings.proxyUrlHint')}
               </p>
             </div>
@@ -619,13 +654,14 @@ export function ProxyPanel() {
               </div>
               <div className="flex items-center gap-2 pt-4">
                 <Switch checked={form.enabled}
+                        aria-label={t('settings.proxyInPool')}
                         onCheckedChange={(v) => setForm({...form, enabled: v})} />
                 <span className="text-xs text-muted-foreground">
                   {t('settings.proxyInPool')}
                 </span>
               </div>
             </div>
-            <p className="text-[10px] leading-4 text-muted-foreground">
+            <p className="text-[11px] leading-4 text-muted-foreground">
               {t('settings.proxyWeightHint')}
             </p>
           </DialogBody>
@@ -688,9 +724,11 @@ export function ProxyPanel() {
                 {t('settings.proxyAutoAssignUnit')}
               </span>
             </div>
-            <p className="text-[10px] leading-4 text-muted-foreground">
-              {t('settings.proxyAutoAssignHint', {count: String(
-                accounts.filter((a) => !a.proxy).length)})}
+            <p className="text-[11px] leading-4 text-muted-foreground">
+              {bindLoading
+                ? t('settings.proxyBindingsLoading')
+                : t('settings.proxyAutoAssignHint', {count: String(
+                  accounts.filter((a) => !a.proxy).length)})}
             </p>
           </DialogBody>
           <DialogFooter>
@@ -711,8 +749,13 @@ export function ProxyPanel() {
             <DialogTitle>{t('settings.proxyBindingsManagerTitle')}</DialogTitle>
             <DialogDescription>{t('settings.proxyBindingsManagerDesc')}</DialogDescription>
           </DialogHeader>
-          <DialogBody className="max-h-[26rem] space-y-1.5 overflow-y-auto">
-            {accounts.length === 0 ? (
+          <DialogBody className="max-h-[min(26rem,calc(100dvh-12rem))] space-y-1.5 overflow-y-auto">
+            {bindLoading ? (
+              <div className="flex items-center justify-center gap-2 rounded-2xl bg-muted/40 py-8 text-xs text-muted-foreground">
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                {t('settings.proxyBindingsLoading')}
+              </div>
+            ) : accounts.length === 0 ? (
               <div className="rounded-2xl bg-muted/40 py-8 text-center text-xs text-muted-foreground">
                 {t('settings.proxyBindingsEmpty')}
               </div>
@@ -724,11 +767,12 @@ export function ProxyPanel() {
                 </span>
                 <Select value={row.proxy || '__pool__'}
                         onValueChange={(v) => void assign(row, v)}>
-                  <SelectTrigger className="h-8 w-56 rounded-full bg-background text-xs">
+                  <SelectTrigger className="h-8 w-56 rounded-full bg-background text-xs" aria-label={t('settings.proxyBindingFor', {name: row.nickname || row.uid})}>
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="__pool__">{t('settings.proxyFollowPool')}</SelectItem>
+                    <SelectItem value="__direct__">{t('settings.proxyDirectOnly')}</SelectItem>
                     {routes.map((r) => (
                       <SelectItem key={r.name} value={r.name}>{r.name}</SelectItem>
                     ))}

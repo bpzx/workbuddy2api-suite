@@ -7,7 +7,7 @@
 |---|---|
 | `start.cmd` | 前台启动面板（**关掉窗口即停**），顺带拉起上游网关；首次运行会自动生成 `.env`、初始化上游 `config.json`、准备 Python 虚拟环境 |
 | `stop.cmd` | 停掉面板与上游网关 |
-| `update.cmd` | 一键更新：下载发布包 → **核对 sha256** → 替换 `server/` 与 `web/out/` → 同步依赖 |
+| `update.cmd` | 一键更新：下载发布包 → **核对发布页 sha256（拿不到就拒绝安装）** → 解压到临时目录校验 → 整体替换 `server/` 与 `web/out/` → 同步依赖 |
 | `service-tools.ps1` | 后台常驻方式：`start` / `stop` / `status` / `restart`（日志写 `data\manager.out.log`） |
 
 ```powershell
@@ -24,6 +24,8 @@ powershell -ExecutionPolicy Bypass -File .\windows\service-tools.ps1 status
 再按名字还原回这里 —— 也就是说它**不会**被发布包替换。
 
 v1.0.86 起发布包不再带 `.sig`，仓库里的 `update.ps1` 也从「验签」改成了「核对 sha256」。
+2.2.1 起这一步是**失败即拒绝**：拿不到发布页摘要、或摘要与包不一致，都不会继续安装。
+只在确认包确实来自官方发布页时，才可加 `-AllowUnverified` 强制继续（会大声警告）。
 所以用 `update.cmd` 的用户请**从仓库重新取一次本目录的脚本**（或改用面板的
 「设置 → 系统更新」，那条路走的是已经改好的 Python 更新器）：停在旧脚本上，v1.0.87
 起的新版本会被它自己拦下（「缺少对应的数字签名文件」）。
@@ -45,6 +47,7 @@ v1.0.86 起发布包不再带 `.sig`，仓库里的 `update.ps1` 也从「验签
 |---|---|
 | `build.ps1` | 从源码构建安装包：组装 payload、编译上游 `wb2api.exe`（本机无 Go 时自动下载便携工具链）、预置 Python 3.11 运行时与依赖、csc 编译 |
 | `dist\WorkBuddyManagerSetup.exe` | 双击进入安装向导：选择目录安装、生成桌面与开始菜单快捷方式、注册「设置 → 应用」卸载入口 |
+| `dist\WorkBuddyManagerSetup.exe.sha256` | 安装包的 SHA-256（与 CI 产物同构）；分发后可用 `certutil -hashfile WorkBuddyManagerSetup.exe SHA256` 核对 |
 | 安装目录里的 `WorkBuddyManager.exe` | 控制窗口：启动 / 重启 / 关闭项目、运行状态、修改监听 IP 与端口、打开面板；点 X 可选最小化到托盘或退出（可记住选择） |
 | 安装目录里的 `Uninstall.exe` | 卸载程序：停止服务、清理快捷方式与注册表，可选保留账号与配置数据 |
 

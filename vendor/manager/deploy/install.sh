@@ -186,6 +186,20 @@ else
 
   cd "$UPSTREAM_DIR"
 
+  # 上游端口只绑回环：面板与它在同一台机器（或同一 docker 网络）上访问，
+  # 不需要对公网暴露 7863。compose 模板写的是 "7863:7863"（所有网卡），这里
+  # 统一改成 "127.0.0.1:7863:7863"，与更新器的端口收敛（enforce_local_bind）
+  # 同一口径。改不动时不阻断安装，但会明说。
+  if [ -f "${UPSTREAM_DIR}/docker-compose.yml" ]; then
+    sed -i "s#- \"${UPSTREAM_PORT}:${UPSTREAM_PORT}\"#- \"127.0.0.1:${UPSTREAM_PORT}:${UPSTREAM_PORT}\"#" "${UPSTREAM_DIR}/docker-compose.yml" 2>/dev/null || true
+    sed -i "s#- ${UPSTREAM_PORT}:${UPSTREAM_PORT}#- \"127.0.0.1:${UPSTREAM_PORT}:${UPSTREAM_PORT}\"#" "${UPSTREAM_DIR}/docker-compose.yml" 2>/dev/null || true
+    if grep -q "127.0.0.1:${UPSTREAM_PORT}:${UPSTREAM_PORT}" "${UPSTREAM_DIR}/docker-compose.yml"; then
+      ok "上游端口已收敛为 127.0.0.1:${UPSTREAM_PORT}（不对公网暴露）"
+    else
+      warn "未能自动收敛上游端口，请手工把 compose 的端口映射改为 127.0.0.1:${UPSTREAM_PORT}:${UPSTREAM_PORT}"
+    fi
+  fi
+
   # 生成配置：绝不覆盖已有 config.json（含 api_key 与账号状态）
   if [ ! -f config.json ]; then
     if [ -f config.example.json ]; then
@@ -364,8 +378,8 @@ cat <<EOF
   │  部署完成                                            │
   └──────────────────────────────────────────────────────┘
 
-  管理端      http://127.0.0.1:${MANAGER_PORT}
-  上游        http://127.0.0.1:${UPSTREAM_PORT}   （workbuddy2api，仅本机）
+  管理端      http://127.0.0.1:${MANAGER_PORT}   （监听 0.0.0.0:${MANAGER_PORT}；建议用防火墙/反代收紧）
+  上游        http://127.0.0.1:${UPSTREAM_PORT}   （workbuddy2api，仅监听 127.0.0.1）
   配置目录    ${APP_DIR}
   账号目录    ${UPSTREAM_DIR}/auths
 EOF

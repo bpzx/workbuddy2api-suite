@@ -176,6 +176,8 @@ class PostParamLocationAuditTest(unittest.TestCase):
         '/api/accounts/{filename}/force-cooling': {'upstream_id'},
         '/api/accounts/{filename}/note': {'upstream_id'},
         '/api/accounts/{filename}/proxy': {'upstream_id'},
+        # 手写权重（issue #187）：与 proxy 同形，按 `?upstream_id=` 指定分组。
+        '/api/accounts/{filename}/weight': {'upstream_id'},
         # 代理线路（设置 → 代理）：改名/删除要按分组重绑账号，前端按 query 传。
         '/api/proxy-routes/{name}': {'upstream_id'},
         '/api/proxy-routes/{name}/accounts': {'upstream_id'},

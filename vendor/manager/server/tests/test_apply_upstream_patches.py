@@ -83,6 +83,26 @@ class AlreadyAppliedTest(unittest.TestCase):
         patch = self._patch(_hunk('never-inserted'), '0001-x.patch')
         self.assertFalse(self.mod._already_applied(patch, self.src))
 
+    def test_common_lines_elsewhere_do_not_mask_a_missing_hunk(self) -> None:
+        """`}` 之类的常见行不能算「已应用」的证据。
+
+        旧实现用子串匹配：补丁新增 `}` 与 `inserted`，文件里本来就有 `}`
+        和 `prefix-inserted-suffix`（子串包含 inserted），于是被误判成已应用，
+        `git apply` 被跳过 —— 产物里少了整段逻辑，而且没有任何报错。
+        """
+        self.target.write_bytes(
+            b'line1\n}\nprefix-inserted-suffix\nline2\nline3\nline4\nline5\n')
+        body = ('--- a/pkg/a.go\n'
+                '+++ b/pkg/a.go\n'
+                '@@ -1,5 +1,7 @@\n'
+                ' line1\n'
+                '+}\n'
+                '+inserted\n'
+                ' line2\n line3\n line4\n line5\n')
+        patch = self._patch(body, '0001-x.patch')
+        self.assertFalse(self.mod._already_applied(patch, self.src),
+                         '常见行/子串被当成了「补丁已应用」的证据')
+
     def test_real_patch_dir_parses_added_lines(self) -> None:
         """真补丁也要能被解析出「文件 → 新增行」（判定按这份数据走）。"""
         files = self.mod._added_lines(_ROOT / 'dev' / 'upstream-patches'
@@ -90,6 +110,58 @@ class AlreadyAppliedTest(unittest.TestCase):
         self.assertIn('internal/upstream/client.go', files)
         self.assertTrue(any('CodeOf' in line for line in files['internal/upstream/client.go']),
                         '未解析出该补丁的新增函数')
+
+
+class ManifestIdempotencyTest(unittest.TestCase):
+    """后一个补丁改写前一个补丁的新增行时，重入仍须判定为「已应用」。
+
+    现场（2026-10-18）：0009 引入的思考兜底块被 0010 重排（帧序修正），0009 的
+    新增行在树里已不存在 —— 按内容判定会把 0009 误判成「没打」，第二次运行直接
+    报 patch does not match。清单按「补丁字节哈希」记录已应用事实，避免这种误判。
+    """
+
+    def setUp(self) -> None:
+        self.mod = _load()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.src = self.root / 'src'
+        (self.src / 'pkg').mkdir(parents=True)
+        (self.src / 'go.mod').write_bytes(b'module x\n')
+        (self.src / 'docker-compose.yml').write_bytes(b'services: {}\n')
+        self.target = self.src / 'pkg' / 'a.go'
+        self.target.write_bytes(b'line1\nline2\nline3\nline4\nline5\n')
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_later_patch_may_rewrite_earlier_added_lines(self) -> None:
+        insert = ('--- a/pkg/a.go\n'
+                  '+++ b/pkg/a.go\n'
+                  '@@ -1,5 +1,6 @@\n'
+                  ' line1\n'
+                  '+alpha\n'
+                  ' line2\n line3\n line4\n line5\n')
+        rewrite = ('--- a/pkg/a.go\n'
+                   '+++ b/pkg/a.go\n'
+                   '@@ -1,6 +1,6 @@\n'
+                   ' line1\n'
+                   '-alpha\n'
+                   '+beta\n'
+                   ' line2\n line3\n line4\n line5\n')
+        (self.root / '0001-add.patch').write_bytes(insert.encode())
+        (self.root / '0002-rewrite.patch').write_bytes(rewrite.encode())
+
+        self.assertEqual(self.mod.apply_patches(self.src, self.root),
+                         ['applied: 0001-add.patch', 'applied: 0002-rewrite.patch'])
+        # 清单已落盘，且记录的是补丁名 → 字节哈希
+        manifest = self.mod._load_manifest(self.src)
+        self.assertEqual(sorted(manifest), ['0001-add.patch', '0002-rewrite.patch'])
+
+        # 重入：0001 的新增行 alpha 已被 0002 改写成 beta，内容判定会失败；
+        # 清单命中必须让它仍然算「已应用」，否则整条流水线卡死。
+        self.assertEqual(self.mod.apply_patches(self.src, self.root),
+                         ['already applied: 0001-add.patch',
+                          'already applied: 0002-rewrite.patch'])
 
 
 if __name__ == '__main__':

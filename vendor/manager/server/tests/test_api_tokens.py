@@ -295,6 +295,9 @@ class WriteEndpointScopeMatrixTest(unittest.TestCase):
         'POST /api/proxy-routes/{name}/auto-assign',
         'PUT /api/settings/proxy-pool',
         'POST /api/proxy-routes/probe',
+        # Upstash 连通性测试：会拿**已保存的 Token** 向外部发请求（审计 2026-10-18），
+        # 泄露的 token 不该能借它探测 / 外带凭据。
+        'POST /api/settings/upstash/test',
         'PUT /api/settings/proxy',
         'POST /api/settings/proxy/probe',
         'POST /api/settings/upstash/reload',   # 评审补：与 /api/restart 同动作

@@ -38,6 +38,54 @@ def _since(days: int) -> str:
     return time.strftime('%Y-%m-%d', time.localtime(time.time() - (d - 1) * 86400))
 
 
+def _epoch_since(days: int) -> int:
+    """与 `_since` 同一口径（本地时区、含今天）的起始时刻（epoch 秒）。"""
+    return int(time.mktime(time.strptime(_since(days), '%Y-%m-%d')))
+
+
+def _throughput_by_model(days: int, realm: str | None) -> dict[str, dict]:
+    """按模型算**输出速率**（tokens/秒，issue #214）。
+
+    数据源必须是 `request_logs`：`usage_daily` 只累计请求数与 token 数，没有耗时。
+
+    口径（写清楚是因为「tok/s」很容易被算成好看但没意义的数）：
+
+      · 生成耗时 = `latency_ms − first_token_ms`。流式请求的 first_token 是首字
+        延迟，两者相减正好是「开始吐字到结束」；非流式没有中间过程，first_token
+        为 NULL，用整个 latency（略低估，但不会凭空造数）；
+      · 只统计成功（2xx）、有输出 token、耗时为正的记录 —— 失败请求的 latency
+        含重试/排队，算进去会把速率压低成噪声；
+      · 只覆盖**请求日志保留期**内的数据，返回 `throughput_samples` 让界面如实
+        标注样本量（统计页的时间范围可能比日志保留期长）。
+    """
+    since = _epoch_since(days)
+    rf = ' AND realm = ?' if realm in ('cn', 'global') else ''
+    args: tuple = (since,) + ((realm,) if rf else ())
+    rows = db.query(
+        'SELECT model AS name, COUNT(*) AS samples, '
+        'SUM(completion_tokens) AS ct, '
+        'SUM(CASE WHEN latency_ms > COALESCE(first_token_ms, 0) '
+        '         THEN latency_ms - COALESCE(first_token_ms, 0) ELSE 0 END) AS gen_ms '
+        'FROM request_logs '
+        'WHERE ts >= ? AND status >= 200 AND status < 300 AND completion_tokens > 0 '
+        # 生成耗时必须为正：latency=0 或 latency<=first_token 的记录算不出速率，
+        # 留在分母外也不该把它们的 token 计进分子（否则速率会虚高一倍）。
+        'AND latency_ms > COALESCE(first_token_ms, 0)'
+        f'{rf} GROUP BY model',
+        args,
+    )
+    out: dict[str, dict] = {}
+    for r in rows:
+        name = r['name'] or '未知'
+        gen_ms = float(r['gen_ms'] or 0)
+        ct = float(r['ct'] or 0)
+        out[name] = {
+            'tokens_per_sec': round(ct / (gen_ms / 1000.0), 2) if gen_ms > 0 and ct > 0 else None,
+            'throughput_samples': int(r['samples'] or 0),
+        }
+    return out
+
+
 @router.get('/summary')
 def summary(realm: str | None = None,
             user: dict = Depends(security.current_user)) -> dict:
@@ -497,16 +545,21 @@ def by_model(days: int = 30, realm: str | None = None,
         f'FROM usage_daily WHERE day >= ?{rf} GROUP BY model ORDER BY SUM(prompt_tokens + completion_tokens) DESC',
         args,
     )
-    return [
-        {
-            'name': r['name'] or '未知',
+    # 输出速率来自请求日志（issue #214）：与上面的用量表**同区间不同源**，
+    # 所以只给「两边都有」的模型补字段；日志里完全没有的模型给 null（显示 —）。
+    tmap = _throughput_by_model(days, realm)
+    out = []
+    for r in rows:
+        name = r['name'] or '未知'
+        out.append({
+            'name': name,
             'requests': int(r['requests'] or 0),
             'prompt_tokens': int(r['prompt_tokens'] or 0),
             'completion_tokens': int(r['completion_tokens'] or 0),
             'credit': float(r['credit'] or 0),
-        }
-        for r in rows
-    ]
+            **tmap.get(name, {'tokens_per_sec': None, 'throughput_samples': 0}),
+        })
+    return out
 
 
 @router.get('/by-key')

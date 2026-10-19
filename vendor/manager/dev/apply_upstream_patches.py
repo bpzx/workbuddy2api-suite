@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
+from collections import Counter
 from pathlib import Path
 import re
 import subprocess
@@ -40,6 +43,11 @@ def _already_applied(patch: Path, source: Path) -> bool:
     判据只看新增行（上下文行不参与）：对「已经应用」这个判断足够，且不受其它补丁
     漂移影响。空行不判（到处都是）。新增行全为空的新文件补丁按「未应用」处理 ——
     那种情况下真正该走的是正常 apply。
+
+    **按整行、按出现次数比较**，不做子串匹配：补丁里常见的 `}`、`return nil`
+    在文件里到处都有，子串判定会让「只打了一半的补丁」被误认成已应用，随后
+    `git apply` 又被跳过，产物里就少了一段逻辑。次数比较还覆盖了同一个补丁在
+    不同 hunk 插入相同行的情况。
     """
     files = _added_lines(patch)
     if not files:
@@ -49,14 +57,50 @@ def _already_applied(patch: Path, source: Path) -> bool:
         target = source / rel
         if not target.is_file():
             return False
-        text = target.read_text(encoding='utf-8', errors='replace')
+        existing = Counter(target.read_text(encoding='utf-8', errors='replace').splitlines())
         for line in lines:
             if not line.strip():
                 continue
             checked += 1
-            if line not in text:
+            if existing[line] <= 0:
                 return False
+            existing[line] -= 1
     return checked > 0
+
+
+# 补丁应用清单：{补丁文件名: 补丁 sha256}，写在源码树根。
+#
+# 为什么需要它：按「新增行内容」判定（_already_applied）解决不了**后一个补丁改写
+# 前一个补丁新增行**的情形 —— 0009 引入的兜底块被 0010 重排后，0009 的新增行就
+# 不在树里了，重入时会被误判成「没打」，整条流水线随即报 patch does not match。
+# 清单把「这份树打过哪些补丁、打的是哪一版字节」记成事实，重入时按哈希精确跳过；
+# 补丁文件被修改（哈希变了）则退回内容/反向判定，避免陈旧清单掩盖真实改动。
+#
+# 清单会随资产一起打包，所以每个发布出去的 upstream-src 都自带它的补丁 ancestry。
+MANIFEST_NAME = '.wb2a-patches.json'
+
+
+def _patch_sha(patch: Path) -> str:
+    return hashlib.sha256(patch.read_bytes()).hexdigest()
+
+
+def _load_manifest(source: Path) -> dict[str, str]:
+    path = source / MANIFEST_NAME
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items()}
+
+
+def _save_manifest(source: Path, manifest: dict[str, str]) -> None:
+    path = source / MANIFEST_NAME
+    tmp = path.with_suffix('.json.tmp')
+    tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + '\n',
+                   encoding='utf-8', newline='\n')
+    os.replace(tmp, path)
 
 
 def apply_patches(source: Path, patch_dir: Path) -> list[str]:
@@ -68,6 +112,8 @@ def apply_patches(source: Path, patch_dir: Path) -> list[str]:
     if not patches:
         raise ValueError(f'No upstream patches found in {patch_dir}')
     results = []
+    manifest = _load_manifest(source)
+    manifest_dirty = False
     env = os.environ.copy()
     # Release staging lives inside the manager checkout. Do not let git discover
     # that parent repository and silently skip paths belonging to the upstream.
@@ -75,14 +121,28 @@ def apply_patches(source: Path, patch_dir: Path) -> list[str]:
     for key in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR'):
         env.pop(key, None)
     for patch in patches:
+        sha = _patch_sha(patch)
+        if manifest.get(patch.name) == sha:
+            # 清单命中：这份树打的就是这一版补丁字节。即使后续补丁改写了它新增的
+            # 行（0009→0010 的情况），也仍然算「已应用」。
+            results.append(f'already applied: {patch.name}')
+            continue
+
         def run(*args: str) -> subprocess.CompletedProcess[str]:
-            return subprocess.run(['git', 'apply', *args, str(patch)], cwd=source,
+            # core.autocrlf 必须显式关掉：Windows 上的默认值会把补丁里的 LF 在
+            # 工作树上写成 CRLF，于是「打完补丁的树」与资产基线行尾不一致 ——
+            # 后续补丁的上下文一旦跨到这些行就再也对不上（issue #202 的同一类
+            # 事故）。资产最终由 pack 脚本归一，但中途的树也应当是干净的。
+            return subprocess.run(['git', '-c', 'core.autocrlf=false', '-c', 'core.eol=lf',
+                                   'apply', *args, str(patch)], cwd=source,
                                   env=env, capture_output=True, text=True)
         check = run('--check')
         if check.returncode:
             # 内容判定优先：只要新增行都在，就是「已应用」（见 _already_applied 的说明）。
             if _already_applied(patch, source) or run('--reverse', '--check').returncode == 0:
                 results.append(f'already applied: {patch.name}')
+                manifest[patch.name] = sha
+                manifest_dirty = True
                 continue
             raise RuntimeError(f'Upstream patch does not match this snapshot: {patch.name}\n'
                                f'{check.stderr.strip()}\nReview/rebase the patch before publishing.')
@@ -90,6 +150,10 @@ def apply_patches(source: Path, patch_dir: Path) -> list[str]:
         if applied.returncode:
             raise RuntimeError(f'Could not apply {patch.name}: {applied.stderr.strip()}')
         results.append(f'applied: {patch.name}')
+        manifest[patch.name] = sha
+        manifest_dirty = True
+    if manifest_dirty:
+        _save_manifest(source, manifest)
     return results
 
 

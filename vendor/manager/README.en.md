@@ -94,7 +94,7 @@ upstream repo is gone, and its source is now maintained here.
 - **Scheduled tasks** — check-in / travel / activity / keep-alive, each with its own switch and time
 - **Multiple upstreams** — configure several instances, each with its own address and `api_key`
 - **Security** — inbound IP allow / deny lists (CIDR), audit log, separate session and API tokens
-- **Updates & backup** — one-click update (signature-checked), off-site PostgreSQL backup
+- **Updates & backup** — one-click update (checksum-verified), off-site PostgreSQL backup
 - **Five locales** — Simplified / Traditional Chinese, English, Japanese, Korean
 
 The exhaustive list (with detail per item) lives in [the full feature list](docs/features.md).
@@ -193,7 +193,7 @@ Admin API details are available at `/docs` (Swagger UI) when enabled.
 - Keys are shown once and stored as hashes; account credentials never reach the browser
 - Inbound IP allow / deny lists (CIDR) plus per-key IP and model allowlists
 - Every sensitive action is audited (who, when, what)
-- Release packages are signed; one-click updates verify the signature before installing
+- One-click updates verify the published SHA-256 and file size before installing
 
 Threat model and hardening notes: [security notes](docs/security-notes.md) and the
 [security audit report](docs/SECURITY-AUDIT.md).

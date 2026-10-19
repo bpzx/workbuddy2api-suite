@@ -634,6 +634,13 @@ Remove-Item $assemblyInfoPath -Force -ErrorAction SilentlyContinue
 # ── 7. 报告与清理 ───────────────────────────────────────────
 $zipMB = [math]::Round((Get-Item $zipPath).Length / 1MB, 1)
 $exeMB = [math]::Round((Get-Item $outExe).Length / 1MB, 1)
+# 与 CI 产物同构：安装包旁边留一份 `.sha256`，下载/分发后能直接核对。
+# 本地构建没有发布说明可写摘要，不让用户自己去算就是唯一可行的替代。
+$exeHash = Get-FileSha256 $outExe
+[System.IO.File]::WriteAllText(
+    ($outExe + '.sha256'),
+    ($exeHash + '  WorkBuddyManagerSetup.exe' + [Environment]::NewLine),
+    (New-Object System.Text.ASCIIEncoding))
 Remove-Item $stageDir -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host ''
@@ -641,6 +648,8 @@ Write-Host '==================================' -ForegroundColor Green
 Write-Host ' 构建完成' -ForegroundColor Green
 Write-Host (' 安装包：' + $outExe) -ForegroundColor Green
 Write-Host (' 体积：' + $exeMB + ' MB（内嵌 payload ' + $zipMB + ' MB）') -ForegroundColor Green
+Write-Host (' sha256：' + $exeHash) -ForegroundColor Green
+Write-Host (' 校验文件：' + $outExe + '.sha256') -ForegroundColor Green
 if ($runtimeOk) { Write-Host ' Python 运行时：已预置（安装后零下载启动）' -ForegroundColor Green }
 else { Write-Host ' Python 运行时：uv.exe 兜底（首次启动需联网）' -ForegroundColor Yellow }
 if (-not $SkipUpstream) { Write-Host ' 上游网关：wb2api.exe 已打包' -ForegroundColor Green }

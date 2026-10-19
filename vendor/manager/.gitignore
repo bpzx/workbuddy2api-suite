@@ -141,3 +141,5 @@ LOCAL_DEPLOY_NOTES.md
 /windows/launcher/dist/
 start-all.cmd
 stop-all.cmd
+dev/.weight-task
+dev/.shots-weight-task

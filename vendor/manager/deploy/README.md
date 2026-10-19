@@ -232,7 +232,8 @@ WB_BASE_PATH=/workbuddy-manager
 > 症状很隐蔽 —— 配置看起来加了，但前缀没被剥掉，表现为「页面能打开、接口全 404」，
 > 容易误判成反代写错了。
 >
-> 其余可选项（出口代理 `WB_HTTP_PROXY`、更新代理 `WB_UPDATE_PROXY`、新账号默认线路
+> 其余可选项（出口代理 `WB_HTTP_PROXY`、更新代理 `WB_UPDATE_PROXY`、GitHub 镜像
+> `WB_GITHUB_MIRROR`、新账号默认线路
 > `WB_DEFAULT_ACCOUNT_PROXY` 等）**写进安装目录的 `.env` 即可**：容器部署由 compose 的
 > `${}` 取过去，systemd 部署由单元里的 `EnvironmentFile=` 读进来，Windows 原生由
 > 启动脚本交给面板（`uvicorn --env-file .env`）。
@@ -313,6 +314,29 @@ sudo /opt/workbuddy-manager/venv/bin/python deploy/update.py --target both
 
 `--target` 取值为 `manager` / `upstream` / `both`。
 
+### 国内网络：用镜像加速更新
+
+直连 GitHub 超时、发布包下载卡在 0% 时，可以填一个 GitHub 加速服务的基址
+（issue #216）。两种填法，任选其一：
+
+```bash
+# ① 面板：设置 → 系统更新 → GitHub 镜像加速，填 https://gh-proxy.com/
+# ② 命令行 / .env（面板里没填时生效）
+WB_GITHUB_MIRROR=https://gh-proxy.com/
+```
+
+版本检测与发布包下载都会**先走镜像、失败自动回退直连**，所以镜像临时不可用也
+不会把更新卡死。程序会自动拼成 `https://gh-proxy.com/https://github.com/...`
+这种「基址 + 完整原始地址」的形式，不用自己拼。
+
+> **镜像会把请求转给第三方**，因此走镜像时**不会发送 GitHub Token**。下载公开
+> 仓库的 Release 本身不需要认证；如果你配镜像的目的是绕开 API 限流，请注意这条
+> 路径用的是镜像自己的配额。不放心的话，用 `WB_UPDATE_PROXY` 配一个自己能控制的
+> 代理，效果类似且流量不经过第三方。
+>
+> 加速服务的可用性由服务方决定。换了服务只要改基址即可（`gh-proxy.org` 是同一家
+> 的另一个域名）；留空 = 全部直连。
+
 ### 容器（Docker Compose）部署的更新
 
 上面两种方式都是按宿主安装写的（方式二用的是宿主上的 venv）。容器部署用面板里的
@@ -374,13 +398,13 @@ docker compose up -d workbuddy-manager
 ## 五、目录与端口
 
 ```
-管理端   /opt/workbuddy-manager         :7864   仅本机（经反代对外）
+管理端   /opt/workbuddy-manager         :7864   监听 0.0.0.0（经反代对外；建议防火墙收紧）
   ├─ server/        后端代码
   ├─ web/out/       前端静态产物
   ├─ data/          SQLite、users.json（含会话密钥）
   └─ venv/          Python 虚拟环境
 
-上游     /opt/workbuddy2api             :7863   仅本机
+上游     /opt/workbuddy2api             :7863   仅本机（安装脚本把端口映射绑到 127.0.0.1）
   ├─ auths/         账号授权文件（每个账号一个 JSON）
   ├─ data/state.json 账号池状态
   └─ config.json    上游配置（含 api_key）

@@ -298,7 +298,12 @@ export default function KeysPage() {
       } else {
         const created = await keyApi.create(payload as Partial<ApiKey>);
         notify.ok(t('keys.keyCreated'));
-        if (created.key) setIssued(created.key);
+        if (created.key) {
+          setIssued(created.key);
+          // 上一把密钥的「一键导入」结果不能留到这一把：否则用户会以为新密钥
+          // 已经写入目标、或对着旧备份路径去核对。
+          setImported(null);
+        }
       }
       setFormOpen(false);
       // 刷新失败**不能**把这次创建判成失败：密钥已经建好了。
@@ -541,6 +546,11 @@ export default function KeysPage() {
 
       {/* 刷新时有请求失败：常驻提示，**不**顶掉已经显示出来的内容——那些数据仍然
           是对的，只是可能不是最新的。 */}
+      {/* 上游清单没取到：新建密钥的「绑定上游」只剩默认项，静默建出来会绑错池。
+          单独说清（比笼统的「部分失败」更能指导下一步）。 */}
+      {'upstreams' in errors && (
+        <LoadError message={t('keys.upstreamsFailed')} onRetry={reload} />
+      )}
       {partialFailed && (
         <LoadError message={t('state.partialFailed')} onRetry={reload} />
       )}
@@ -748,7 +758,7 @@ export default function KeysPage() {
         {/* 「暂无密钥」是**一条都没有**的断言，取不到时不能说这句（见上面首屏守卫的
             说明）。`keysFailed` 覆盖「另一份取到了、这一份没有」的部分失败：那时首屏
             守卫不会拦（values 里还有 upstreams），但列表这一块同样不知道有没有。 */}
-        {!keys.length && !keysFailed && (
+        {!shownKeys.length && !keysFailed && (
           <EmptyState
             icon={KeyRound}
             title={t('keys.emptyTitle')}
@@ -803,7 +813,7 @@ export default function KeysPage() {
                       value={form.expiryMode}
                       onValueChange={(v) => setForm({...form, expiryMode: v as FormState['expiryMode']})}
                     >
-                      <SelectTrigger className="flex-1">
+                      <SelectTrigger className="flex-1" aria-label={t('keys.expiry')}>
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
@@ -856,7 +866,7 @@ export default function KeysPage() {
                     value={form.quotaCredit}
                     onChange={(e) => setForm({...form, quotaCredit: e.target.value})}
                   />
-                  <p className="text-[10px] leading-4 text-muted-foreground">
+                  <p className="text-[11px] leading-4 text-muted-foreground">
                     {t('keys.quotaCreditHint')}
                   </p>
                 </div>
@@ -883,7 +893,7 @@ export default function KeysPage() {
                       value={form.realm || '__all__'}
                       onValueChange={(v) => setForm({...form, realm: (v === '__all__' ? '' : v) as FormState['realm']})}
                     >
-                      <SelectTrigger>
+                      <SelectTrigger aria-label={t('keys.realm')}>
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
@@ -893,7 +903,7 @@ export default function KeysPage() {
                         <SelectItem value="__all__">{t('keys.realmAll')}</SelectItem>
                       </SelectContent>
                     </Select>
-                    <p className="text-[10px] leading-4 text-muted-foreground">
+                    <p className="text-[11px] leading-4 text-muted-foreground">
                       {form.realm === ''
                         ? t('keys.realmHintUnlimited')
                         : form.realm === 'global'
@@ -921,7 +931,7 @@ export default function KeysPage() {
                             ? t('realm.global')
                             : t('realm.cn')}
                       </Badge>
-                      <span className="text-[10px] leading-4 text-muted-foreground">
+                      <span className="text-[11px] leading-4 text-muted-foreground">
                         {form.realm === '' ? t('keys.realmUnlimitedOn') : t('keys.realmFollowsPage')}
                       </span>
                     </div>
@@ -953,7 +963,7 @@ export default function KeysPage() {
                     setForm({...form, upstream_id: v === '__default__' ? null : Number(v)})
                   }
                 >
-                  <SelectTrigger>
+                  <SelectTrigger aria-label={t('keys.upstreamLabel')}>
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -967,7 +977,7 @@ export default function KeysPage() {
                       ))}
                   </SelectContent>
                 </Select>
-                <p className="text-[10px] leading-4 text-muted-foreground">
+                <p className="text-[11px] leading-4 text-muted-foreground">
                   {t('keys.upstreamHint')}
                 </p>
               </div>
@@ -1014,7 +1024,7 @@ export default function KeysPage() {
                     版本归属由上面的选项控制（粗粒度，拦跨版本调用），
                     白名单在版本之内再收窄到具体几个模型（细粒度）。
                     写模型名时注意与所选版本一致——带 global: 前缀的是国际版模型。 */}
-                <p className="text-[10px] leading-4 text-muted-foreground">
+                <p className="text-[11px] leading-4 text-muted-foreground">
                   {/* 反引号包住的模型名由 RichText 渲染成等宽字体 */}
                   <RichText text={t('keys.modelPrefixNote')} />
                 </p>
@@ -1033,7 +1043,8 @@ export default function KeysPage() {
       </Dialog>
 
       {/* 一次性展示新密钥 */}
-      <Dialog open={!!issued} onOpenChange={(v) => !v && (setIssued(null), setExported(null))}>
+      <Dialog open={!!issued}
+              onOpenChange={(v) => { if (!v) { setIssued(null); setExported(null); setImported(null); } }}>
         {/* 尺寸必须**跟着视口走**：这个弹窗里有密钥、有一整段 JSON、还有导入区，
             内容比一般弹窗高得多。之前只写了个 max-w，高度没上限，于是窗口一矮
             （或系统缩放一大）底部就被 `overflow-hidden` 直接裁掉，连「我已保存」
@@ -1080,7 +1091,7 @@ export default function KeysPage() {
                             setExported(null);
                             setImported(null);
                           }}>
-                    <SelectTrigger className="h-7 w-[168px] rounded-full text-xs">
+                    <SelectTrigger className="h-7 w-[168px] rounded-full text-xs" aria-label={t('keys.exportTitle')}>
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>

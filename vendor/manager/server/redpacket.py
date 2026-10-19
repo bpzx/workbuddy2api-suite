@@ -188,9 +188,10 @@ def create_packet(name: str, kind: str, total: float, shares: int,
 
     # 与 create_key 共用同一段 INSERT（见 keysvc.create_key 的 `_conn` 参数），
     # 不把 SQL 抄第二遍——两份 SQL 漂移过一次就够了（count_tokens 的鉴权）。
-    conn = db.connect()
     created: list[dict] = []
     with db._lock:
+        # 连接在锁内取：PG 恢复会在锁内关闭并重开共享连接。
+        conn = db.connect()
         try:
             conn.execute('BEGIN')
             packet_id = conn.execute(
@@ -445,8 +446,9 @@ def draw(code: str, ip: str) -> dict:
     两个并发请求会各自查到「没领过」、各自挑一份：同一个人抽到两份，而且其中
     一份原本该属于别人（先被标记走了）。
     """
-    conn = db.connect()
     with db._lock:
+        # 连接在锁内取：PG 恢复会在锁内关闭并重开共享连接。
+        conn = db.connect()
         try:
             conn.execute('BEGIN')
             p = conn.execute('SELECT * FROM red_packets WHERE code = ?',

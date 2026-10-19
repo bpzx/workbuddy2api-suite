@@ -33,13 +33,14 @@ size:   874638
 sha256: 29718acd31a5e9aa41b0dfb2829a70cfa2852e5410836e76248a32ae76371f56
 ```
 
-包内 **0 个文件带 CR**（此前 293 个），`login.sh` 首行结尾是 `\n`。补丁系列在该资产上
+包内 **0 个文件带 CR**（此前 293 个），`login.sh` 首行结尾是 `\nn`。补丁系列在该资产上
+仍报「已应用」（条数 = `dev/upstream-patches/*.patch` 的数量；**不要写死**，补丁会继续增加）。
 仍报「已应用」×5（重打包路径健康）。
 
 ## 维护者复现
 
 ```sh
-python3 dev/apply_upstream_patches.py <解包后的 upstream-src>   # 期望：5 条 already applied
+python3 dev/apply_upstream_patches.py <解包后的 upstream-src>   # 期望：与补丁文件数相同的 already applied
 # 打包（内部会先把源码树归一，再打）
 python3 dev/pack_fixed_upstream_src.py <源码树> -o /tmp/out --stamp '...'
 # 验收：包内文本文件不该有 CR
