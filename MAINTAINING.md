@@ -79,7 +79,8 @@ git push --delete origin v0.2.5 && git tag -d v0.2.5
 > ⚠️ **wb2api 的上游已删除**（`Sliverkiss/workbuddy2api` 现为 404，账号仍在）。
 > 它**没有可同步的目标了**：`--only wb2api` 会 fetch 失败。**该部分自此由本项目
 > 自行维护** —— 改它走 `docker/patches/apply.py`（见 [UPSTREAMS.md](UPSTREAMS.md)
-> 的「构建期补丁登记」，补丁 4~6 就是上游没有、我们自己加的风控加固）。
+> 的「构建期补丁登记」，补丁 4~6 是上游没有、我们自己加的风控加固，
+> 补丁 7~8 是我们自己加的下游响应 gzip —— 同为"上游没有的行为"）。
 > 本地镜像缓存 `.upstream-cache/wb2api.git` 保留到 `f2ccc7b` 的历史可备查阅。
 
 **manager 仍有上游可同步**，流程如下：
@@ -121,7 +122,7 @@ git pull
 
 网关对外**声称自己是官方桌面客户端**，因此以下几项会随时间和上游客户端版本
 漂移，需要定期复核。背景与操作细节见 README「账号风控相关」与
-[`UPSTREAMS.md`](UPSTREAMS.md) 的补丁 4~6。
+[`UPSTREAMS.md`](UPSTREAMS.md) 的补丁 4~8。
 
 - [ ] **新账号加入后确认设备风控凭据**：`docker compose logs wb2api | grep device_token`
   —— 启动时会提示「N/总数 个账号缺少 device_token」。内置登录流程**不写**该字段

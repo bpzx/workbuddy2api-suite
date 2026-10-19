@@ -19,6 +19,31 @@
 
 ## [未发布]
 
+### 新增：下游方向的响应 gzip（补丁 7/8）—— 省流量，不碰出站指纹
+
+**背景**：审计发现两边对"发给客户端"的响应从不压缩 —— `/v1/models`、
+`/v1/stats`、非流式对话 JSON（wb2api），面板 JS/CSS 与 `/api/*`（manager）
+全部裸传，客户端带了 `Accept-Encoding: gzip` 也没用。**出站方向**（网关 →
+上游平台）的请求形态则刻意保持不动：头族、Accept-Encoding 透传、payload
+节奏都是风控指纹，本轮一条没碰。
+
+- **补丁 7（wb2api）**：`internal/server/handler.go` 的 `ServeHTTP` 出口包一层
+  `gzipResponseWriter`。收得很窄：只压 `Content-Type` 以 `application/json`
+  开头的响应，且客户端 `Accept-Encoding` 显式含 gzip（q≠0，`*` 通配不触发）。
+  SSE（`text/event-stream`）与非 JSON 整路透传，`Flush` 逐帧语义透传，
+  handler 返回后 `Close()` 收尾 gzip 流。
+- **补丁 8（manager）**：starlette 内建 `GZipMiddleware`（minimum_size=1024），
+  已读源码确认它内建排除 `text/event-stream`（playground SSE 不受影响）、
+  流式逐块压缩不缓冲；`fastapi>=0.115` 必然解析到满足该行为的 starlette，
+  无新增依赖。注册在模块层级，无 CORS 配置时也生效。
+- **冲烟测试抓到的真缺陷**：补丁 7 初版忘了在 handler 返回后 `Close()` gzip
+  流 —— 响应只剩 10 字节 gzip 头（压缩数据全在内部缓冲里丢失）。已修复并把
+  教训写进补丁注释与 UPSTREAMS.md 登记。
+- 验证：打补丁树 Go 全套测试全绿（含 streaming handler）；上游 Python 2540
+  套件仅剩 4 个已登记的 Windows tearDown 误报；本项目测试 135 全绿（新增
+  2 条 gzip 意图断言）；实测 gzip 协商 / q=0 拒绝 / br-only 明文 / SSE 逐帧
+  明文与解压回读全部符合预期。
+
 ### 同步上游：manager v2.1.0 → v2.6.3（22 个提交，含"上游自维护"体系与安全批次）
 
 `9cb188f` → `ec7eccb`（141 文件 / +9067 −2470；中间还消化了 v1.0.97 的单提交

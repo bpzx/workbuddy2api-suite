@@ -62,12 +62,13 @@ class TextPatchPreflightTest(unittest.TestCase):
     def test_patch_targets_are_the_expected_files(self) -> None:
         """把"改了哪些上游文件"固定下来：新增一个补丁时这里会失败，提醒复核清单。
 
-        2026-09 上游 wb2api 删除后，本项目自行维护该部分，补丁从 4 组扩到 7 组（
-        后 manager 内网直连补丁被上游 v1.0.91 取代删除，现为 6 组）
-        （新增 3 组风控加固，因此新增 4 个 Go 文件）—— 见 UPSTREAMS.md 的登记。
+        2026-09 上游 wb2api 删除后，本项目自行维护该部分（新增 3 组风控加固，
+        因此新增 4 个 Go 文件）—— 见 UPSTREAMS.md 的登记。
         2026-10-16 同步 v1.0.91 时，补丁「manager 内网直连」因上游用
         _proxy_transport 自行实现而整组删除 —— manager/server/config.py
         从此不再是补丁目标。
+        2026-10-19 新增补丁 7/8（入站响应 gzip）：wb2api/internal/server/handler.go
+        与 manager/server/main.py（后者本就是补丁目标）。
         """
         files = sorted({str(p.relative_to(_VENDOR)).replace('\\', '/')
                         for p, *_ in apply.build_text_edits(_VENDOR)})
@@ -77,6 +78,7 @@ class TextPatchPreflightTest(unittest.TestCase):
             'wb2api/cmd/server/main.go',
             'wb2api/internal/scheduler/scheduler.go',
             'wb2api/internal/scheduler/travel.go',
+            'wb2api/internal/server/handler.go',
             'wb2api/internal/upstream/headers.go',
             'wb2api/internal/upstream/transport.go',
         ])
@@ -241,6 +243,44 @@ class PatchIntentTest(unittest.TestCase):
         # 三处调用点都必须真的用上抖动助手
         for new in (apply.GO_TRAVEL_DELAY_NEW, apply.GO_ACT_DELAY_NEW, apply.GO_ACT_GAP_NEW):
             self.assertIn('jitteredDelay(', new)
+
+    # ── 补丁 7/8：入站响应 gzip（压缩只作用于下游方向）──
+
+    def test_wb2api_gzip_patch_scope_and_safety(self) -> None:
+        """wb2api gzip 补丁的边界必须收窄在"下游方向的 JSON"上。
+
+        出站请求形态是风控指纹 —— 补丁里若出现任何"改出站"的痕迹（例如动
+        transport、改请求头），说明写错了地方。SSE 的 Content-Type 不能出现在
+        压缩判定里（流式必须逐帧透传）。
+        """
+        new = apply.GO_GZIP_ServeHTTP_NEW
+        self.assertIn('Accept-Encoding', new, '必须做内容协商，不能无条件压缩')
+        self.assertIn('application/json', new, '只压 JSON，面不能比设计更宽')
+        self.assertNotIn('text/event-stream', new,
+                         'SSE 不该出现在 wb2api 侧判定里 —— 它靠"只压 JSON"天然排除，'
+                         '显式写出来反而像要处理它')
+        self.assertIn('http.Flusher', new, 'flush 语义必须透传，否则流式会被缓冲')
+        self.assertIn('gzip.NewWriter', new)
+        # 不碰出站：补丁只出现在 handler.go（ServeHTTP），不涉及 transport/headers
+        handler = (_VENDOR / 'wb2api' / 'internal' / 'server' / 'handler.go').read_text(encoding='utf-8')
+        patched = handler.replace(apply.GO_GZIP_ServeHTTP_OLD, new, 1)
+        self.assertIn('gzipResponseWriter', patched, '替换没有生效')
+        self.assertIn('Vary', new, '协商类响应必须带 Vary: Accept-Encoding')
+
+    def test_manager_gzip_patch_uses_builtin_and_excludes_sse(self) -> None:
+        """manager 侧必须用 starlette 内建 GZipMiddleware（它内建排除 SSE），
+        且注册在模块层级 —— 不能塞进 if config.CORS_ORIGINS 块（没配 CORS 就失效）。"""
+        self.assertIn('from starlette.middleware.gzip import GZipMiddleware',
+                      apply.MAIN_GZIP_IMPORT_NEW)
+        self.assertIn('app.add_middleware(GZipMiddleware', apply.MAIN_GZIP_NEW)
+        self.assertIn('minimum_size', apply.MAIN_GZIP_NEW)
+        main = (_VENDOR / 'manager' / 'server' / 'main.py').read_text(encoding='utf-8')
+        # 锚点是 CORS 块的收尾 —— 若上游给该块加了参数，这里能第一时间红出来
+        self.assertIn(apply.MAIN_GZIP_OLD, main)
+        # 注册行必须落在 CORS 块之外（模块层级，无缩进）
+        new_line = 'app.add_middleware(GZipMiddleware, minimum_size=1024)'
+        self.assertRegex(apply.MAIN_GZIP_NEW.replace('\r\n', '\n'), r'\n' + re.escape(new_line),
+                         'GZipMiddleware 必须注册在模块层级（顶格，不依赖 CORS 配置）')
 
 
 if __name__ == '__main__':

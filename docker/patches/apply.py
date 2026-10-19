@@ -7,13 +7,17 @@
 逐字节一致 —— 只有这样 `scripts/sync-upstreams.sh` 才能是一条命令的事。
 
 ===== 四类改动（按侵入程度从轻到重）=====
-能用的就用轻的。当前用量：文本补丁 3 组（5 处替换）、JSON 键合并 1、文件新增 2、文件覆写 1。
+能用的就用轻的。当前用量：文本补丁 8 组（16 处替换）、JSON 键合并 1、文件新增 2、文件覆写 1。
 
   1. **文本补丁**：锚定上游某段代码原位替换，保留上游其余逻辑。
-     3 组分别是：出口代理支持（wb2api 侧 1 组）、注册套件路由（1 组）、
-     移除不该出现的会话弹窗（1 组）。
-     （第 4 组「manager 内网直连」已被上游 v1.0.91 的 _proxy_transport 实现
-     取代并删除 —— 见下面「曾经打过」小节与 UPSTREAMS.md 的登记。）
+     8 组分别是：出口代理支持（wb2api）、注册套件路由（manager）、
+     移除不该出现的会话弹窗（manager）—— 这 3 组是集成能力；
+     设备标识盐可轮换、max_in_flight=0 告警、上报节奏抖动 —— 这 3 组是
+     风控加固（wb2api 上游删除后由本项目自维护，见 UPSTREAMS.md）；
+     入站响应 gzip（wb2api 与 manager 各 1 组）—— 压缩只作用于**下游**
+     方向（面板/客户端），出站请求形态一概不动（指纹红线）。
+     （曾经还有一组「manager 内网直连」，已被上游 v1.0.91 的 _proxy_transport
+     实现取代并删除 —— 见下面「曾经打过」小节与 UPSTREAMS.md 的登记。）
   2. **JSON 键合并**：给 i18n 词典**新增**一个文案命名空间，不碰上游已有键。
   3. **文件新增**：放入上游没有的新文件（自研的套件更新后端）。
   4. **文件覆写**：整文件替换上游文件。**代价是放弃该文件的上游后续改进**，
@@ -137,6 +141,11 @@ MAIN_ROUTER_OLD = 'app.include_router(system.router)'
 MAIN_ROUTER_NEW = """app.include_router(system.router)
 # 【集成补丁】套件自更新（/api/system/suite-*）
 app.include_router(suite_router.router)"""
+
+# 补丁 8 需要的 import（与 CORSMiddleware 同源：starlette 中间件）
+MAIN_GZIP_IMPORT_OLD = 'from fastapi.middleware.cors import CORSMiddleware'
+MAIN_GZIP_IMPORT_NEW = ('from fastapi.middleware.cors import CORSMiddleware\n'
+                        'from starlette.middleware.gzip import GZipMiddleware')
 
 
 # ─────────────────────────────────────────────────────────────
@@ -510,6 +519,166 @@ GO_ACT_GAP_OLD = 'if !sleepCtx(ctx, activityReportGap) {'
 GO_ACT_GAP_NEW = 'if !sleepCtx(ctx, jitteredDelay(activityReportGap)) {'
 
 
+# ─────────────────────────────────────────────────────────────
+# 补丁 7：wb2api —— 对下游的 JSON 响应做 gzip（入站方向）
+# ─────────────────────────────────────────────────────────────
+# 上游位置：internal/server/handler.go 的 ServeHTTP()（整个 HTTP 出口唯一收口）
+#
+# 背景：/v1/models、/v1/stats、非流式 /v1/chat/completions 等都会把几 KB 到
+# 上百 KB 的 JSON 裸写给下游；客户端带了 Accept-Encoding: gzip 也不压。
+# 压缩**只作用于下游方向**（面板 / OpenAI 客户端），出站请求的形态
+# （头族、Accept-Encoding 透传、payload 节奏）一概不碰 —— 那是风控指纹。
+#
+# 实现要点（缺一不可，写在这里供 reviewer 对照）：
+#   * 只压 Content-Type 以 application/json 开头的响应。SSE（text/event-stream）
+#     整路透传 —— 流式响应必须逐帧到客户端，压缩缓冲会破坏实时性；
+#     非压缩类响应也透传，避免对未知形态做错误假设。
+#   * WriteHeader 时才决策（那时 Content-Type 已定稿），协商失败要能
+#     **还原成透传** —— 决策窗口只有这一次，不能事后反悔。
+#   * 必须实现 http.Flusher：json 路径目前不 flush，但这是出口中间件，
+#     任何路由将来引入流式 JSON 都不能在这里静默丢掉 flush 语义。
+#   * Accept-Encoding 不含 gzip（或含 identity;q=0 之类拒绝语义）→ 完全透传。
+#   * 只用标准库 compress/gzip，不改 go.mod。
+GO_GZIP_ServeHTTP_OLD = """func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.mux.ServeHTTP(w, r)
+}"""
+
+GO_GZIP_ServeHTTP_NEW = """// gzipResponseWriter 按 Content-Type 在 WriteHeader 时决策是否 gzip。
+// 决策只压 application/json；其余类型（含 SSE）整路透传。
+//
+// 【本发行版集成补丁】见 docker/patches/apply.py 补丁 7。
+type gzipResponseWriter struct {
+	http.ResponseWriter
+	acceptsGzip bool
+	decided     bool
+	gz          *gzip.Writer
+}
+
+func (g *gzipResponseWriter) WriteHeader(status int) {
+	if g.decided {
+		return
+	}
+	g.decided = true
+	ct := g.Header().Get("Content-Type")
+	if g.acceptsGzip && strings.HasPrefix(ct, "application/json") {
+		g.Header().Del("Content-Length")
+		g.Header().Set("Content-Encoding", "gzip")
+		g.Header().Add("Vary", "Accept-Encoding")
+		g.gz = gzip.NewWriter(g.ResponseWriter)
+	}
+	g.ResponseWriter.WriteHeader(status)
+}
+
+func (g *gzipResponseWriter) Write(p []byte) (int, error) {
+	if !g.decided {
+		// 没 WriteHeader 就 Write：Go 会补 200，走同一决策路径。
+		g.WriteHeader(http.StatusOK)
+	}
+	if g.gz != nil {
+		return g.gz.Write(p)
+	}
+	return g.ResponseWriter.Write(p)
+}
+
+// Flush 透传 flush 语义：SSE/流式靠它逐帧推送。gzip 状态在 flush 时
+// 也刷出去，保证被压缩的流式 JSON 不会把帧攒在缓冲里。
+func (g *gzipResponseWriter) Flush() {
+	if g.gz != nil {
+		_ = g.gz.Flush()
+	}
+	if fl, ok := g.ResponseWriter.(http.Flusher); ok {
+		fl.Flush()
+	}
+}
+
+// Close 收尾 gzip 流：把 deflate 残留与 CRC 尾注写到底层。
+// ⚠️ 没有它响应会**只剩 10 字节 gzip 头**（首个 Write 落头、压缩数据
+// 全在 gzip.Writer 内部缓冲里，handler 返回后随缓冲一起丢失）——
+// 这是本补丁首次冲烟测试抓到的真实缺陷，Close 必须在 ServeHTTP 返回后调。
+func (g *gzipResponseWriter) Close() error {
+	if g.gz == nil {
+		return nil
+	}
+	err := g.gz.Close()
+	g.gz = nil
+	return err
+}
+
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// 【集成补丁】入站方向（面向下游）的响应压缩。见补丁 7 说明。
+	// 只认显式的 gzip 条目；`*` 通配不触发（保守：绝不发给没明说能解 gzip 的端）。
+	accepts := false
+	for _, part := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
+		fields := strings.Split(part, ";")
+		if !strings.EqualFold(strings.TrimSpace(fields[0]), "gzip") {
+			continue
+		}
+		q := "1"
+		for _, kv := range fields[1:] {
+			if k, v, ok := strings.Cut(strings.TrimSpace(kv), "="); ok && strings.EqualFold(k, "q") {
+				q = strings.TrimSpace(v)
+			}
+		}
+		if q != "0" && q != "0.0" {
+			accepts = true
+			break
+		}
+	}
+	if accepts {
+		gzw := &gzipResponseWriter{ResponseWriter: w, acceptsGzip: true}
+		defer func() { _ = gzw.Close() }()
+		w = gzw
+	}
+	h.mux.ServeHTTP(w, r)
+}"""
+
+GO_GZIP_IMPORT_OLD = """import (
+	"context"
+	"crypto/subtle"
+	"encoding/json\""""
+
+GO_GZIP_IMPORT_NEW = """import (
+	"compress/gzip"
+	"context"
+	"crypto/subtle"
+	"encoding/json\""""
+
+
+# ─────────────────────────────────────────────────────────────
+# 补丁 8：manager —— 对面板响应做 gzip（入站方向）
+# ─────────────────────────────────────────────────────────────
+# 上游位置：vendor/manager/server/main.py（CORSMiddleware 注册块之后）
+#
+# 面板的 JS/CSS 静态资源与 /api/* JSON 此前全部裸传（单文件可达数百 KB）。
+# 用 starlette 内建 GZipMiddleware，理由：
+#   * 已读源码（starlette >=0.47）确认它**内建排除 text/event-stream**——
+#     playground 的 SSE 转发不会被缓冲；流式响应逐块压缩、不整段缓冲；
+#     小于 minimum_size 的响应不动。
+#   * fastapi>=0.115 必然解析到满足该行为的 starlette，无新增依赖。
+#   * 模块层级注册（不放进 if config.CORS_ORIGINS 块）：无 CORS 配置时也生效。
+# 锚点取 CORS 注册块的**收尾**——该块比 import 块稳定（很少动）。
+MAIN_GZIP_OLD = """    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=config.CORS_ORIGINS,
+        allow_credentials=True,
+        allow_methods=['*'],
+        allow_headers=['*'],
+    )"""
+
+MAIN_GZIP_NEW = """    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=config.CORS_ORIGINS,
+        allow_credentials=True,
+        allow_methods=['*'],
+        allow_headers=['*'],
+    )
+
+# 【集成补丁】对下游（浏览器/客户端）的响应 gzip。starlette 内建实现会排除
+# text/event-stream（playground 的 SSE 不受影响），流式逐块压缩、小响应不动。
+# 只作用于入站方向；出站（对接 wb2api / 上游）的请求形态一概不变。
+app.add_middleware(GZipMiddleware, minimum_size=1024)"""
+
+
 def build_text_edits(root: Path) -> list[tuple[Path, str, str, str]]:
     """全部文本补丁：(文件, 锚点, 替换成, 说明)。
 
@@ -537,6 +706,7 @@ def build_text_edits(root: Path) -> list[tuple[Path, str, str, str]]:
          MANAGEMENT_BAR_OLD, MANAGEMENT_BAR_NEW,
          'manager: 移除"发现新版本"会话弹窗'),
         # ── 以下三组是「上游删除后由本项目维护」的风控加固，见 UPSTREAMS.md ──
+        # （补丁 7/8 的 gzip 条目在其后，以注释行「入站响应 gzip」分隔）
         (go_headers, GO_IMPORT_OLD, GO_IMPORT_NEW,
          'wb2api: 设备标识盐支持环境变量覆盖（补 import）'),
         (go_headers, GO_SALT_OLD, GO_SALT_NEW,
@@ -553,6 +723,19 @@ def build_text_edits(root: Path) -> list[tuple[Path, str, str, str]]:
          'wb2api: 活跃上报账号间延迟加抖动'),
         (go_sched, GO_ACT_GAP_OLD, GO_ACT_GAP_NEW,
          'wb2api: 活跃上报账号内间隔加抖动'),
+        # ── 入站响应 gzip（补丁 7/8）：压缩只作用于下游方向，出站一概不动 ──
+        (root / 'wb2api' / 'internal' / 'server' / 'handler.go',
+         GO_GZIP_IMPORT_OLD, GO_GZIP_IMPORT_NEW,
+         'wb2api: JSON 响应 gzip 补 import'),
+        (root / 'wb2api' / 'internal' / 'server' / 'handler.go',
+         GO_GZIP_ServeHTTP_OLD, GO_GZIP_ServeHTTP_NEW,
+         'wb2api: JSON 响应 gzip（入站方向）'),
+        (root / 'manager' / 'server' / 'main.py',
+         MAIN_GZIP_IMPORT_OLD, MAIN_GZIP_IMPORT_NEW,
+         'manager: 补 GZipMiddleware import'),
+        (root / 'manager' / 'server' / 'main.py',
+         MAIN_GZIP_OLD, MAIN_GZIP_NEW,
+         'manager: 面板响应 gzip（入站方向）'),
     ]
 
 

@@ -285,6 +285,12 @@ docker compose logs manager | grep -i 出口代理
 UA `WorkBuddy/5.5.4 … CLI/2.137.1`）。以下几项直接关系到账号会不会被平台风控
 标记，建议逐条确认。
 
+**方向边界**（理解哪头能动、哪头不能动）：所有风控加固只作用于"网关 → 上游
+平台"的**出站**请求形态 —— 头族、Accept-Encoding、payload 节奏全部按官方客户端
+伪装，一概不改。对"客户端 → 网关"的**入站**方向没有这条约束，所以面向下游的
+响应做了 gzip 压缩省流量（wb2api 只压 JSON、manager 用 starlette 内建件，
+SSE 均不受影响；见 UPSTREAMS.md「构建期补丁登记」补丁 7/8）。
+
 ### 设备风控凭据 `device_token`
 
 **这是最该先查的一项。** `X-Device-Token` 只在账号带 `device_token` 时才发送
