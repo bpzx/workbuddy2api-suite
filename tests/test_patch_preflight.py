@@ -143,6 +143,28 @@ class OverlaySourceGuardTest(unittest.TestCase):
                          'UpdatePanel.tsx 丢了上游守卫要读的按钮禁用表达式字样')
 
 
+class CiWorkflowGuardTest(unittest.TestCase):
+    """CI 前端步骤必须先装依赖再构建。
+
+    回归案例：一次「构建失败自动重试」的改动把 `npm ci` 一起删掉了，verify
+    直接红在 `sh: 1: cross-env: not found`。`cross-env` 是 devDependency，
+    而 setup-node 的 `cache: npm` 只缓存、不安装 —— 这两件事很容易被误当成一件。
+    """
+
+    def test_frontend_step_installs_deps_before_build(self) -> None:
+        workflow = (_REPO / '.github' / 'workflows' / 'build.yml').read_text(encoding='utf-8')
+        marker = '- name: Frontend static export (patched)'
+        start = workflow.index(marker)
+        end = workflow.find('- name:', start + len(marker))
+        block = workflow[start:end if end != -1 else len(workflow)]
+        self.assertIn('npm ci', block,
+                      '前端步骤缺少 npm ci（cross-env 等 devDependencies 不会被安装）')
+        self.assertLess(
+            block.index('npm ci'), block.index('npm run build:export'),
+            'npm ci 必须在 build:export 之前执行',
+        )
+
+
 class I18nPreflightTest(unittest.TestCase):
     def test_merge_is_plannable_for_all_locales(self) -> None:
         ops = apply._plan_i18n(_VENDOR, _OVERLAY)

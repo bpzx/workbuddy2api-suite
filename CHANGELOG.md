@@ -19,6 +19,15 @@
 
 ## [未发布]
 
+### 修复：CI verify 前端步骤漏装依赖
+
+`f096a11`（前端构建自动重试）替换 `run` 块时把 `npm ci` 一起删掉了，
+verify 直接红在 `sh: 1: cross-env: not found`：`cross-env` 在
+devDependencies 里，而 `actions/setup-node` 的 `cache: npm` 只缓存、不安装。
+已恢复 `npm ci` 并加注释，同时新增 `CiWorkflowGuardTest` 断言它必须排在
+`npm run build:export` 之前 —— 这类"重试逻辑覆盖掉安装步骤"的回归不该再靠
+人眼看 diff 抓。
+
 ### 新增：下游方向的响应 gzip（补丁 7/8）—— 省流量，不碰出站指纹
 
 **背景**：审计发现两边对"发给客户端"的响应从不压缩 —— `/v1/models`、
@@ -46,9 +55,9 @@
   Starlette 内建件用子串判断 `"gzip"`，同样会把 `gzip;q=0` 误压 —— 新增
   `GzipQ0Normalizer` 在它外层先摘掉被拒绝的词条，压缩本身仍交给内建件。
 - 验证：打补丁树 Go 全套测试全绿（含 streaming handler）；上游 Python 2540
-  套件仅剩 4 个已登记的 Windows tearDown 误报；本项目测试 138 全绿（新增
-  gzip 协商意图断言与 q=0 归一化单测）；wb2api 侧实测 gzip 协商 / q=0 拒绝 /
-  br-only 明文 / SSE 逐帧明文与解压回读全部符合预期。
+  套件仅剩 4 个已登记的 Windows tearDown 误报；本项目测试 139 全绿（新增
+  gzip 协商意图断言、q=0 归一化单测与 CI 依赖安装顺序守卫）；wb2api 侧实测
+  gzip 协商 / q=0 拒绝 / br-only 明文 / SSE 逐帧明文与解压回读全部符合预期。
 
 ### 同步上游：manager v2.1.0 → v2.6.3（22 个提交，含"上游自维护"体系与安全批次）
 

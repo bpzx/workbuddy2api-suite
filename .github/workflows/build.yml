@@ -200,6 +200,9 @@ jobs:
         working-directory: /tmp/patched/manager/web
         run: |
           set -e
+          npm ci
+          # ⚠️ npm ci 不能省：build:export 依赖 devDependencies 里的 cross-env，
+          # 漏装时第一步就是 `sh: cross-env: not found`（v0.2.13 构建实际踩过）。
           for i in 1 2 3; do
             if npm run build:export && test -f out/index.html; then exit 0; fi
             echo "前端构建失败（第 ${i}/3 次）—— Google Fonts 拉取偶发抖动，2 秒后重试"
