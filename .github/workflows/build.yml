@@ -95,12 +95,15 @@ jobs:
             || { echo "::error::更新面板丢了 assetsPending 提示字样"; exit 1; }
           grep -q "check.manager.assets_ready === false" "$PANEL" \
             || { echo "::error::更新面板丢了 assets_ready 禁用表达式字样"; exit 1; }
-          for f in server/services/suite.py server/routers/suite.py; do
+          for f in server/services/suite.py server/routers/suite.py \
+                   server/services/gzip.py; do
             test -f "/tmp/patched/manager/$f" \
-              || { echo "::error::套件更新后端缺失：$f"; exit 1; }
+              || { echo "::error::套件新增后端缺失：$f"; exit 1; }
           done
           grep -q "suite_router" /tmp/patched/manager/server/main.py \
             || { echo "::error::main.py 未注册套件路由"; exit 1; }
+          grep -q "GzipQ0Normalizer" /tmp/patched/manager/server/main.py \
+            || { echo "::error::main.py 未注册 gzip q=0 归一化中间件"; exit 1; }
           # i18n：新增命名空间必须落到**全部**语系（漏一个，上游 i18n 测试就红）
           for loc in zh-CN zh-TW en ja ko; do
             grep -q '"suiteUpdate"' "/tmp/patched/manager/web/lib/i18n/locales/$loc.json" \

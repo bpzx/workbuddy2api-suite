@@ -279,7 +279,7 @@ internal/prompt/prompt.go:17:12: pattern defaultprompt.md: no matching files fou
 | 5 | wb2api | `cmd/server/main.go` · 池初始化 | `pool.max_in_flight == 0` 时启动告警 | 0 = 单账号在途**不限**；该值只能写在 config.json 里，误设无任何报错，而并发无上限会显著提高账号风控风险 |
 | 6 | wb2api | `internal/scheduler/travel.go` + `scheduler.go` | 上报间隔（0.8s / 1.5s）加 0..+50% 抖动（新增 `jitteredDelay`） | 精确等距的节奏是"机器特征"，真人不会这么匀；抖动让时间密度不再落在固定周期上。`base<=0` 原样返回，测试靠置 0 跳过等待 |
 | 7 | wb2api | `internal/server/handler.go` · `ServeHTTP()` | 出口包一层 `gzipResponseWriter`：`Content-Type` 为 `application/json` 且客户端 `Accept-Encoding` 显式含 gzip（q≠0）时压缩；SSE（`text/event-stream`）与非 JSON 整路透传，`Flush` 语义透传，handler 返回后 `Close()` 收尾 | `/v1/models`、`/v1/stats`、非流式对话等 JSON 此前全部裸传。压缩**只作用于下游方向**（面板/OpenAI 客户端），出站请求形态一概不动 —— 那是风控指纹。只压 JSON 让 SSE 天然排除。冲烟测试抓过一个真缺陷：没有 `Close()` 时响应只剩 10 字节 gzip 头（压缩数据全在内部缓冲里丢失） |
-| 8 | manager | `server/main.py` · CORS 注册块之后 | starlette 内建 `app.add_middleware(GZipMiddleware, minimum_size=1024)` | 面板 JS/CSS 与 `/api/*` JSON 此前全部裸传（单文件可达数百 KB）。选内建件因为已读源码确认它**内建排除 `text/event-stream`**（playground SSE 不受影响）、流式逐块压缩不缓冲、小响应不动；`fastapi>=0.115` 必然解析到满足该行为的 starlette，无新增依赖。注册在模块层级（不塞进 `if config.CORS_ORIGINS` 块），无 CORS 配置时也生效 |
+| 8 | manager | `server/main.py` · CORS 注册块之后 | starlette 内建 `app.add_middleware(GZipMiddleware, minimum_size=1024)`，外层再加 `GzipQ0Normalizer`（overlay 新增文件） | 面板 JS/CSS 与 `/api/*` JSON 此前全部裸传（单文件可达数百 KB）。选内建件因为已读源码确认它**内建排除 `text/event-stream`**（playground SSE 不受影响）、流式逐块压缩不缓冲、小响应不动；`fastapi>=0.115` 必然解析到满足该行为的 starlette，无新增依赖。注册在模块层级（不塞进 `if config.CORS_ORIGINS` 块），无 CORS 配置时也生效。内建件用子串判断 `"gzip"`，会把 `gzip;q=0`（明确拒绝）误压；`GzipQ0Normalizer` 在它外层先摘掉被拒绝的词条，压缩仍由内建件完成 |
 
 补丁 1 与**出口代理**有关；补丁 2 是"挂载我们自己的路由"的接线；
 补丁 3 是"去掉不该出现的行为"；补丁 4~6 是**风控加固**（本项目独有的增量）；

@@ -261,6 +261,18 @@ class PatchIntentTest(unittest.TestCase):
                          '显式写出来反而像要处理它')
         self.assertIn('http.Flusher', new, 'flush 语义必须透传，否则流式会被缓冲')
         self.assertIn('gzip.NewWriter', new)
+        self.assertIn('qAllows', new, 'q 值必须按数值语义判断，不能只枚举 "0"/"0.0"')
+        # 协商边界：q=0 的等价写法、无响应体状态码、已压缩响应都不能误压
+        self.assertIn("r != '0'", new, 'q=0.00/.0 这类等价写法必须同样算拒绝')
+        self.assertIn('StatusNoContent', new, '204 不允许响应体，设置 Content-Encoding 无意义')
+        self.assertIn('StatusNotModified', new, '304 不允许响应体，设置 Content-Encoding 无意义')
+        self.assertIn('StatusPartialContent', new, '206 区间响应不能被整体压缩')
+        self.assertIn('g.Header().Get("Content-Encoding") == ""', new,
+                      '已带 Content-Encoding 的响应不能二次压缩')
+        self.assertIn('status >= 100 && status < 200', new,
+                      '1xx 中间响应不能提前定下压缩决策')
+        self.assertIn('acceptsGzip: accepts', new,
+                      '即使客户端不接受 gzip 也要包一层：未压缩的 JSON 同样需要 Vary')
         # 不碰出站：补丁只出现在 handler.go（ServeHTTP），不涉及 transport/headers
         handler = (_VENDOR / 'wb2api' / 'internal' / 'server' / 'handler.go').read_text(encoding='utf-8')
         patched = handler.replace(apply.GO_GZIP_ServeHTTP_OLD, new, 1)
@@ -274,6 +286,15 @@ class PatchIntentTest(unittest.TestCase):
                       apply.MAIN_GZIP_IMPORT_NEW)
         self.assertIn('app.add_middleware(GZipMiddleware', apply.MAIN_GZIP_NEW)
         self.assertIn('minimum_size', apply.MAIN_GZIP_NEW)
+        # 内建件对 q=0 是子串误判；必须由外层 normalizer 修正，且顺序不能反
+        self.assertIn('from .services.gzip import GzipQ0Normalizer',
+                      apply.MAIN_GZIP_IMPORT_NEW)
+        self.assertIn('app.add_middleware(GzipQ0Normalizer)', apply.MAIN_GZIP_NEW)
+        self.assertLess(
+            apply.MAIN_GZIP_NEW.index('app.add_middleware(GZipMiddleware'),
+            apply.MAIN_GZIP_NEW.index('app.add_middleware(GzipQ0Normalizer)'),
+            'normalizer 必须在 GZipMiddleware 之后注册（后注册的在外层，先看到请求）',
+        )
         main = (_VENDOR / 'manager' / 'server' / 'main.py').read_text(encoding='utf-8')
         # 锚点是 CORS 块的收尾 —— 若上游给该块加了参数，这里能第一时间红出来
         self.assertIn(apply.MAIN_GZIP_OLD, main)
@@ -281,6 +302,81 @@ class PatchIntentTest(unittest.TestCase):
         new_line = 'app.add_middleware(GZipMiddleware, minimum_size=1024)'
         self.assertRegex(apply.MAIN_GZIP_NEW.replace('\r\n', '\n'), r'\n' + re.escape(new_line),
                          'GZipMiddleware 必须注册在模块层级（顶格，不依赖 CORS 配置）')
+
+
+class GzipNegotiationTest(unittest.TestCase):
+    """q=0 归一化：明确拒绝 gzip 的客户端不能再收到压缩体。
+
+    Starlette 内建件用 `"gzip" in header` 判断，`gzip;q=0` 会被误压 —— 这是
+    协议违规（客户端要 identity，却收到 gzip）。normalizer 只摘词条，压缩仍由
+    内建件负责。
+    """
+
+    @staticmethod
+    def _mod():
+        path = _OVERLAY / 'server' / 'services' / 'gzip.py'
+        spec = importlib.util.spec_from_file_location('suite_overlay_gzip', str(path))
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_accepts_gzip_uses_numeric_q(self) -> None:
+        mod = self._mod()
+        for header, want in (
+            ('gzip', True),
+            ('gzip;q=1', True),
+            ('gzip;q=0.5', True),
+            ('gzip;q=0', False),
+            ('gzip;q=0.0', False),
+            ('gzip;q=0.00', False),
+            ('gzip;q=.0', False),
+            ('br, gzip;q=0', False),
+            ('br, gzip;q=0.5', True),
+            ('x-gzip;q=0', False),
+            ('x-gzip', True),
+            ('*', False),
+            ('gzip;q=abc', True),
+        ):
+            with self.subTest(header=header):
+                self.assertIs(mod.accepts_gzip(header), want)
+
+    def test_strip_declined_gzip_keeps_other_encodings(self) -> None:
+        mod = self._mod()
+        self.assertEqual(mod.strip_declined_gzip('br, gzip;q=0'), 'br')
+        self.assertEqual(mod.strip_declined_gzip('gzip;q=0, deflate'), 'deflate')
+        self.assertEqual(mod.strip_declined_gzip('gzip;q=0'), '')
+
+    def test_normalizer_rewrites_only_when_all_gzip_tokens_declined(self) -> None:
+        import asyncio
+
+        mod = self._mod()
+        seen: dict = {}
+
+        async def app(scope, receive, send):
+            seen['scope'] = scope
+
+        normalizer = mod.GzipQ0Normalizer(app)
+        for header, want in (
+            (b'gzip;q=0', None),
+            (b'gzip;q=0.00', None),
+            (b'br, gzip;q=0', b'br'),
+            (b'gzip', b'gzip'),
+            (b'br, gzip;q=0.5', b'br, gzip;q=0.5'),
+            (b'br', b'br'),
+        ):
+            with self.subTest(header=header):
+                scope = {
+                    'type': 'http',
+                    'headers': [(b'accept-encoding', header)],
+                }
+                asyncio.run(normalizer(scope, None, None))
+                got = [
+                    value
+                    for key, value in seen['scope']['headers']
+                    if key.lower() == b'accept-encoding'
+                ]
+                self.assertEqual(got[0] if got else None, want)
 
 
 if __name__ == '__main__':

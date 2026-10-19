@@ -7,7 +7,7 @@
 逐字节一致 —— 只有这样 `scripts/sync-upstreams.sh` 才能是一条命令的事。
 
 ===== 四类改动（按侵入程度从轻到重）=====
-能用的就用轻的。当前用量：文本补丁 8 组（16 处替换）、JSON 键合并 1、文件新增 2、文件覆写 1。
+能用的就用轻的。当前用量：文本补丁 8 组（16 处替换）、JSON 键合并 1、文件新增 3、文件覆写 1。
 
   1. **文本补丁**：锚定上游某段代码原位替换，保留上游其余逻辑。
      8 组分别是：出口代理支持（wb2api）、注册套件路由（manager）、
@@ -145,7 +145,8 @@ app.include_router(suite_router.router)"""
 # 补丁 8 需要的 import（与 CORSMiddleware 同源：starlette 中间件）
 MAIN_GZIP_IMPORT_OLD = 'from fastapi.middleware.cors import CORSMiddleware'
 MAIN_GZIP_IMPORT_NEW = ('from fastapi.middleware.cors import CORSMiddleware\n'
-                        'from starlette.middleware.gzip import GZipMiddleware')
+                        'from starlette.middleware.gzip import GZipMiddleware\n'
+                        'from .services.gzip import GzipQ0Normalizer')
 
 
 # ─────────────────────────────────────────────────────────────
@@ -226,6 +227,11 @@ ADDITIONS: list[tuple[str, str, str]] = [
         'server/routers/suite.py',
         'manager/server/routers/suite.py',
         '套件更新端点 /api/system/suite-*',
+    ),
+    (
+        'server/services/gzip.py',
+        'manager/server/services/gzip.py',
+        '面板 gzip 协商修正（q=0 明确拒绝时不得压缩）',
     ),
 ]
 
@@ -555,15 +561,33 @@ type gzipResponseWriter struct {
 }
 
 func (g *gzipResponseWriter) WriteHeader(status int) {
+	// 1xx 是中间响应（如 103 Early Hints），不终结本次响应：原样透传，
+	// 也**不能**在这里定下压缩决策，否则最终响应会走错分支。
+	if status >= 100 && status < 200 {
+		g.ResponseWriter.WriteHeader(status)
+		return
+	}
 	if g.decided {
 		return
 	}
 	g.decided = true
 	ct := g.Header().Get("Content-Type")
-	if g.acceptsGzip && strings.HasPrefix(ct, "application/json") {
+	compressible := strings.HasPrefix(ct, "application/json")
+	if compressible {
+		// 压缩与否取决于 Accept-Encoding，所以**所有**可压响应都要带 Vary，
+		// 而不只是这次真压缩的那份：否则共享缓存可能把未压缩体缓存给 gzip
+		// 客户端（只是浪费带宽），或把压缩体发给不支持 gzip 的客户端（直接坏掉）。
+		g.Header().Add("Vary", "Accept-Encoding")
+	}
+	// 204/304 不允许响应体；206 是区间响应，压缩会破坏区间语义；
+	// 响应已经带 Content-Encoding（例如上游自己压过）时也不能二次压缩。
+	if compressible && g.acceptsGzip &&
+		status != http.StatusNoContent &&
+		status != http.StatusNotModified &&
+		status != http.StatusPartialContent &&
+		g.Header().Get("Content-Encoding") == "" {
 		g.Header().Del("Content-Length")
 		g.Header().Set("Content-Encoding", "gzip")
-		g.Header().Add("Vary", "Accept-Encoding")
 		g.gz = gzip.NewWriter(g.ResponseWriter)
 	}
 	g.ResponseWriter.WriteHeader(status)
@@ -615,21 +639,42 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		q := "1"
 		for _, kv := range fields[1:] {
-			if k, v, ok := strings.Cut(strings.TrimSpace(kv), "="); ok && strings.EqualFold(k, "q") {
+			if k, v, ok := strings.Cut(strings.TrimSpace(kv), "="); ok &&
+				strings.EqualFold(strings.TrimSpace(k), "q") {
 				q = strings.TrimSpace(v)
 			}
 		}
-		if q != "0" && q != "0.0" {
+		if qAllows(q) {
 			accepts = true
 			break
 		}
 	}
-	if accepts {
-		gzw := &gzipResponseWriter{ResponseWriter: w, acceptsGzip: true}
-		defer func() { _ = gzw.Close() }()
-		w = gzw
-	}
+	// 无论客户端这次是否接受 gzip，都包一层：可压响应必须在**未压缩**的那一份
+	// 上也带 Vary，否则共享缓存可能把压缩体发给不支持 gzip 的客户端。
+	gzw := &gzipResponseWriter{ResponseWriter: w, acceptsGzip: accepts}
+	defer func() { _ = gzw.Close() }()
+	w = gzw
 	h.mux.ServeHTTP(w, r)
+}
+
+// qAllows 报告质量因子是否 > 0。按数值语义判断：0 / 0.0 / 0.00 / .0 都表示
+// **拒绝**，其余值（含缺失）表示接受。
+//
+// 为什么不用 strconv 解析：这里只关心"是否全为 0"，非法 q 按缺省接受处理
+// （宁可多压一次，也不要因为解析失败漏压）。用数值比较而非枚举字符串，
+// 是为了让 q=0.00 这类等价写法不再被误判成"接受" —— 那会让客户端明确
+// 拒绝的编码照样发给它。
+func qAllows(q string) bool {
+	q = strings.TrimSpace(q)
+	if q == "" {
+		return true
+	}
+	for _, r := range q {
+		if r != '0' && r != '.' {
+			return true
+		}
+	}
+	return false
 }"""
 
 GO_GZIP_IMPORT_OLD = """import (
@@ -656,6 +701,8 @@ GO_GZIP_IMPORT_NEW = """import (
 #     小于 minimum_size 的响应不动。
 #   * fastapi>=0.115 必然解析到满足该行为的 starlette，无新增依赖。
 #   * 模块层级注册（不放进 if config.CORS_ORIGINS 块）：无 CORS 配置时也生效。
+# 但内建件用 `"gzip" in Accept-Encoding` 做子串判断，`gzip;q=0` 会被误压；
+# 因此在它外层再加一个 GzipQ0Normalizer（overlay 新增文件）做协商归一化。
 # 锚点取 CORS 注册块的**收尾**——该块比 import 块稳定（很少动）。
 MAIN_GZIP_OLD = """    app.add_middleware(
         CORSMiddleware,
@@ -676,7 +723,11 @@ MAIN_GZIP_NEW = """    app.add_middleware(
 # 【集成补丁】对下游（浏览器/客户端）的响应 gzip。starlette 内建实现会排除
 # text/event-stream（playground 的 SSE 不受影响），流式逐块压缩、小响应不动。
 # 只作用于入站方向；出站（对接 wb2api / 上游）的请求形态一概不变。
-app.add_middleware(GZipMiddleware, minimum_size=1024)"""
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+# 【集成补丁】内建中间件用 `"gzip" in Accept-Encoding` 做子串判断，会把
+# `gzip;q=0`（明确拒绝）误当成接受。后注册的中间件在外层，所以这行放在
+# GZipMiddleware **之后**：先摘掉被拒绝的 gzip 词条，再交给内建件决策。
+app.add_middleware(GzipQ0Normalizer)"""
 
 
 def build_text_edits(root: Path) -> list[tuple[Path, str, str, str]]:
