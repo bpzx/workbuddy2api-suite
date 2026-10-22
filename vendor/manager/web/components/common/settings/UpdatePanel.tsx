@@ -7,7 +7,6 @@ import {
   DownloadCloud,
   Globe,
   Loader2,
-  Pin,
   RefreshCw,
   RotateCcw,
   Server,
@@ -42,12 +41,6 @@ const TARGETS = [
     hintKey: 'updatePanel.targetBothHint',
   },
   {
-    id: 'upstream' as const,
-    labelKey: 'updatePanel.targetUpstream',
-    descKey: 'updatePanel.targetUpstreamDesc',
-    hintKey: 'updatePanel.targetUpstreamHint',
-  },
-  {
     id: 'manager' as const,
     labelKey: 'updatePanel.targetManager',
     descKey: 'updatePanel.targetManagerDesc',
@@ -57,10 +50,7 @@ const TARGETS = [
 
 /** 把检测结果拼成一句可读摘要，用于提醒 */
 function describeAvailable(c: UpdateCheck, t: (key: string, params?: Record<string, string | number>) => string): string {
-  const parts: string[] = [];
-  if (c.manager.has_update) parts.push(t('update.managerVersion', {v: c.manager.latest}));
-  if (c.upstream.has_update) parts.push(t('update.upstreamVersion', {v: c.upstream.latest}));
-  return parts.join(' · ');
+  return c.manager.has_update ? t('update.managerVersion', {v: c.manager.latest}) : '';
 }
 
 export function UpdatePanel() {
@@ -83,11 +73,8 @@ export function UpdatePanel() {
   const [pkgSha, setPkgSha] = useState('');
   /** 清除上次更新记录（issue #105）在途状态 */
   const [clearBusy, setClearBusy] = useState(false);
-  const [refInput, setRefInput] = useState('');
-  const [refBusy, setRefBusy] = useState(false);
   /** 四份数据**全部**没取到：版本与「有没有新版本」都不能下结论（服务可能正在重启） */
   const [loadFailed, setLoadFailed] = useState(false);
-  const refInited = useRef(false);
   const logRef = useRef<HTMLDivElement>(null);
 
   const load = useCallback(async () => {
@@ -99,13 +86,7 @@ export function UpdatePanel() {
         systemApi.packageMeta(),
       ]);
       if (pk.status === 'fulfilled') setPkg(pk.value);
-      if (st.status === 'fulfilled') {
-        setStatus(st.value);
-        if (!refInited.current) {
-          refInited.current = true;
-          setRefInput(st.value.upstream_ref || '');
-        }
-      }
+      if (st.status === 'fulfilled') setStatus(st.value);
       if (vs.status === 'fulfilled') setVersions(vs.value);
       if (ck.status === 'fulfilled') setCheck(ck.value);
       // 全失败才报错：更新期间服务重启，单份失败是瞬时的；但四份都没到，
@@ -119,8 +100,9 @@ export function UpdatePanel() {
   /**
    * 上传离线升级包。
    *
-   * 前端只做「选文件 + 可选填发布页摘要」，核对与落盘都在服务端：填了摘要就当场
-   * 比对（不一致直接拒收），没填就只验证结构，界面把这一点写清楚。
+   * 前端只做「选文件 + 填发布页摘要」，核对与落盘都在服务端。摘要在服务端默认
+   * 必填：安装包会在本机执行包内代码，没有摘要就无法确认包没被替换；确实拿不到
+   * 摘要的离线环境由服务端显式设置 WB_ALLOW_UNVERIFIED_PACKAGE=1 放行。
    */
   const uploadPackage = useCallback(async (file: File) => {
     setPkgBusy(true);
@@ -219,6 +201,9 @@ export function UpdatePanel() {
       setCheck(r);
       if (r.has_any) {
         notify.warn(t('updatePanel.newVersion'), describeAvailable(r, t));
+      } else if (r.manager.upstream_changed) {
+        notify.warn(t('updatePanel.upstreamNoticeTitle'),
+          t('updatePanel.upstreamOnlyChanged'));
       } else if (r.manager.error || r.upstream.error) {
         // **失败不能说成结论**（issue #204）：403/网络失败时旧缓存会回退，
         // 以前这里照样弹「已是最新」，把一次失败说成了"没有新版本"。
@@ -299,28 +284,6 @@ export function UpdatePanel() {
       notify.err(errText(e));
     } finally {
       setBusy(false);
-    }
-  }
-
-  /** 保存上游版本固定（空 = 取消固定） */
-  async function saveUpstreamRef() {
-    setRefBusy(true);
-    try {
-      const r = await systemApi.setUpstreamRef(refInput.trim());
-      setRefInput(r.upstream_ref || '');
-      if (r.upstream_ref) {
-        notify.ok(
-          t('updatePanel.refPinned'),
-          t('updatePanel.refPinnedDesc', {ref: r.upstream_ref}),
-        );
-      } else {
-        notify.info(t('updatePanel.refUnpinned'), t('updatePanel.refUnpinnedDesc'));
-      }
-      await load();
-    } catch (e) {
-      notify.err(errText(e));
-    } finally {
-      setRefBusy(false);
     }
   }
 
@@ -451,83 +414,12 @@ export function UpdatePanel() {
                     <span>{t('updatePanel.assetsPending')}</span>
                   </div>
                 )}
-                {check.upstream.has_update && (
-                  <div className="space-y-1 text-[11px] text-muted-foreground">
-                    <div>
-                      {t('updatePanel.upstreamUpgrade', {from: check.upstream.current || t('metric.unknown')})}{' '}
-                      <span className="font-medium text-foreground">{check.upstream.latest}</span>
-                      {!!check.upstream.ahead && (
-                        <span className="ml-1">{t('updatePanel.commitsBehind', {n: check.upstream.ahead})}</span>
-                      )}
-                    </div>
-                    {/* 变更列表：上游常一次累积多个提交，列出各自说明才能判断
-                        「这批更新做了什么、值不值得跟」 */}
-                    {check.upstream.changes?.length ? (
-                      <details className="group">
-                        <summary className="cursor-pointer list-none">
-                          <span className="text-foreground/80 group-open:hidden">
-                            {t('updatePanel.viewCommits', {
-                              n: check.upstream.ahead || check.upstream.changes.length,
-                            })}
-                          </span>
-                          <span className="hidden text-foreground/80 group-open:inline">
-                            {t('updatePanel.hideCommits')}
-                          </span>
-                        </summary>
-                        <ul className="mt-1 max-h-[220px] space-y-0.5 overflow-auto rounded-xl bg-background/60 p-2">
-                          {check.upstream.changes.map((c) => (
-                            <li key={c.sha} className="flex gap-2">
-                              <span className="shrink-0 font-mono text-[11px] text-muted-foreground">
-                                {c.sha}
-                              </span>
-                              <span className="min-w-0 flex-1 break-all">{c.subject}</span>
-                            </li>
-                          ))}
-                          {check.upstream.truncated && (
-                            <li className="pt-0.5 text-[11px] text-muted-foreground">
-                              {t('updatePanel.changesTruncated', {n: check.upstream.changes.length})}
-                            </li>
-                          )}
-                        </ul>
-                      </details>
-                    ) : (
-                      check.upstream.subject && (
-                        <div className="break-all">
-                          {t('updatePanel.latestCommit', {subject: check.upstream.subject})}
-                          {check.upstream.date && `（${check.upstream.date.slice(0, 10)}）`}
-                        </div>
-                      )
-                    )}
-                  </div>
-                )}
                 <div className="text-[11px] text-muted-foreground">
                   {t('updatePanel.updateHint')}
                 </div>
               </div>
             </div>
             <div className="flex gap-2">
-              {check.upstream.has_update && (
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="rounded-full"
-                  disabled={!isAdmin || busy || running}
-                  onClick={async () => {
-                    setBusy(true);
-                    try {
-                      const r = await systemApi.startUpdate('upstream');
-                      notify.ok(t('updatePanel.updateStarted'), r.message);
-                      await load();
-                    } catch (e) {
-                      notify.err(errText(e));
-                    } finally {
-                      setBusy(false);
-                    }
-                  }}
-                >
-                  {t('updatePanel.updateUpstream')}
-                </Button>
-              )}
               {check.manager.has_update && (
                 <Button
                   size="sm"
@@ -564,6 +456,16 @@ export function UpdatePanel() {
               )}
             </div>
           </div>
+        </div>
+      )}
+
+      {check && !check.manager.has_update && check.manager.upstream_changed
+        && !status?.running && (
+        <div className="flex items-start gap-2 rounded-[20px] border border-amber-500/30 bg-amber-500/10 px-4 py-3">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
+          <span className="text-[11px] leading-4 text-muted-foreground">
+            {t('updatePanel.upstreamOnlyChanged')}
+          </span>
         </div>
       )}
 
@@ -665,18 +567,18 @@ export function UpdatePanel() {
       )}
 
       {/* 本次检测失败、值来自上次成功结果：必须说明，不能让人以为「已经是最新」 */}
-      {check && (check.manager.error || check.upstream.error) && !status?.running && (
+      {check && check.manager.error && !status?.running && (
         <div className="flex items-start gap-2 rounded-[20px] border border-amber-500/30 bg-amber-500/10 px-4 py-3">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
           <div className="min-w-0 space-y-1 text-[11px] leading-4">
             <div className="font-medium">{t('updatePanel.checkFailed')}</div>
             <div className="break-all text-muted-foreground">
-              {(check.manager.error || check.upstream.error).slice(0, 200)}
+              {check.manager.error.slice(0, 200)}
             </div>
             <div className="text-muted-foreground">
-              {check.manager.stale || check.upstream.stale
+              {check.manager.stale
                 ? t('updatePanel.staleNote', {
-                    at: fmtDateTime(Math.max(check.manager.stale_at || 0, check.upstream.stale_at || 0)),
+                    at: fmtDateTime(check.manager.stale_at || 0),
                   })
                 : t('updatePanel.checkFailedHint')}
             </div>
@@ -684,7 +586,8 @@ export function UpdatePanel() {
         </div>
       )}
 
-      {check && !check.has_any && !check.manager.error && !check.upstream.error && !status?.running && (
+      {check && !check.has_any && !check.manager.upstream_changed
+        && !check.manager.error && !status?.running && (
         <div className="flex items-center gap-2 rounded-[20px] border border-emerald-500/30 bg-emerald-500/10 px-4 py-3">
           <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-500" />
           <span className="text-xs">{t('updatePanel.allUpToDate')}</span>
@@ -768,7 +671,7 @@ export function UpdatePanel() {
         <div className="mb-3 text-[11px] leading-4 text-muted-foreground">
           {t('updatePanel.oneClickUpdateDesc')}
         </div>
-        <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
           {TARGETS.map((target, i) => {
             // 能否更新上游取决于**能否操作 docker**（后端按实际能力判定），
             // 而不是"是否在容器里"：容器挂了 docker.sock 就能做这些事。
@@ -902,69 +805,6 @@ export function UpdatePanel() {
           )}
         </div>
       )}
-
-      {/* 上游版本固定：上游某个提交自身有问题时，固定回上一个可用提交 */}
-      <div className="rounded-[20px] bg-muted p-4">
-        <div className="mb-1 flex flex-wrap items-center gap-2 text-sm font-medium">
-          <Pin className="h-4 w-4" />
-          {t('updatePanel.pinTitle')}
-          {status?.upstream_ref ? (
-            <Badge variant="secondary" className="rounded-full text-amber-600 dark:text-amber-400">
-              {t('updatePanel.pinPinned', {ref: status.upstream_ref})}
-            </Badge>
-          ) : (
-            <Badge variant="secondary" className="rounded-full text-muted-foreground">
-              {t('updatePanel.pinFollowing')}
-            </Badge>
-          )}
-        </div>
-        <div className="mb-3 text-[11px] leading-4 text-muted-foreground">
-          <RichText text={t('updatePanel.pinDesc')} />
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <Input
-            value={refInput}
-            disabled={!isAdmin || refBusy}
-            placeholder={t('updatePanel.pinPlaceholder')}
-            className="h-8 w-full max-w-[320px] bg-background font-mono text-xs"
-            onChange={(e) => setRefInput(e.target.value)}
-          />
-          <Button
-            size="sm"
-            variant="outline"
-            className="rounded-full"
-            disabled={!isAdmin || refBusy}
-            onClick={saveUpstreamRef}
-          >
-            {refBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Pin className="h-3.5 w-3.5" />}
-            {t('common.save')}
-          </Button>
-          {status?.upstream_ref && (
-            <Button
-              size="sm"
-              variant="ghost"
-              className="rounded-full text-muted-foreground"
-              disabled={!isAdmin || refBusy}
-              onClick={async () => {
-                setRefInput('');
-                setRefBusy(true);
-                try {
-                  await systemApi.setUpstreamRef('');
-                  notify.info(t('updatePanel.refUnpinned'), t('updatePanel.refUnpinnedDesc'));
-                  await load();
-                } catch (e) {
-                  notify.err(errText(e));
-                } finally {
-                  setRefBusy(false);
-                }
-              }}
-            >
-              <RotateCcw className="h-3.5 w-3.5" />
-              {t('updatePanel.unpin')}
-            </Button>
-          )}
-        </div>
-      </div>
 
       {/* 日志。**没有可看的内容时不渲染这块**（issue #105：一次失败会长期驻留，
           清掉记录后这里还应整块消失，而不是永远挂着一个空框）。 */}

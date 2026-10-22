@@ -37,15 +37,12 @@ sudo bash deploy/install.sh          # 自动使用包内的 upstream/
 sudo UPSTREAM_SRC=/opt/workbuddy2api bash deploy/install.sh
 sudo UPSTREAM_SRC=/path/to/workbuddy2api-<版本>.tar.gz bash deploy/install.sh
 
-# 2) 从你自己的 git 副本拉
-sudo UPSTREAM_REPO=https://github.com/<你的账号>/workbuddy2api.git bash deploy/install.sh
-
-# 3) 上游已手工装好，只想装面板
+# 2) 上游已手工装好，只想装面板
 sudo bash deploy/install.sh --skip-upstream
 ```
 
-优先级：`UPSTREAM_SRC` → 发布包自带的 `upstream/` → 目标目录里已有的 git 仓库
-→ `UPSTREAM_REPO` 克隆。`UPSTREAM_DIR` 默认 `/opt/workbuddy2api`。
+优先级：`UPSTREAM_SRC` → 发布包自带的 `upstream/` → 目标目录里已有的完整源码。
+上游已由本项目维护，不再从外部 git 仓库克隆。`UPSTREAM_DIR` 默认 `/opt/workbuddy2api`。
 
 ### 以后怎么更新上游代码
 
@@ -59,6 +56,46 @@ cd /opt/workbuddy2api && docker compose up -d --build
 ```
 
 这三样务必保留：`config.json`（含 `api_key`）、`auths/`（账号授权）、`data/`。
+
+### 直接用预构建的上游镜像（不想本地构建时）
+
+每次发版也会把**上游**构建成镜像推到 GHCR。它和管理端镜像**同源**：都用发布包里
+那份源码（= `upstream-src` 资产 + 我们的全部补丁），所以不会出现「第三方上游镜像
+与项目上游源码不一致」的版本漂移。
+
+```bash
+docker pull ghcr.io/ithtelab/workbuddy2api:<版本>
+# latest 指向最近一次发布；长期跑建议钉版本号（理由同管理端镜像）
+```
+
+要跑多个上游（分组 / 多号池）时，把各自目录里 compose 的 `build: .` 换成 `image:`
+即可，端口与卷不变：
+
+```yaml
+services:
+  wb2api:
+    image: ghcr.io/ithtelab/workbuddy2api:2.8.0
+    container_name: workbuddy2api
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+    ports:
+      - "127.0.0.1:7863:7863"
+    volumes:
+      - ./auths:/app/auths
+      - ./data:/app/data
+      - ./config.json:/app/config.json:ro
+```
+
+三点要知道：
+
+- 镜像里**不带**真实配置（只有 `config.example.json`），`config.json` 必须自己挂；
+  首次使用可从发布包的 `upstream/config.example.json` 复制一份再改。
+- 镜像是**多架构**（amd64 / arm64），与管理端镜像一致。
+- 用镜像之后，上游就**不再由面板的一键更新维护**（那条路同步源码并
+  `docker compose up -d --build`）：升级上游 = 改 `image:` 的版本号 +
+  `docker compose up -d`。面板「全部更新」里针对上游源码的那一步对镜像部署无效，
+  这是预期行为。
 
 ### 许可
 
@@ -128,7 +165,6 @@ sudo APP_DIR=/opt/wbm \
 |---|---|---|
 | `APP_DIR` | `/opt/workbuddy-manager` | 管理端目录 |
 | `UPSTREAM_DIR` | `/opt/workbuddy2api` | 上游目录 |
-| `UPSTREAM_REPO` | 上游 GitHub 地址 | 上游仓库地址 |
 | `MANAGER_PORT` | `7864` | 管理端端口 |
 | `UPSTREAM_PORT` | `7863` | 上游端口 |
 | `PY` | `/usr/bin/python3` | Python 解释器路径 |
@@ -190,6 +226,43 @@ server {
 > `X-Real-IP` 是管理端判定真实来源 IP 的**首选依据**（`X-Forwarded-For`
 > 首段可被客户端伪造）。若前面还叠了 CDN，请把服务端
 > `WB_TRUSTED_PROXY_HOPS` 设为 CDN + 反代的层数。
+
+#### 前面是 Cloudflare（或任何 CDN）时**必须**再配一步
+
+只把 `X-Real-IP` 设成 `$remote_addr` 在 CF 后面是不够的：请求经过 CDN 时
+`$remote_addr` 是**边缘节点**的地址（`162.159.x` / `172.68.x` …），于是应用侧的
+全局 IP 白/黑名单、登录失败锁定、密钥 IP 白名单、审计日志全部按「CDN 的 IP」
+记账 —— 所有用户看起来都是同一个来源，IP 类管控既拦不准也锁不准（实测线上：
+`request_logs` 访问量前几名全是 CF 网段，单条 1.8 万次）。要用 nginx 自带的
+`realip` 模块从 `CF-Connecting-IP` 还原真实来源：
+
+```bash
+{
+  curl -fsS https://www.cloudflare.com/ips-v4
+  curl -fsS https://www.cloudflare.com/ips-v6
+  echo
+  echo 'real_ip_header CF-Connecting-IP;'
+  echo 'real_ip_recursive on;'
+} | sed -E '/^[0-9a-fA-F:.]+\/[0-9]+$/ { s/^/set_real_ip_from /; s/$/;/ }' \
+  | sudo tee /etc/nginx/conf.d/cloudflare-realip.conf
+
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+这个文件由 `nginx.conf` 里 `http {}` 中的 `include conf.d/*.conf` 加载，对所有
+站点生效。要点：
+
+- **`set_real_ip_from` 必须限定为 CDN 网段**。绕过 CDN 直连源站的请求，TCP
+  对端不匹配这些网段，伪造的 `CF-Connecting-IP` 就不会被采信。
+- CF 网段会变（官方列表会增减），建议把上面那段放进 cron（例如每月一次）后
+  跟 `nginx -t && systemctl reload nginx`，别只跑一次就忘了。
+- 应用侧**不用改**：`X-Real-IP` 仍由 nginx 覆盖成 `$remote_addr`，此时它已是
+  真实客户端 IP；`WB_TRUSTED_PROXY_HOPS` 也不必上调 —— 那是给「直接采信
+  `X-Forwarded-For`」的场景算层数用的。
+
+验证：`sudo tail -1 /var/log/nginx/access.log` 的第一列应是真实客户端 IP；
+或者不带密钥请求一次 `/v1/usage`（会返回 401），管理端「安全 → IP 访问日志」
+里新增那条的来源 IP 应是你的公网 IP，而不是 CF 网段。
 
 ### 4. 子路径部署（可选）
 
@@ -470,7 +543,8 @@ chown -R 10001:10001 /opt/workbuddy2api/auths /opt/workbuddy2api/data
 
 **Q：首次构建上游很慢**
 上游是 Go 项目，首次 `docker compose up --build` 需拉取基础镜像并编译，
-视网络情况可能需要几分钟，属正常现象。
+视网络情况可能需要几分钟，属正常现象。不想本地编译就把 compose 的 `build: .`
+换成预构建镜像（见「〇、上游源码从哪来 → 直接用预构建的上游镜像」）。
 
 **Q：构建管理端镜像失败 / 启动后打开页面显示 ERR_CONNECTION_REFUSED**
 
@@ -565,6 +639,12 @@ grep api_key /opt/workbuddy2api/config.json
 >   这个地址并非回环，绑回环后**可能连不上上游**。实测 Docker Desktop
 >   （Windows / macOS）会把 `host.docker.internal` 转发到宿主回环、连得上；
 >   而 Linux 上容器访问宿主回环通常**不通**。
+>
+> 一键更新会自动处理这个差异：检测到 `WB2API_BASE` 用的是
+> `host.docker.internal` 时，把上游端口绑到宿主网桥地址（如 `172.17.0.1`），
+> 容器可达且不对公网开放；Docker Desktop 仍用 `127.0.0.1`。要指定别的地址
+> （例如只绑内网网卡），在管理端环境变量里设 `WB_UPSTREAM_BIND=192.168.1.10`
+> 后重新执行一次更新。
 >
 > 更可靠的做法有两条，按你的部署形态选：
 >

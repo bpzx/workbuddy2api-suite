@@ -38,6 +38,52 @@ class ReleaseNotesTest(unittest.TestCase):
         with mock.patch.object(updater, '_upstream_dir', return_value=Path(tmp) / 'missing'):
             self.assertEqual(updater._local_upstream_id(), '')
 
+    def test_missing_local_upstream_is_marked_changed(self) -> None:
+        """老部署没有 .upstream-id：Release 带上游时必须提示需要同步。"""
+        cache = {'checked_at': int(updater.time.time()),
+                 'manager': {'latest': 'v1.0.0', 'upstream_id': 'a' * 64}}
+        with mock.patch.object(updater, '_read_cache', return_value=dict(cache)), \
+             mock.patch.object(updater, 'current_version', return_value='v1.0.0'), \
+             mock.patch.object(updater, '_local_upstream_id', return_value=''):
+            out = updater.check_updates()
+        self.assertTrue(out['manager']['upstream_changed'])
+        self.assertFalse(out['has_any'])
+
+    def test_stale_release_metadata_does_not_claim_upstream_mismatch(self) -> None:
+        """本次检查失败、用的是旧缓存时，不能据此断言本机上游不一致。
+
+        旧缓存里的 upstream-id 可能还是上一个 Release 的；拿它和刚同步好的
+        本机比较，会一直显示「需要同步」，用户点多少次都消不掉（issue #240）。
+        """
+        cache = {'checked_at': int(updater.time.time()),
+                 'manager': {'latest': 'v1.0.0', 'upstream_id': 'a' * 64,
+                             'stale': True, 'error': 'HTTP 403'}}
+        with mock.patch.object(updater, '_read_cache', return_value=dict(cache)), \
+             mock.patch.object(updater, 'current_version', return_value='v1.0.0'), \
+             mock.patch.object(updater, '_local_upstream_id', return_value='b' * 64):
+            out = updater.check_updates()
+        self.assertFalse(out['manager']['upstream_changed'],
+                         '旧缓存不能作为「上游不一致」的依据')
+
+    def test_packaged_updater_is_preferred(self) -> None:
+        """server/deploy/update.py 优先于根目录 deploy/update.py。
+
+        旧安装的根目录更新器可能不支持随包同步；它不会替换自己，
+        只靠根目录那份会让提示永远消不掉（issue #240）。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'server' / 'deploy').mkdir(parents=True)
+            (root / 'deploy').mkdir()
+            root_deploy = root / 'deploy' / 'update.py'
+            packaged = root / 'server' / 'deploy' / 'update.py'
+            root_deploy.write_text('old', encoding='utf-8')
+            with mock.patch.object(updater.config, 'ROOT', root):
+                self.assertEqual(updater._updater_script(), root_deploy)
+            packaged.write_text('new', encoding='utf-8')
+            with mock.patch.object(updater.config, 'ROOT', root):
+                self.assertEqual(updater._updater_script(), packaged)
+
 
 if __name__ == '__main__':
     unittest.main()

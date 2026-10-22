@@ -31,10 +31,17 @@ async def save_upstream(body: dict, request: Request,
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    # 改上游配置会影响全部账号行为，且可能写入 device_token/base 等敏感项，必须留痕
+    # 改上游配置会影响全部账号行为，且可能写入 device_token/base 等敏感项，必须留痕。
+    # 顶层标量（如 reasoning_as_content）不属于任何段，单独列出——否则日志会显示
+    # 「段=」，看起来像什么都没改。
+    sections = ','.join(sorted(k for k in body if isinstance(body.get(k), dict)))
+    top_keys = ','.join(sorted(
+        f'{k}={body[k]}' for k in body
+        if not isinstance(body.get(k), dict) and k != 'listen'
+    ))
     security.audit(user, 'update_upstream', '',
-                   f"段={','.join(sorted(k for k in body if isinstance(body.get(k), dict)))}"
-                   f'；来源 {client_ip(request)}')
+                   f'段={sections}' + (f'；顶层={top_keys}' if top_keys else '')
+                   + f'；来源 {client_ip(request)}')
     # 上游只在启动时读 config.json，保存后自动重载使其生效
     result['reload_scheduled'] = reload.request_restart()
     # 无法自动重载上游时（没装 docker / 容器没挂 docker.sock），要如实告诉
@@ -213,8 +220,9 @@ def add_user(body: UserIn, request: Request,
     而这一步当时没有任何记录。新建用户写随机 sv，避免同名重建后旧 cookie 复活。
     """
     pw = str(body.password)
-    if len(pw) < 8:
-        raise HTTPException(status_code=400, detail='密码至少 8 位')
+    problem = security.password_problem(pw, body.username)
+    if problem:
+        raise HTTPException(status_code=400, detail=problem)
     cfg = security.load_users()
     if any(u.get('username') == body.username for u in cfg.get('users', [])):
         raise HTTPException(status_code=409, detail='用户名已存在')
@@ -226,7 +234,9 @@ def add_user(body: UserIn, request: Request,
         'sv': secrets.randbelow(1 << 30),
     })
     security.save_users(cfg)
-    security.audit(user, 'add_user', body.username, f'角色={body.role}；来源 {client_ip(request)}')
+    ip = client_ip(request)
+    security.audit(user, 'add_user', body.username,
+                   f'角色={body.role}；来源 {ip}', ip=ip)
     return {'username': body.username, 'role': body.role}
 
 
@@ -250,9 +260,10 @@ def update_user(username: str, body: UserPatch, request: Request,
     changed_pwd = changed_role = False
     if body.password:
         pw = str(body.password)
-        # 现在不再接受空/极短口令：管理端是公网入口，弱口令等于没有防护
-        if len(pw) < 8:
-            raise HTTPException(status_code=400, detail='密码至少 8 位')
+        # 管理端是公网入口：弱口令等于没有防护，统一走与启动时相同的策略。
+        problem = security.password_problem(pw, username)
+        if problem:
+            raise HTTPException(status_code=400, detail=problem)
         target['pwd_hash'] = security.make_hash(pw)
         changed_pwd = True
     if body.role and body.role != target.get('role'):
@@ -279,7 +290,9 @@ def update_user(username: str, body: UserPatch, request: Request,
             parts.append('改密码')
         if changed_role:
             parts.append('改角色')
-        security.audit(user, 'update_user', username, '、'.join(parts) + f'；来源 {client_ip(request)}')
+        ip = client_ip(request)
+        security.audit(user, 'update_user', username,
+                       '、'.join(parts) + f'；来源 {ip}', ip=ip)
     # 把自己的密码改了，当前会话也会失效——前端据此提示重新登录
     self_revoked = bool(changed_pwd and username == user.get('username'))
     return {

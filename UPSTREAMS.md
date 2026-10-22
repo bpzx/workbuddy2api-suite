@@ -23,14 +23,38 @@
 | 上游 | 仓库 | 分支 | Commit | 提交时间 | 快照位置 |
 |---|---|---|---|---|---|
 | wb2api | `Sliverkiss/workbuddy2api` ⚠️ **已删除** | `master` | `d1023f3` | 2026-09-21 09:52 | `vendor/wb2api` |
-| manager | [ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) | `main` | [`ec7eccb`](https://github.com/ithtelab/workbuddy-manager/commit/ec7eccb) | 2026-10-18 22:08 | `vendor/manager` |
+| manager | [ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) | `main` | [`90c0638`](https://github.com/ithtelab/workbuddy-manager/commit/90c0638) | 2026-10-21 23:02 | `vendor/manager` |
 
 > wb2api 那一行**不再有可点的链接**：仓库已 404（见下节）。
 > 它是**我们开始自行维护时的起点**，不是"待同步的目标"。
 
 - wb2api：`Merge pull request #184 from .../fix/image-url-`（+764/−21，15 个文件）
   含图片 URL 修复、积分口径、成长任务链、WAF 403 处理等
-- manager：`fix: v2.6.3 —— 宽屏账号表格操作列保持单行`
+- manager（2026-10-22 同步）：`chore(release): v2.8.3`（`90c0638`，
+  71 文件 / +4652 −1167，**51 个提交**，v2.6.3 → v2.8.3）
+  **面板显示版本 v2.8.3**。要点：
+  - **更新器重构**（v2.7.0 起）：上游网关代码**随管理端镜像一起发**，
+    不再有独立的上游更新通道；上游 UpdatePanel 因此拆掉「上游固定版本」
+    与独立「更新上游」按钮（合并进「更新管理端（含上游）」）。
+  - **离线包摘要必填**（v2.7.x）：服务端比对发布页摘要，
+    `WB_ALLOW_UNVERIFIED_PACKAGE=1` 才放行无摘要包（用于真正离线环境）。
+  - **更新器僵尸进程修复**（#252）：`waitpid` 不到子进程时不再误判为
+    「更新还在跑」。
+  - **OCI label**（#241/#253）：上游镜像自带
+    `org.opencontainers.image.version` 与 `upstream-id`。
+  - **风控净化**：DSH system prompt 与 Web GUI 指纹各修一处（#246/#250，
+    国际版 11-128 打穿整池的根因之一）；`/v1/models` 按模型中心目录
+    裁掉已下架模型（#239）；企业版 fallback 路径的 11102 不再写 6 小时
+    模型冷却（#245）。
+  - 账号页与网关杂项：签到重置 `until` 不再把冷却提前清掉；强制冷却
+    到期后自动恢复；国际版 `deepseek-v4.1-flash` 补回 Max 档位（#238）；
+    settings 同步改白名单（pgsync 不再把含凭据的 settings 整表复制）。
+  - **集成层**：6 个 `main.py` 锚点 + wb2api Go 补丁链全部一次通过
+    （v2.6.3 → v2.8.3 的 51 个提交全部绕开我们的锚点，预检零失效）；
+    覆写面板守卫字样（`assetsPending` / `assets_ready` /
+    `can_update_upstream`）依然在；上游对 UpdatePanel 的大改**不回流**
+    （我们覆写那份没有它拆掉的两个按钮，无需跟随重建）。
+- manager（早前一轮）：`fix: v2.6.3 —— 宽屏账号表格操作列保持单行`
   （141 文件 / +9067 −2470，22 个提交，v2.1.0 → v2.6.3）
   **面板显示版本 v2.6.3**。要点：**上游"自维护"成体系**（v2.6.0：发布包内嵌打过
   13 条补丁的 wb2api 源码，面板发现上游变化时主按钮变「全部更新（含上游）」，
@@ -51,7 +75,10 @@
 > 1. **首次成规模地"不采纳"上游的 Go 侧增量**（0007~0013 补丁链，含 2.0.0
 >    主打的账号级出口线路）。上游 wb2api 仓库删除后，manager 项目把 Go 改动
 >    维护成**顺序耦合的补丁链 + 定期重打的 upstream-src 资产包**（v2.6.0 时已
->    13 条）。实测 0007/0008 在我们的基线（`d1023f3`，2026-09-21 冻结）上
+>    13 条；到 v2.8.3 已编号到 **0019**，新增 0014 截断流信号 / 0015 全局
+>    积分刷新 / 0016 deepseek 最大 effort / 0017 DSH system prompt 指纹 /
+>    0018 console fallback 缺失 / 0019 DSH Web GUI 指纹——**本套件依然不采纳
+>    整链**，维持冻结基线 `d1023f3` + 自有 4 组补丁，理由同下）。实测 0007/0008 在我们的基线（`d1023f3`，2026-09-21 冻结）上
 >    **5 个文件 patch does not apply**（`cmd/server/config.go`、
 >    `cmd/server/main.go`、`internal/server/handler.go`、
 >    `internal/upstream/client.go`、`internal/auth/auth.go`）—— 它们的基线是

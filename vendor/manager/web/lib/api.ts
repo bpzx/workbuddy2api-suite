@@ -726,18 +726,15 @@ export const systemApi = {
   packageMeta: () => get<UpdatePackageMeta>('/api/system/update-package'),
   /**
    * 上传离线升级包（发布页下载的 .tar.gz）。
-   * `expectedSha256` 填发布页那串摘要时会当场核对，不一致直接拒收。
+   * `expectedSha256` 是发布页那串摘要；服务端默认必填，缺失会直接拒收。
    */
-  uploadPackage: (file: File, expectedSha256 = '') => {
+  uploadPackage: (file: File, expectedSha256: string) => {
     const body = new FormData();
     body.append('file', file, file.name);
     body.append('expected_sha256', expectedSha256);
     return post<UpdatePackageMeta>('/api/system/update-package', body);
   },
   deletePackage: () => del<{ok: boolean}>('/api/system/update-package'),
-  /** 固定上游版本（空串 = 取消固定，恢复跟随分支） */
-  setUpstreamRef: (ref: string) =>
-    post<{ok: boolean; upstream_ref: string}>('/api/system/upstream-ref', {ref}),
   /**
    * 清除上次更新的结果与日志（issue #105）。
    *
